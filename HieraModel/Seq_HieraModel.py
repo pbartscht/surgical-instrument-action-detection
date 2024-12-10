@@ -13,7 +13,7 @@ import torch.nn as nn
 import torchvision.transforms as transforms
 import numpy as np
 import json
-from Verbmodel.models.model import SimpleVerbRecognition
+#from Verbmodel.models.model import SimpleVerbRecognition
 
 CONFIDENCE_THRESHOLD = 0.6
 IOU_THRESHOLD = 0.3
@@ -131,7 +131,7 @@ class HierarchicalEvaluator:
         ])
     
     def load_verb_model(self, model_path):
-        model = SimpleVerbRecognition.load_from_checkpoint(model_path)
+      #  model = SimpleVerbRecognition.load_from_checkpoint(model_path)
         model = model.to(self.device)
         model.eval()
         return model
