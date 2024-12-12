@@ -1,5 +1,5 @@
-path: /data/Bartscht/YOLO  
-train: images/train
+path: /data/Bartscht/YOLO  #insert your individual path to data
+train: images/train 
 val: images/val
 test: images/test
 
@@ -7,10 +7,10 @@ nc: 7
 names: ['Grasper', 'Bipolar', 'Hook', 'Scissors', 'Clipper', 'Irrigator', 'SpecimenBag']
     
 class_weights:
-  0: 1.0    # Grasper (8658 Samples - Referenzklasse)
+  0: 1.0    # Grasper (8658 Samples)
   1: 4.35   # Bipolar (1990 Samples)
   2: 2.65   # Hook (3272 Samples)
   3: 9.26   # Scissors (935 Samples)
   4: 7.02   # Clipper (1233 Samples)
   5: 4.02   # Irrigator (2151 Samples)
-  6: 0.0    # SpecimenBag (ignoriert)
+  6: 0.0    # SpecimenBag (ignored)

@@ -1,0 +1,29 @@
+# Configuration for instrument improvement through active learning
+dataset:
+  base_dir: "/data/Bartscht/CholecT50"
+  videos: ['VID26']
+
+target_instruments:
+  - name: 'Grasper'
+    index: 0
+    confidence_threshold: 0.6
+  - name: 'Bipolar'
+    index: 1
+    confidence_threshold: 0.6
+  - name: 'Hook'
+    index: 2
+    confidence_threshold: 0.6
+  - name: 'Scissors'
+    index: 3
+    confidence_threshold: 0.6
+  - name: 'Clipper'
+    index: 4
+    confidence_threshold: 0.6
+  - name: 'Irrigator'
+    index: 5
+    confidence_threshold: 0.6
+
+paths:
+  weights: "weights/instrument_detector/best_v35.pt"
+  pretrained: "weights/pretrained/yolo11l.pt"
+  predictions: "outputs/predictions"
