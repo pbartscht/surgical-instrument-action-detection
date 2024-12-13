@@ -11,6 +11,7 @@ import torch
 import sys
 from pathlib import Path
 import wandb  
+import numpy as np
 
 # Add project root to Python path
 project_root = Path(__file__).parent.parent.absolute()
@@ -43,6 +44,36 @@ def main():
     
     # Initialize model with pretrained weights
     model = CustomYOLO(str(pretrained_weights_path))
+
+    def test_augmentations():
+        print("\n=== Testing Augmentations ===")
+        try:
+            # Der Pfad zur data.yaml sollte direkt übergeben werden
+            data_yaml_path = str(project_root / 'config' / 'model_config' / 'data.yaml')
+            print(f"Loading dataset from: {data_yaml_path}")
+            
+            # Dataset erstellen mit korrekten Parametern
+            dataset = model.get_dataset(
+                dataset_path=data_yaml_path,
+                mode='train'  # Dies wird intern in augment=True umgewandelt
+            )
+            
+            # Ersten Datenpunkt laden und Informationen ausgeben
+            img, labels = dataset[0]
+            print(f"Successfully loaded first image and labels")
+            print(f"Augment flag: {dataset.augment}")
+            print(f"Image shape: {img.shape}")
+            print(f"Labels shape: {labels.shape if isinstance(labels, np.ndarray) else 'no labels'}")
+            
+        except Exception as e:
+            print(f"Error during augmentation test: {str(e)}")
+            print(f"Traceback:")
+            import traceback
+            traceback.print_exc()
+        print("=== Augmentation Test Complete ===\n")
+    
+    # Test durchführen
+    test_augmentations()
     
     training_config = {
         # Basis-Parameter
@@ -67,6 +98,13 @@ def main():
         'project': str(output_weights_dir.parent),
         'name': output_weights_dir.name,
         'exist_ok': True,
+
+        'mosaic': 0,  # Deaktiviert YOLO's mosaic augmentation
+        'hsv_h': 0,   # Deaktiviert YOLO's HSV augmentation
+        'hsv_s': 0,
+        'hsv_v': 0,
+        'augment': True,  # Aktiviert die Augmentierung
+        'cache': False,
         
         # Rest bleibt gleich
         'amp': True,
@@ -82,6 +120,9 @@ def main():
     }
     
     # Training starten
+    print("Initializing model...")  # Debug print
+    model = CustomYOLO(str(pretrained_weights_path))
+    print("Starting training...")   # Debug print
     model.train(**training_config)
 
 if __name__ == '__main__':
