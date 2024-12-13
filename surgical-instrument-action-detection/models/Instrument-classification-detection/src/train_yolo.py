@@ -48,29 +48,28 @@ def main():
     def test_augmentations():
         print("\n=== Testing Augmentations ===")
         try:
-            # Der Pfad zur data.yaml sollte direkt übergeben werden
             data_yaml_path = str(project_root / 'config' / 'model_config' / 'data.yaml')
             print(f"Loading dataset from: {data_yaml_path}")
             
-            # Dataset erstellen mit korrekten Parametern
-            dataset = model.get_dataset(
-                dataset_path=data_yaml_path,
-                mode='train'  # Dies wird intern in augment=True umgewandelt
-            )
+            # Prüfen, ob die Datei existiert
+            if not Path(data_yaml_path).exists():
+                raise FileNotFoundError(f"Konnte data.yaml nicht finden: {data_yaml_path}")
+                
+            # Dataset erstellen mit korrekter Parameterübergabe
+            dataset = model.get_dataset(data_yaml_path, mode='train')
             
-            # Ersten Datenpunkt laden und Informationen ausgeben
+            # Test des ersten Bildes
             img, labels = dataset[0]
-            print(f"Successfully loaded first image and labels")
-            print(f"Augment flag: {dataset.augment}")
-            print(f"Image shape: {img.shape}")
-            print(f"Labels shape: {labels.shape if isinstance(labels, np.ndarray) else 'no labels'}")
+            print("Dataset erfolgreich erstellt!")
+            print(f"Augmentierungen aktiv: {dataset.augment}")
+            print(f"Bildform: {img.shape}")
+            print(f"Anzahl Labels: {len(labels) if labels is not None else 0}")
             
         except Exception as e:
-            print(f"Error during augmentation test: {str(e)}")
-            print(f"Traceback:")
+            print(f"Fehler beim Testen der Augmentierungen: {str(e)}")
             import traceback
             traceback.print_exc()
-        print("=== Augmentation Test Complete ===\n")
+        print("=== Augmentations-Test abgeschlossen ===\n")
     
     # Test durchführen
     test_augmentations()

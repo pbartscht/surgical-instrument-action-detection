@@ -1,16 +1,23 @@
-path: /data/Bartscht/YOLO
-train: images/train
-val: images/val
-test: images/test
-nc: 7
+# Dataset paths
+path: /data/Bartscht/YOLO  # Base path
+train: images/train        # Path to training images
+val: images/val           # Path to validation images
+test: images/test         # Path to test images
+
+# Class configuration
+nc: 7  # Number of classes
+
+# Class names in ordered list
 names:
-- Grasper
-- Bipolar
-- Hook
-- Scissors
-- Clipper
-- Irrigator
-- SpecimenBag
+  - Grasper
+  - Bipolar
+  - Hook
+  - Scissors
+  - Clipper
+  - Irrigator
+  - SpecimenBag
+
+# Class weights
 class_weights:
   0: 0.32
   1: 1.47

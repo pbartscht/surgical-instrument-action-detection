@@ -48,18 +48,12 @@ class CustomYOLO(YOLO):
     def get_dataset(self, dataset_path, mode='train', batch=None):
         """
         Create and return a BasicSurgicalYOLODataset instance.
-
-        Args:
-            dataset_path (str): Path to the dataset
-            mode (str): Dataset mode ('train', 'val', or 'test')
-            batch (int, optional): Batch size
-
-        Returns:
-            BasicSurgicalYOLODataset: Dataset instance with class weights
         """
+        print(f"Erstelle Dataset für Modus: {mode}")
+        print(f"Verwende Konfiguration aus: {dataset_path}")
+        
         return BasicSurgicalYOLODataset(
-            path=dataset_path,
-            batch=batch,
+            dataset_path,  # Übergebe den YAML-Pfad
             augment=(mode == 'train'),
             class_weights=self.class_weights
         )
