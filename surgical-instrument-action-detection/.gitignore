@@ -1,0 +1,52 @@
+# Python cache files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual Environment
+.venv/
+venv/
+ENV/
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+
+# IDE specific files
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# Local development settings
+.env
+.env.local
+
+# Logs
+*.log
+wandb/
+logs/
+
+# Model weights and large files
+*.pt
+*.pth
+*.h5
+*.onnx
+*.weights
+
+# Dataset files (wenn Sie diese nicht im Repo haben wollen)
+*.jpg
+*.jpeg
+*.png
+*.gif
+*.mp4
+*.avi
+*.mov
+
+# Temp files
+tmp/
+temp/

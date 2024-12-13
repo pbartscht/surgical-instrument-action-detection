@@ -1,0 +1,47 @@
+Total samples: 85038
+
+=== Instrument Distribution ===
+hook        :  43289 (50.91%)
+grasper     :  30826 (36.25%)
+bipolar     :   4490 ( 5.28%)
+clipper     :   2696 ( 3.17%)
+irrigator   :   2322 ( 2.73%)
+scissors    :   1415 ( 1.66%)
+
+=== Verb Distribution ===
+dissect     :  40846 (48.03%)
+retract     :  27952 (32.87%)
+null_verb   :   4252 ( 5.00%)
+coagulate   :   3804 ( 4.47%)
+grasp       :   2796 ( 3.29%)
+clip        :   2467 ( 2.90%)
+aspirate    :   1427 ( 1.68%)
+cut         :   1235 ( 1.45%)
+irrigate    :    251 ( 0.30%)
+pack        :      8 ( 0.01%)
+
+=== Top 20 Instrument-Verb Combinations ===
+hook         - dissect     :  39875 (46.89%)
+grasper      - retract     :  27112 (31.88%)
+bipolar      - coagulate   :   3267 ( 3.84%)
+grasper      - grasp       :   2714 ( 3.19%)
+clipper      - clip        :   2467 ( 2.90%)
+hook         - null_verb   :   2441 ( 2.87%)
+irrigator    - aspirate    :   1427 ( 1.68%)
+scissors     - cut         :   1235 ( 1.45%)
+grasper      - null_verb   :    959 ( 1.13%)
+bipolar      - dissect     :    734 ( 0.86%)
+hook         - coagulate   :    531 ( 0.62%)
+hook         - retract     :    442 ( 0.52%)
+irrigator    - null_verb   :    273 ( 0.32%)
+bipolar      - null_verb   :    260 ( 0.31%)
+irrigator    - irrigate    :    251 ( 0.30%)
+irrigator    - retract     :    251 ( 0.30%)
+clipper      - null_verb   :    229 ( 0.27%)
+bipolar      - retract     :    147 ( 0.17%)
+irrigator    - dissect     :    120 ( 0.14%)
+scissors     - null_verb   :     90 ( 0.11%)
+
+=== Videos per Combination ===
+Average videos per combination: 23.80
+Median videos per combination: 20.00

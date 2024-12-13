@@ -10,6 +10,7 @@ using proper relative paths for model loading and saving.
 import torch
 import sys
 from pathlib import Path
+import wandb  
 
 # Add project root to Python path
 project_root = Path(__file__).parent.parent.absolute()
@@ -34,6 +35,12 @@ def main():
     print(f"Loading pretrained model from: {pretrained_weights_path}")
     print(f"Will save trained model to: {output_weights_dir / output_model_name}")
     
+    # Initialisieren Sie wandb separat (optional)
+    wandb.init(
+        project="surgical-instrument-detection",
+        entity="peebee-hamburg-university-of-technology",
+    )
+    
     # Initialize model with pretrained weights
     model = CustomYOLO(str(pretrained_weights_path))
     
@@ -55,7 +62,7 @@ def main():
         'warmup_epochs': 3,
         'patience': 30,
         'label_smoothing': 0.15,
-        
+
         # Speicherpfad für trainiertes Modell
         'project': str(output_weights_dir.parent),
         'name': output_weights_dir.name,
