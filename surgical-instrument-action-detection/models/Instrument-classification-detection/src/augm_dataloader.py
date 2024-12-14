@@ -9,19 +9,35 @@ from pathlib import Path
 class BasicSurgicalYOLODataset(YOLODataset):
     """
     Custom YOLO dataset for surgical instrument detection with specialized medical augmentations.
+    
+    This dataset extends the base YOLO dataset with medical-specific image augmentations
+    designed for surgical scenes and instrument detection.
+    
+    Attributes:
+        class_weights (torch.Tensor, optional): Weights for each class for loss calculation
+        instrument_aug (albumentations.Compose): Augmentation pipeline for surgical instruments
     """
+    
     def __init__(self, data_path, augment=False, class_weights=None):
-        # YAML-Datei laden
+        """
+        Initialize the surgical dataset with custom augmentations.
+        
+        Args:
+            data_path (str): Path to the YAML file containing dataset configuration
+            augment (bool): Whether to apply augmentations
+            class_weights (torch.Tensor, optional): Class weights for loss calculation
+        """
+        # Load YAML configuration
         with open(data_path, 'r') as f:
             data_dict = yaml.safe_load(f)
+            
+        # Construct absolute path to training images
+        base_path = Path(data_dict.get('path', ''))
+        train_path = base_path / data_dict.get('train', '')
         
-        # Absoluten Pfad zu den Trainingsbildern konstruieren
-        base_path = Path(data_dict.get('path', ''))  # /data/Bartscht/YOLO
-        train_path = base_path / data_dict.get('train', '')  # Kombiniert zu /data/Bartscht/YOLO/images/train
+        print(f"Using image path: {train_path}")
         
-        print(f"Verwende Bilderpfad: {train_path}")
-        
-        # YOLO's eigene Initialisierung mit dem absoluten Bildpfad nutzen
+        # Initialize parent YOLO dataset with absolute image path
         super().__init__(str(train_path), augment=augment)
         self.class_weights = class_weights
         
@@ -29,11 +45,14 @@ class BasicSurgicalYOLODataset(YOLODataset):
             self._setup_augmentations()
         else:
             self.instrument_aug = None
-            print("Augmentationen deaktiviert")
-
+            print("Augmentations disabled")
+    
     def _setup_augmentations(self):
-        """Setup der Augmentations-Pipeline"""
-        # Basis-Transformationen für OP-Szenen
+        """
+        Set up the augmentation pipeline with medical-specific transformations.
+        Includes both basic augmentations and specialized medical image enhancements.
+        """
+        # Basic transformations for surgical scenes
         basic_transforms = [
             A.RandomBrightnessContrast(
                 brightness_limit=(-0.2, 0.2),
@@ -49,7 +68,7 @@ class BasicSurgicalYOLODataset(YOLODataset):
             ),
         ]
         
-        # Medizinspezifische Transformationen
+        # Medical-specific transformations
         medical_transforms = [
             A.CLAHE(
                 clip_limit=2.0,
@@ -64,7 +83,7 @@ class BasicSurgicalYOLODataset(YOLODataset):
             ),
         ]
         
-        # Kombiniere alle Transformationen
+        # Combine all transformations
         self.instrument_aug = A.Compose(
             basic_transforms + medical_transforms,
             bbox_params=A.BboxParams(
@@ -72,28 +91,37 @@ class BasicSurgicalYOLODataset(YOLODataset):
                 label_fields=['class_labels']
             )
         )
-        print("Augmentationen initialisiert")
-
+        print("Augmentations initialized")
+    
     def __getitem__(self, index):
-        """Lädt ein Bild und wendet Augmentationen an, falls aktiviert"""
-        # Originalbild und Labels von YOLO laden
+        """
+        Load and augment an image and its labels.
+        
+        Args:
+            index (int): Index of the image to load
+            
+        Returns:
+            tuple: (image, labels) where labels are in YOLO format
+                  [class_id, x_center, y_center, width, height]
+        """
+        # Load original image and labels from YOLO
         img, labels = super().__getitem__(index)
         
-        # Augmentationen nur anwenden, wenn aktiviert
+        # Apply augmentations if enabled
         if self.augment and self.instrument_aug is not None:
             try:
-                # Labels für Albumentations vorbereiten
+                # Prepare labels for Albumentations
                 bboxes = labels[:, 1:].tolist()  # YOLO format: [x_center, y_center, width, height]
                 class_labels = labels[:, 0].tolist()
                 
-                # Augmentationen durchführen
+                # Apply augmentations
                 transformed = self.instrument_aug(
                     image=img,
                     bboxes=bboxes,
                     class_labels=class_labels
                 )
                 
-                # Neue Labels-Matrix erstellen
+                # Create new labels matrix
                 if transformed['bboxes']:
                     new_boxes = np.array(transformed['bboxes'])
                     new_labels = np.array(transformed['class_labels'])
@@ -102,7 +130,7 @@ class BasicSurgicalYOLODataset(YOLODataset):
                 return transformed['image'], labels
                 
             except Exception as e:
-                print(f"Warnung: Augmentationsfehler bei Bild {index}: {str(e)}")
-                return img, labels  # Fallback auf nicht-augmentierte Daten
-        
+                print(f"Warning: Augmentation failed for image {index}: {str(e)}")
+                return img, labels  # Fallback to non-augmented data
+                
         return img, labels

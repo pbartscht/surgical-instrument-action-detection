@@ -51,7 +51,7 @@ class CustomYOLO(YOLO):
         print(f"Verwende Konfiguration aus: {dataset_path}")
         
         return BasicSurgicalYOLODataset(
-            dataset_path,  # Übergebe den YAML-Pfad
+            dataset_path,  
             augment=(mode == 'train'),
             class_weights=self.class_weights
         )
