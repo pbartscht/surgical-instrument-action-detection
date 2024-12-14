@@ -4,8 +4,6 @@ import torch
 from ultralytics import YOLO
 from pathlib import Path
 import sys
-
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from augm_dataloader import BasicSurgicalYOLODataset
 
 class CustomYOLO(YOLO):
@@ -14,11 +12,11 @@ class CustomYOLO(YOLO):
     Extends the base YOLO class from ultralytics to add class-specific weight handling
     for improved training on imbalanced datasets.
     """
-
+    
     def __init__(self, model):
         """
         Initialize CustomYOLO with model and load class weights from config.
-
+        
         Args:
             model: Path to YOLO model or model name
         """
@@ -40,7 +38,7 @@ class CustomYOLO(YOLO):
                 # Move weights to appropriate device
                 self.class_weights = self.class_weights.to('cuda' if torch.cuda.is_available() else 'cpu')
                 print(f"Loaded class weights: {self.class_weights}")
-        
+                
         except Exception as e:
             print(f"Warning: Could not load class weights: {e}")
             self.class_weights = None
@@ -61,11 +59,11 @@ class CustomYOLO(YOLO):
     def _apply_class_weights(self, cls_loss, cls_targets):
         """
         Apply class-specific weights to classification loss.
-
+        
         Args:
             cls_loss (torch.Tensor): Classification loss
             cls_targets (torch.Tensor): Target class indices
-
+        
         Returns:
             torch.Tensor: Weighted classification loss
         """
@@ -77,11 +75,11 @@ class CustomYOLO(YOLO):
     def criterion(self, preds, targets):
         """
         Override default loss calculation to include class weights.
-
+        
         Args:
             preds (dict): Model predictions
             targets (dict): Ground truth targets
-
+        
         Returns:
             ComputeLoss: Modified loss including class weights
         """

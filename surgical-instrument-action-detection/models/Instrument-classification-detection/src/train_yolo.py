@@ -36,7 +36,7 @@ def main():
     print(f"Loading pretrained model from: {pretrained_weights_path}")
     print(f"Will save trained model to: {output_weights_dir / output_model_name}")
     
-    # Initialisieren Sie wandb separat (optional)
+    # Initialize wandb separately (optional)
     wandb.init(
         project="surgical-instrument-detection",
         entity="peebee-hamburg-university-of-technology",
