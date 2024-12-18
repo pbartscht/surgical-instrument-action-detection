@@ -37,7 +37,7 @@ logger = logging.getLogger(__name__)
 
 def organize_video_data(
     video_path: str = '/data/Bartscht/CholecT50/videos/VID26',
-    annotations_zip: str = '/home/Bartscht/YOLO/surgical-instrument-action-detection/models/Instrument-classification-detection/outputs/predictions/cvat_annotations.zip',
+    annotations_zip: str = '/home/Bartscht/YOLO/surgical-instrument-action-detection/models/Instrument-classification-detection/outputs/predictions/cvat_annotations.zip', # put here the corrected annoations zip file into
     yolo_base_dir: str = '/data/Bartscht/YOLO',
     train_ratio: float = 0.7,
     val_ratio: float = 0.2
