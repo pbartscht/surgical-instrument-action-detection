@@ -1,7 +1,7 @@
 # Surgical Instrument Classification and Detection
 
 ## Introduction
-This project implements an advanced computer vision pipeline for detecting and classifying surgical instruments in laparoscopic surgery videos. By combining traditional machine learning approaches with active learning techniques, we achieve continuous improvement in detection accuracy. The system is particularly designed for processing surgical video data, making it valuable for applications in computer-assisted surgery, surgical workflow analysis, and medical training.
+This project implements an computer vision pipeline for detecting and classifying surgical instruments in laparoscopic surgery videos. By combining traditional machine learning approaches with active learning techniques, we achieve continuous improvement in detection accuracy. The system is particularly designed for processing surgical video data, making it valuable for applications in computer-assisted surgery and surgical workflow analysis.
 
 The pipeline follows a two-stage approach:
 1. Initial training using a foundational dataset to establish baseline detection capabilities
@@ -25,11 +25,11 @@ This script is used for:
 Important: Complete initial instrument model training before proceeding to verb recognition.
 
 ### 3. Active Learning Pipeline
-Refer to active_learning/README.md for:
+Refer to [`config/active_learning/README.md`](config/active_learning/README.md) for:
 
-1. Model prediction generation
+1. Model prediction generation for unknown CholeCT50 images
 2. Annotation refinement using CVAT.ai
-3. Model retraining process using the same training script with updated datasets
+3. Model retraining process using the same training script with updated CholeCT50 datasets positions.
 
 ### Prerequisites
 
