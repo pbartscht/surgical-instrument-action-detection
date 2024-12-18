@@ -15,7 +15,7 @@ VOC to YOLO Conversion
 Troubleshooting
 
 ## Overview
-This directory contains tools for preprocessing the surgical instrument dataset, specifically for converting annotations from VOC format to YOLO format. This conversion is necessary to prepare the data for our active learning pipeline.
+This directory contains tools for preprocessing the surgical instrument dataset, specifically for converting annotations from VOC format to YOLO format. This conversion is necessary to prepare the data for the active learning pipeline.
 ## VOC to YOLO Conversion
 ### Dataset Source
 The initial dataset and annotations are sourced from Jin et al. (2018):
@@ -87,7 +87,7 @@ The script generates:
 
 
 ### Workflow Context
-This conversion is Step 1 in our active learning pipeline:
+This conversion is Step 1 in the active learning pipeline:
 
 **Current Step**: Convert VOC annotations to YOLO format
 **Next Steps**:

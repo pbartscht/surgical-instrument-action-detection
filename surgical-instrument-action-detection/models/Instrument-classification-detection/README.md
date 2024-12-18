@@ -13,7 +13,7 @@ The pipeline follows a two-stage approach:
 - Follow the instructions in [`data/README.md`](data/README.md) for:
   - Downloading required datasets (M2CAI16-Tool-Locations and CholecT50)
   - Proper dataset organization 
-  - Data conversion procedures for M2CAI16-Tool-Locations look under data/preprocessing
+  - Data conversion procedures for M2CAI16-Tool-Locations look under [`data/preprocessing/README.md`](data/preprocessing/README.md)
 
 ### 2. Model Training
 ```bash
