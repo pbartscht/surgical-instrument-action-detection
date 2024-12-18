@@ -16,10 +16,11 @@ The CholecT50 dataset [2] was officially released on February 20, 2023, and is a
 Visit the official GitHub repository: https://github.com/CAMMA-public/cholect50
 Fill out the access request form: https://forms.gle/GbMj8TwNoNpMUJuv9
 After submitting the form, you will receive download access via email
-
-Note: Access to the dataset is granted after completing the request form. Please ensure you comply with all usage terms and conditions.
-References:
-[1] Jin, Amy, et al. "Tool detection and operative skill assessment in surgical videos using region-based convolutional neural networks." 2018 IEEE winter conference on applications of computer vision (WACV). IEEE, 2018.
-
-[2] C.I. Nwoye, T. Yu, C. Gonzalez, B. Seeliger, P. Mascagni, D. Mutter, J. Marescaux, N. Padoy. Rendezvous: Attention Mechanisms for the Recognition of Surgical Action Triplets in Endoscopic Videos. Medical Image Analysis, 78 (2022) 102433.
 Place all downloaded datasets in your working directory before running the VOC to YOLO conversion script.
+
+Please ensure you comply with all usage terms and conditions.
+References:
+- [1] Jin, Amy, et al. "Tool detection and operative skill assessment in surgical videos using region-based convolutional neural networks." 2018 IEEE winter conference on applications of computer vision (WACV). IEEE, 2018.
+
+- [2] C.I. Nwoye, T. Yu, C. Gonzalez, B. Seeliger, P. Mascagni, D. Mutter, J. Marescaux, N. Padoy. Rendezvous: Attention Mechanisms for the Recognition of Surgical Action Triplets in Endoscopic Videos. Medical Image Analysis, 78 (2022) 102433.
+Note: Access to the dataset is granted after completing the request form. 
