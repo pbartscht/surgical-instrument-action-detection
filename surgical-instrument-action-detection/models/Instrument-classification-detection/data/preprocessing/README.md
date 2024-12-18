@@ -4,12 +4,12 @@
 Overview
 VOC to YOLO Conversion
 
-Dataset Source
-Prerequisites
-Directory Structure
-Usage
-Output
-Workflow Context
+- Dataset Source
+- Prerequisites
+- Directory Structure
+- Usage
+- Output
+- Workflow Context
 
 
 Troubleshooting
@@ -76,14 +76,13 @@ python voc_to_yolo_converter.py
 ### Output
 The script generates:
 
-Converted annotation files in YOLO format
-Copied image files in the new structure
-Dataset split files (train.txt, val.txt, test.txt)
-Configuration file (data.yaml) containing:
-
-File paths
-Number of classes
-Class names
+- Converted annotation files in YOLO format
+- Copied image files in the new structure
+- Dataset split files (train.txt, val.txt, test.txt)
+- Configuration file (data.yaml) containing:
+    - File paths
+    - Number of classes
+    - Class names
 
 
 
@@ -93,9 +92,9 @@ This conversion is Step 1 in our active learning pipeline:
 **Current Step**: Convert VOC annotations to YOLO format
 **Next Steps**:
 
-Train initial YOLO model
-Generate predictions on new video frames
-Begin active learning annotation refinement
+- Train initial YOLO model
+- Generate predictions on new video frames
+- Begin active learning annotation refinement
 
 
 
