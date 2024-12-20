@@ -272,7 +272,7 @@ class InstrumentVerbMapping(nn.Module):
         """
         return torch.mm(tool_probabilities, self.mapping)
     
-    class CholecT50Model(pl.LightningModule):
+class CholecT50Model(pl.LightningModule):
         """
         Main model for surgical workflow recognition.
         This PyTorch Lightning module combines all components for multi-task learning:
