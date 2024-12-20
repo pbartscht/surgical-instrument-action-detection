@@ -1,7 +1,7 @@
 # Surgical Instrument Classification and Detection
 
 ## Introduction
-This project implements an computer vision pipeline for detecting and classifying surgical instruments in laparoscopic surgery videos. By combining traditional machine learning approaches with active learning techniques, we achieve continuous improvement in detection accuracy. The system is particularly designed for processing surgical video data, making it valuable for applications in computer-assisted surgery and surgical workflow analysis.
+A computer vision pipeline for detecting and classifying surgical instruments in laparoscopic surgery videos is implemented in this project. Continuous improvement in detection accuracy is achieved by combining traditional machine learning approaches with active learning techniques. The system has been particularly designed for processing surgical video data, making it valuable for applications in computer-assisted surgery and surgical workflow analysis.
 
 The pipeline follows a two-stage approach:
 1. Initial training using a foundational dataset to establish baseline detection capabilities
