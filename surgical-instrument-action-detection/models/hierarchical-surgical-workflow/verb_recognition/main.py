@@ -2,14 +2,14 @@ import pytorch_lightning as pl
 from pytorch_lightning.loggers import WandbLogger
 from pytorch_lightning.callbacks import ModelCheckpoint
 from models.constrain_model import VerbRecognitionModel
-from utils.finaltest import VerbDataModule
+from utils.verbdataloader import VerbDataModule
 import os
 
 def main():
     # Basic setup
     base_dir = "/data/Bartscht/Verbs"
     batch_size = 16
-    num_workers = 4
+    num_workers = 8
     
     # Initialize data and model
     print("Initializing DataModule...")
