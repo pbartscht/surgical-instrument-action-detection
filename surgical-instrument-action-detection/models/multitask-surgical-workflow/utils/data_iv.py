@@ -18,213 +18,199 @@ Classes:
 
 import os
 import json
-from typing import Tuple, List, Dict, Optional, Any
-from pathlib import Path
-
+import random
 import torch
 import numpy as np
 from PIL import Image
+from torchvision import utils
+import torchvision.transforms as transforms
 from torch.utils.data import Dataset, ConcatDataset, DataLoader
 import pytorch_lightning as pl
-import torchvision.transforms as transforms
+import torchvision
+#import matplotlib.pyplot as plt
+#import matplotlib.patches as patches
+from torch.cuda.amp import autocast
+from collections import Counter
+
 
 class CholecT50_DataModule(pl.LightningDataModule):
-    """PyTorch Lightning DataModule for CholecT50 dataset."""
     
-    def __init__(
-        self, 
-        dataset_dir: str, 
-        batch_size: int,
-        dataset_variant: str = "cholect45-crossval"
-    ):
-        """
-        Initialize the DataModule.
-
-        Args:
-            dataset_dir: Root directory of the CholecT50 dataset
-            batch_size: Batch size for dataloaders
-            dataset_variant: Dataset variant to use (default: "cholect45-crossval")
-        """
+    def __init__(self, dataset_dir, batch_size):
         super().__init__()
+        
         self.dataset_dir = dataset_dir
-        self.dataset_variant = dataset_variant
+        self.dataset_variant = "cholect50-challenge"
         self.batch_size = batch_size
-        self.train_dataset = None
-        self.val_dataset = None
-        self.test_dataset = None
         
-    def setup(self, stage: Optional[str] = None) -> None:
-        """
-        Set up the datasets for training, validation, and testing.
+    def setup(self, stage=None):
         
-        Args:
-            stage: Optional stage parameter (fit/test)
-        """
-        cholect50 = CholecT50(
-            dataset_dir=self.dataset_dir, 
-            dataset_variant=self.dataset_variant,
-            img_size=(256, 448)
-        )
+        cholect50 = CholecT50(dataset_dir=self.dataset_dir, 
+                              dataset_variant=self.dataset_variant,
+                              img_size=(256, 448),
+                              #img_size_old=(224,224)
+                              )
         
         self.train_dataset, self.val_dataset, self.test_dataset = cholect50.build()
         
-    def train_dataloader(self) -> DataLoader:
-        """Get training data loader."""
-        return DataLoader(
-            self.train_dataset, 
-            batch_size=self.batch_size, 
-            shuffle=True,
-            num_workers=4,
-            pin_memory=True
-        )
+    def train_dataloader(self):
+        return DataLoader(self.train_dataset, batch_size=self.batch_size, shuffle=True)
     
-    def val_dataloader(self) -> DataLoader:
-        """Get validation data loader."""
-        return DataLoader(
-            self.val_dataset, 
-            batch_size=self.batch_size, 
-            shuffle=False,
-            num_workers=4,
-            pin_memory=True
-        )
+    def val_dataloader(self):
+        return DataLoader(self.val_dataset, batch_size=self.batch_size, shuffle=False)
     
-    def test_dataloader(self) -> DataLoader:
-        """Get test data loader."""
-        return DataLoader(
-            self.test_dataset, 
-            batch_size=self.batch_size, 
-            shuffle=False,
-            num_workers=4,
-            pin_memory=True
-        )
-
-class CholecT50:
-    """Main CholecT50 dataset class handling data splitting and preparation."""
-    
-    DATASET_VARIANTS = {
-        "cholect45-crossval": "CholecT45 dataset variant with official cross-validation splits",
-        "cholect50-crossval": "CholecT50 dataset variant with official cross-validation splits (recommended)",
-        "cholect50-challenge": "CholecT50 dataset variant used in CholecTriplet challenge",
-        "cholect50": "CholecT50 dataset with original splits from rendezvous paper",
-        "cholect45": "Pointer to cholect45-crossval",
-        "cholect50-subset": "Subset created for EDU4SDS summer school"
-    }
-
-    def __init__(
-        self, 
-        dataset_dir: str, 
-        dataset_variant: str = "cholect50-challenge",
-        img_size: Tuple[int, int] = (224, 224),
-        test_fold: int = 1,
-        augmentation_list: List[str] = None,
-        normalize: bool = True
-    ):
+    def test_dataloader(self):
+        return DataLoader(self.test_dataset, batch_size=self.batch_size, shuffle=False)
+        
+class CholecT50():
+    def __init__(self, 
+                dataset_dir, 
+                dataset_variant="cholect50-challenge",
+                img_size = (224, 224),
+                test_fold=1,
+                augmentation_list=['original', 'vflip', 'hflip', 'contrast', 'rot90'],
+                normalize=True):
+        """ Args
+                dataset_dir : common path to the dataset (excluding videos, output)
+                list_video  : list video IDs, e.g:  ['VID01', 'VID02']
+                aug         : data augumentation style
+                split       : data split ['train', 'val', 'test']
+            Call
+                batch_size: int, 
+                shuffle: True or False
+            Return
+                tuple ((image), (tool_label, verb_label, target_label, triplet_label, phase_label))
         """
-        Initialize the CholecT50 dataset.
-
-        Args:
-            dataset_dir: Root directory of the dataset
-            dataset_variant: Which dataset variant to use
-            img_size: Size to resize images to (height, width)
-            test_fold: Which fold to use for testing in cross-validation
-            augmentation_list: List of augmentation names to apply
-            normalize: Whether to normalize images
-        
-        Raises:
-            ValueError: If dataset_variant is not valid
-        """
-        if dataset_variant not in self.DATASET_VARIANTS:
-            raise ValueError(
-                f"Invalid dataset variant: {dataset_variant}. "
-                f"Valid options are: {list(self.DATASET_VARIANTS.keys())}"
-            )
-            
-        self.img_size = img_size
-        self.normalize = normalize
-        self.dataset_dir = Path(dataset_dir)
-        
-        # Set up data splits
-        video_split = self._get_video_split(dataset_variant)
-        self.train_records, self.val_records, self.test_records = \
-            self._prepare_record_lists(video_split, test_fold, dataset_variant)
-            
-        # Set up augmentations
-        if augmentation_list is None:
-            augmentation_list = ['original', 'vflip', 'hflip', 'contrast', 'rot90']
-        self.augmentation_list = self._get_augmentations(augmentation_list)
-        
-        # Build transforms
-        trainform, testform = self._build_transforms()
-        
-        # Build datasets
-        self._build_datasets(trainform, testform)
-
-    def _get_augmentations(self, augmentation_list: List[str]) -> List[transforms.Transform]:
-        """Get list of augmentation transforms based on names."""
-        aug_dict = {
-            'original': transforms.Lambda(lambda x: x),
+        self.img_size  = img_size
+        self.normalize   = normalize
+        self.dataset_dir = dataset_dir
+        self.list_dataset_variant = {
+            "cholect45-crossval": "for CholecT45 dataset variant with the official cross-validation splits.",
+            "cholect50-crossval": "for CholecT50 dataset variant with the official cross-validation splits (recommended)",
+            "cholect50-challenge": "for CholecT50 dataset variant as used in CholecTriplet challenge",
+            "cholect50": "for the CholecT50 dataset with original splits used in rendezvous paper",
+            "cholect45": "a pointer to cholect45-crossval",
+            "cholect50-subset": "specially created for EDU4SDS summer school"
+        }
+        assert dataset_variant in self.list_dataset_variant.keys(), print(dataset_variant, "is not a valid dataset variant")
+        video_split  = self.split_selector(case=dataset_variant)
+        train_videos = sum([v for k,v in video_split.items() if k!=test_fold], []) if 'crossval' in dataset_variant else video_split['train']
+        test_videos  = sum([v for k,v in video_split.items() if k==test_fold], []) if 'crossval' in dataset_variant else video_split['test']
+        if 'crossval' in dataset_variant:
+            val_videos   = train_videos[-5:]
+            train_videos = train_videos[:-5]
+        else:
+            val_videos   = video_split['val']
+        self.train_records = ['VID{}'.format(str(v).zfill(2)) for v in train_videos]
+        self.val_records   = ['VID{}'.format(str(v).zfill(2)) for v in val_videos]
+        self.test_records  = ['VID{}'.format(str(v).zfill(2)) for v in test_videos]
+        self.augmentations = {
+            'original': self.no_augumentation,
             'vflip': transforms.RandomVerticalFlip(0.4),
             'hflip': transforms.RandomHorizontalFlip(0.4),
             'contrast': transforms.ColorJitter(brightness=0.1, contrast=0.2, saturation=0, hue=0),
-            'rot90': transforms.RandomRotation(90, expand=True),
+            'rot90': transforms.RandomRotation(90,expand=True),
             'brightness': transforms.RandomAdjustSharpness(sharpness_factor=1.6, p=0.5),
-            'autocontrast': transforms.RandomAutocontrast(p=0.5),
+            'contrast': transforms.RandomAutocontrast(p=0.5),
         }
-        
-        return [aug_dict[aug] for aug in augmentation_list if aug in aug_dict]
+        self.augmentation_list = []
+        for aug in augmentation_list:
+            self.augmentation_list.append(self.augmentations[aug])
+        trainform, testform = self.transform()
+        self.target_transform = self.to_binary
+        self.build_train_dataset(trainform)
+        self.build_val_dataset(trainform)
+        self.build_test_dataset(testform)
+    
+    def list_dataset_variants(self):
+        print(self.list_dataset_variant)
 
-    def _build_transforms(self) -> Tuple[transforms.Compose, transforms.Compose]:
-        """Build training and testing transforms."""
-        normalize = transforms.Normalize(
-            mean=[0.485, 0.456, 0.406], 
-            std=[0.229, 0.224, 0.225]
-        )
-        
-        basic_transforms = [transforms.Resize(self.img_size)]
-        test_transforms = basic_transforms + [transforms.ToTensor()]
-        train_transforms = basic_transforms + self.augmentation_list + [transforms.ToTensor()]
-        
-        if self.normalize:
-            test_transforms.append(normalize)
-            train_transforms.append(normalize)
-            
-        return transforms.Compose(train_transforms), transforms.Compose(test_transforms)
+    def list_augmentations(self):
+        print(self.augmentations.keys())
 
-    def _build_datasets(self, trainform: transforms.Compose, testform: transforms.Compose) -> None:
-        """Build train, validation and test datasets."""
-        def build_dataset(video_list: List[str], transform: transforms.Compose) -> ConcatDataset:
-            datasets = []
-            for video in video_list:
-                dataset = T50(
-                    img_dir=self.dataset_dir / 'videos' / video,
-                    label_file=self.dataset_dir / 'labels' / f'{video}.json',
-                    transform=transform
-                )
-                datasets.append(dataset)
-            return ConcatDataset(datasets)
-            
-        self.train_dataset = build_dataset(self.train_records, trainform)
-        self.val_dataset = build_dataset(self.val_records, trainform)
-        self.test_dataset = build_dataset(self.test_records, testform)
-
-    def build(self) -> Tuple[ConcatDataset, ConcatDataset, ConcatDataset]:
-        """Get the built datasets."""
-        return self.train_dataset, self.val_dataset, self.test_dataset
-
-    @staticmethod
-    def _get_video_split(variant: str) -> Dict:
-        """Get video split configuration for given variant."""
-        # Video split configurations...
-        splits = {
+    def split_selector(self, case='cholect50'):
+        switcher = {
             'cholect50': {
-                'train': [1, 15, 26, 40, 52, 65, 79, 2, 18, 27, 43, 56, 66, 92],
-                'val': [8, 12, 29, 50, 78],
-                'test': [6, 51, 10, 73, 14, 74, 32, 80, 42, 111]
+                'train': [1, 15, 26, 40, 52, 65, 79, 2, 18, 27, 43, 56, 66, 92, 4, 22, 31, 47, 57, 68, 96, 5, 23, 35, 48, 60, 70, 103, 13, 25, 36, 49, 62, 75, 110],
+                'val'  : [8, 12, 29, 50, 78],
+                'test' : [6, 51, 10, 73, 14, 74, 32, 80, 42, 111]
             },
-            # Add other split configurations...
+            'cholect50-challenge': {
+                'train': [1, 15, 26, 40, 52, 79, 2, 27, 43, 56, 66, 4, 22, 31, 47, 57, 68, 23, 35, 48, 60, 70, 13, 25, 49, 62, 75, 8, 12, 29, 50, 78, 6, 51, 10, 73, 14, 32, 80, 42],
+                'val':   [5, 18, 36, 65, 74],
+                'test':  [92, 96, 103, 110, 111]
+            },
+            'cholect45-crossval': {
+                1: [79,  2, 51,  6, 25, 14, 66, 23, 50,],
+                2: [80, 32,  5, 15, 40, 47, 26, 48, 70,],
+                3: [31, 57, 36, 18, 52, 68, 10,  8, 73,],
+                4: [42, 29, 60, 27, 65, 75, 22, 49, 12,],
+                5: [78, 43, 62, 35, 74,  1, 56,  4, 13,],
+            },
+            'cholect50-crossval': {
+                1: [79,  2, 51,  6, 25, 14, 66, 23, 50, 111],
+                2: [80, 32,  5, 15, 40, 47, 26, 48, 70,  96],
+                3: [31, 57, 36, 18, 52, 68, 10,  8, 73, 103],
+                4: [42, 29, 60, 27, 65, 75, 22, 49, 12, 110],
+                5: [78, 43, 62, 35, 74,  1, 56,  4, 13,  92],
+            },
         }
-        return splits[variant]
+        return switcher.get(case)
 
+    def no_augumentation(self, x):
+        return x
+
+    def transform(self):
+        normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        op_test   = [transforms.Resize(self.img_size), transforms.ToTensor(), ]
+        op_train  = [transforms.Resize(self.img_size)] + self.augmentation_list + [transforms.Resize(self.img_size), transforms.ToTensor()]
+        if self.normalize:
+            op_test.append(normalize)
+            op_train.append(normalize)
+        testform  = transforms.Compose(op_test)
+        trainform = transforms.Compose(op_train)
+        return trainform, testform
+    
+    def to_binary(self, label_list):
+        outputs = []
+        for label in label_list:
+            label = torch.tensor(label).bool().int()
+            outputs.append(label)
+        return outputs
+
+
+    def build_train_dataset(self, transform):
+        iterable_dataset = []
+        for video in self.train_records:
+            dataset = T50(img_dir = os.path.join(self.dataset_dir, 'videos', video), 
+                          label_file = os.path.join(self.dataset_dir, 'labels', '{}.json'.format(video)),
+                          transform=transform,
+                          target_transform=self.target_transform)
+            iterable_dataset.append(dataset)
+        self.train_dataset = ConcatDataset(iterable_dataset)
+
+    def build_val_dataset(self, transform):
+        iterable_dataset = []
+        for video in self.val_records:
+            dataset = T50(img_dir = os.path.join(self.dataset_dir, 'videos', video), 
+                          label_file = os.path.join(self.dataset_dir, 'labels', '{}.json'.format(video)),
+                          transform=transform,
+                          target_transform=self.target_transform)
+            iterable_dataset.append(dataset)
+        self.val_dataset = ConcatDataset(iterable_dataset)
+
+    def build_test_dataset(self, transform):
+        iterable_dataset = []
+        for video in self.test_records:
+            dataset = T50(img_dir = os.path.join(self.dataset_dir, 'videos', video), 
+                          label_file = os.path.join(self.dataset_dir, 'labels', '{}.json'.format(video)), 
+                          transform=transform,
+                          target_transform=self.target_transform)
+            iterable_dataset.append(dataset)
+        self.test_dataset = ConcatDataset(iterable_dataset)
+        
+    def build(self):
+        return (self.train_dataset, self.val_dataset, self.test_dataset)
+   
 class T50(Dataset):
     def __init__(self, img_dir, label_file, transform=None, target_transform=None):
         label_data = json.load(open(label_file, "rb"))
@@ -406,7 +392,191 @@ class T50(Dataset):
 
     def __len__(self):
         return len(self.frames)
+
+
+
+# def show_random_image(dataset):
+#     idx = random.randint(0, len(dataset) - 1)
+#     img, (triplet, tool, verb, target, phase) = dataset[idx]
+#     plt.imshow(img.permute(1, 2, 0))
+#     plt.title(f"Triplet: {torch.argmax(triplet)}, Tool: {torch.argmax(tool)}, Verb: {torch.argmax(verb)}, Target: {torch.argmax(target)}, Phase: {torch.argmax(phase)}")
+#     plt.savefig('plot.png')
+
+# def show_augmentations(dataset):
+#     idx = random.randint(0, len(dataset) - 1)
+#     img, (triplet, tool, verb, target, phase) = dataset[idx]
     
+#     augmentations = {
+#         'Original': transforms.Compose([]),
+#         'Vertical Flip': transforms.RandomVerticalFlip(p=1),
+#         'Horizontal Flip': transforms.RandomHorizontalFlip(p=1),
+#         'Color Jitter': transforms.ColorJitter(brightness=0.5, contrast=0.5, saturation=0.5, hue=0.5),
+#         'Rotate 90': transforms.RandomRotation((90, 90), expand=True),
+#         'Brightness': transforms.Lambda(lambda x: transforms.functional.adjust_brightness(x, brightness_factor=1.5)),
+#         'Contrast': transforms.Lambda(lambda x: transforms.functional.adjust_contrast(x, contrast_factor=2)),
+#         'Auto Contrast': transforms.RandomAutocontrast(p=1),
+#     }
+    
+#     # Apply augmentations and store results
+#     aug_images = []
+#     for aug_name, aug_transform in augmentations.items():
+#         aug_img = aug_transform(img)
+#         aug_images.append((aug_name, aug_img))
+    
+#     # Create a grid of images
+#     fig, axs = plt.subplots(2, 4, figsize=(20, 10))
+#     fig.suptitle(f"Augmentations (Triplet: {torch.argmax(triplet)}, Tool: {torch.argmax(tool)}, Verb: {torch.argmax(verb)}, Target: {torch.argmax(target)}, Phase: {torch.argmax(phase)})")
+    
+#     for i, (aug_name, aug_img) in enumerate(aug_images):
+#         row = i // 4
+#         col = i % 4
+#         axs[row, col].imshow(aug_img.permute(1, 2, 0))
+#         axs[row, col].set_title(aug_name)
+#         axs[row, col].axis('off')
+    
+#     # Remove the last empty subplot
+#     axs[1, 3].axis('off')
+    
+#     plt.tight_layout()
+#     plt.savefig('augmentations.png')
+#     plt.close()
+
+# def visualize_image_with_labels(dataset, index):
+#     img, (triplet, tool, verb, target, phase) = dataset[index]
+    
+#     # Convert the image tensor to a PIL Image for display
+#     img_pil = Image.fromarray((img.permute(1, 2, 0).numpy() * 255).astype('uint8'))
+    
+#     # Create a figure and display the image
+#     plt.figure(figsize=(10, 10))
+#     plt.imshow(img_pil)
+#     plt.axis('off')
+    
+#     # Prepare the label information
+#     triplet_indices = torch.nonzero(triplet).squeeze().tolist()
+#     tool_indices = torch.nonzero(tool).squeeze().tolist()
+#     verb_indices = torch.nonzero(verb).squeeze().tolist()
+#     target_indices = torch.nonzero(target).squeeze().tolist()
+#     phase_indices = torch.nonzero(phase).squeeze().tolist()
+    
+#     # If any of these are single integers, convert to list for consistent handling
+#     if isinstance(triplet_indices, int): triplet_indices = [triplet_indices]
+#     if isinstance(tool_indices, int): tool_indices = [tool_indices]
+#     if isinstance(verb_indices, int): verb_indices = [verb_indices]
+#     if isinstance(target_indices, int): target_indices = [target_indices]
+#     if isinstance(phase_indices, int): phase_indices = [phase_indices]
+    
+#     # Create the title with all label information
+#     title = f"Image {index}\n"
+#     title += f"Triplets: {triplet_indices}\n"
+#     title += f"Tools: {tool_indices}\n"
+#     title += f"Verbs: {verb_indices}\n"
+#     title += f"Targets: {target_indices}\n"
+#     title += f"Phases: {phase_indices}"
+    
+#     plt.title(title)
+#     plt.tight_layout()
+#     plt.savefig(f'image_{index}_with_labels.png')
+#     plt.close()
+
+# def visualize_image_with_bboxes(dataset, index, annotation_file):
+#     img, (triplet, tool, verb, target, phase) = dataset[index]
+    
+#     # Convert the image tensor to a PIL Image for display
+#     img_pil = Image.fromarray((img.permute(1, 2, 0).numpy() * 255).astype('uint8'))
+    
+#     # Load the annotation file
+#     with open(annotation_file, 'r') as f:
+#         annotations = json.load(f)
+    
+#     # Get the frame number from the dataset
+#     frame_number = dataset.frames[index]
+    
+#     # Find the corresponding annotation
+#     frame_annotation = next((a for a in annotations['annotations'] if a['image_id'] == frame_number), None)
+    
+#     if frame_annotation is None:
+#         print(f"No annotation found for frame {frame_number}")
+#         return
+    
+#     # Create a figure and display the image
+#     fig, ax = plt.subplots(1, figsize=(12, 8))
+#     ax.imshow(img_pil)
+    
+#     # Draw bounding boxes
+#     for bbox in frame_annotation['bboxes']:
+#         x, y, w, h = bbox
+#         rect = patches.Rectangle((x, y), w, h, linewidth=2, edgecolor='r', facecolor='none')
+#         ax.add_patch(rect)
+    
+#     # Add title with frame information
+#     ax.set_title(f"Frame: {frame_number}, Phase: {annotations['categories']['phase'][str(frame_annotation['phase'])]}")
+    
+#     # Remove axis ticks
+#     ax.set_xticks([])
+#     ax.set_yticks([])
+    
+#     plt.tight_layout()
+#     plt.savefig(f'image_{index}_with_bboxes.png')
+#     plt.close()
+
+# def analyze_ivt_iv_frequencies(concat_dataset):
+#     ivt_counter = Counter()
+#     iv_counter = Counter()
+    
+#     for dataset in concat_dataset.datasets:
+#         for idx in range(len(dataset)):
+#             # Original IVT labels
+#             original_labels = dataset.label_data[dataset.frames[idx]]
+#             for label in original_labels:
+#                 ivt = label[0]
+#                 if ivt != -1.0:
+#                     ivt_counter[int(ivt)] += 1
+            
+#             # Processed IV labels
+#             _, processed_labels = dataset[idx]
+#             iv_label = processed_labels[0]
+#             for i, count in enumerate(iv_label):
+#                 if count > 0:
+#                     iv_counter[i] += count
+
+#     # Plotting
+#     fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(15, 20))
+
+#     # IVT Histogram
+#     ax1.bar(ivt_counter.keys(), ivt_counter.values())
+#     ax1.set_title('IVT Label Frequencies')
+#     ax1.set_xlabel('IVT Label')
+#     ax1.set_ylabel('Frequency')
+
+#     # IV Histogram
+#     ax2.bar(iv_counter.keys(), iv_counter.values())
+#     ax2.set_title('IV Label Frequencies')
+#     ax2.set_xlabel('IV Label')
+#     ax2.set_ylabel('Frequency')
+
+#     # Comparison plot
+#     ivt_total = sum(ivt_counter.values())
+#     iv_total = sum(iv_counter.values())
+#     ax3.bar(['IVT', 'IV'], [ivt_total, iv_total])
+#     ax3.set_title('Total IVT vs IV Occurrences')
+#     ax3.set_ylabel('Total Count')
+
+#     for ax in (ax1, ax2, ax3):
+#         for i, v in enumerate(ax.patches):
+#             ax.text(v.get_x() + v.get_width()/2, v.get_height(), str(int(v.get_height())), 
+#                     ha='center', va='bottom')
+
+#     plt.tight_layout()
+#     plt.savefig('ivt_iv_frequency_analysis.png')
+#     plt.close()
+
+#     print(f"Total IVT occurrences: {ivt_total}")
+#     print(f"Total IV occurrences: {iv_total}")
+#     print(f"Difference: {ivt_total - iv_total}")
+
+#     return ivt_counter, iv_counter
+
 
 if __name__ == "__main__":
     PATH_TO_CHOLECT50 = "/data/Bartscht/CholecT50"

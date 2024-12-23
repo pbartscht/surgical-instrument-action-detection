@@ -1,638 +1,414 @@
-"""
-CholecT50 Surgical Workflow Recognition Model.
-
-A PyTorch Lightning implementation of a multi-task learning model for surgical workflow recognition
-in laparoscopic surgery videos. The model performs simultaneous detection of:
-- Surgical instruments (tools)
-- Actions (verbs)
-- Instrument-verb pairs (IV)
-- Surgical phases
-
-The architecture uses a ResNet50 backbone with task-specific branches and implements an 
-instrument-guided attention mechanism for improved performance.
-
-Example:
-    >>> from surgical_workflow.models import CholecT50Model
-    >>> model = CholecT50Model()
-    >>> trainer = pl.Trainer(max_epochs=100)
-    >>> trainer.fit(model, train_dataloader, val_dataloader)
-
-Attributes:
-    NUM_TOOLS (int): Number of surgical instrument classes (default: 6)
-    NUM_VERBS (int): Number of action classes (default: 10)
-    NUM_IV (int): Number of instrument-verb pair classes (default: 26)
-    NUM_PHASES (int): Number of surgical phase classes (default: 7)
-
-References:
-    [1]: C.I. Nwoye, T. Yu, C. Gonzalez, B. Seeliger, P. Mascagni, D. Mutter, J. Marescaux, N. Padoy. Rendezvous: Attention Mechanisms for the Recognition of Surgical Action Triplets in Endoscopic Videos. Medical Image Analysis, 78 (2022) 102433.
-"""
-
 import pytorch_lightning as pl
 import torch
-import torch.nn as nn
-from torch.optim.lr_scheduler import ReduceLROnPlateau
+from torch import nn
+import torch.nn.functional as F
 from torchvision.models import resnet50
 from sklearn.metrics import average_precision_score
 import numpy as np
-from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+import warnings
 
-
-@dataclass
-class ModelConfig:
-    """Configuration for the CholecT50 model.
-    
-    This class centralizes all configuration parameters for the model architecture
-    and training process.
-    
-    Attributes:
-        num_tools: Number of surgical instrument classes
-        num_verbs: Number of action classes
-        num_iv: Number of instrument-verb pair classes
-        num_phases: Number of surgical phase classes
-        feature_dim: Dimension of backbone features
-        hidden_dim: Dimension of hidden layers
-        dropout_rate: Dropout probability
+def get_weight_balancing(case='cholect50'):
     """
-    # Model architecture
-    num_tools: int = 6
-    num_verbs: int = 10
-    num_iv: int = 26
-    num_phases: int = 7
-    feature_dim: int = 2048
-    hidden_dim: int = 1024
-    dropout_rate: float = 0.5
+    Returns class weight balancing factors for different surgical action recognition tasks.
     
-    # Learning rates
-    learning_rates: Dict[str, float] = field(default_factory=lambda: {
-        'backbone': 1e-3,
-        'tool': 5e-5,
-        'verb': 1e-3,
-        'iv': 3e-4,
-        'phase': 5e-4
-    })
-    
-    # Task weights for loss computation
-    task_weights: Dict[str, float] = field(default_factory=lambda: {
-        'tool': 0.8,
-        'verb': 1.3,
-        'iv': 1.7,
-        'phase': 1.0
-    })
-
-
-def get_class_weights() -> Dict[str, torch.Tensor]:
-    """Get class weights for handling imbalanced data.
-    
+    Args:
+        case (str): Dataset identifier. Currently supports 'cholect50-challenge'.
+        
     Returns:
-        Dictionary containing weight tensors for tool and verb classes
+        dict: Dictionary containing weight balancing factors for tools and verbs.
     """
-    weights = {
-        'tool': torch.tensor([
-            0.08495163,  # Grasper
-            0.88782288,  # Bipolar
-            0.11259564,  # Hook
-            2.61948830,  # Scissors
-            1.78486647,  # Clipper
-            1.14462417   # Irrigator
-        ]),
-        'verb': torch.tensor([
-            0.39862805,  # grasp
-            0.06981640,  # retract
-            0.08332925,  # dissect
-            0.81876204,  # coagulate
-            1.41586839,  # clip
-            2.26935915,  # cut
-            1.28428410,  # aspirate
-            7.35822511,  # irrigate
-            18.6785714,  # pack
-            0.45704490   # null_verb
-        ])
+    switcher = {
+        'cholect50-challenge': {
+            'tool': [0.08495163, 0.88782288, 0.11259564, 2.61948830, 1.784866470, 1.144624170],
+            'verb': [0.39862805, 0.06981640, 0.08332925, 0.81876204, 1.415868390, 2.269359150, 
+                    1.28428410, 7.35822511, 18.67857143, 0.45704490],
+        },
     }
-    return weights
+    return switcher.get(case)
 
-class InstrumentGuidedAttention(nn.Module):
-    """Attention mechanism guided by instrument predictions.
+class InstrumentGuidedMultiTaskModel(nn.Module):
+    """
+    Multi-task learning model for surgical workflow recognition with instrument guidance.
     
-    This module implements a spatial attention mechanism that uses instrument
-    detection results to guide the network's focus on relevant image regions.
+    The model uses a ResNet50 backbone and performs four related tasks:
+    1. Tool detection
+    2. Verb (action) recognition
+    3. Instrument-Verb (IV) pair recognition
+    4. Phase recognition
+    
+    The architecture implements a hierarchical structure where tool predictions guide
+    the verb and phase recognition, while both tool and verb predictions guide the IV recognition.
     """
     
-    def __init__(self, feature_dim: int, hidden_dim: int = 256):
-        """Initialize attention module.
+    def __init__(self, num_tools, num_verbs, num_iv, num_phases):
+        """
+        Initialize the multi-task model.
         
         Args:
-            feature_dim: Number of input feature channels
-            hidden_dim: Number of hidden channels in attention computation
+            num_tools (int): Number of surgical tool classes
+            num_verbs (int): Number of action/verb classes
+            num_iv (int): Number of instrument-verb pair classes
+            num_phases (int): Number of surgical phase classes
         """
         super().__init__()
         
-        self.attention_net = nn.Sequential(
-            # Reduce feature dimensions
-            nn.Conv2d(feature_dim, hidden_dim, kernel_size=1),
-            nn.BatchNorm2d(hidden_dim),
-            nn.ReLU(inplace=True),
-            
-            # Compute attention weights
-            nn.Conv2d(hidden_dim, 1, kernel_size=1),
-            nn.Sigmoid()
+        # Feature Extractor (ResNet50 Backbone)
+        resnet = resnet50(pretrained=True)
+        self.feature_extractor = nn.Sequential(*list(resnet.children())[:-2])
+        
+        # Shared Feature Processing Layers
+        self.shared_layers = nn.Sequential(
+            nn.Conv2d(2048, 1024, kernel_size=1),
+            nn.ReLU(),
+            nn.Dropout2d(0.5)
         )
         
-    def forward(self, features: torch.Tensor, tool_features: torch.Tensor) -> torch.Tensor:
-        """Apply attention mechanism.
-        
-        Args:
-            features: Input feature maps [batch_size, channels, height, width]
-            tool_features: Tool detection features [batch_size, num_tools, height, width]
-            
-        Returns:
-            Attended feature maps with same shape as input features
-        """
-        # Concatenate feature maps
-        combined_features = torch.cat([features, tool_features], dim=1)
-        
-        # Compute attention weights
-        attention_weights = self.attention_net(combined_features)
-        
-        # Apply attention
-        attended_features = features * attention_weights
-        
-        return attended_features
-
-
-class TaskBranch(nn.Module):
-    """Generic branch for task-specific predictions.
-    
-    This module implements a reusable architecture for different prediction tasks
-    (tools, verbs, IV pairs, phases) with optional guidance from other tasks.
-    """
-    
-    def __init__(
-        self,
-        in_channels: int,
-        out_channels: int,
-        guidance_channels: Optional[int] = None,
-        hidden_channels: int = 512,
-        dropout_rate: float = 0.5
-    ):
-        """Initialize task branch.
-        
-        Args:
-            in_channels: Number of input channels
-            out_channels: Number of output classes
-            guidance_channels: Number of guidance feature channels (optional)
-            hidden_channels: Number of hidden channels
-            dropout_rate: Dropout probability
-        """
-        super().__init__()
-        
-        # Calculate total input channels
-        total_channels = in_channels
-        if guidance_channels is not None:
-            total_channels += guidance_channels
-        
-        # Main prediction network
-        self.network = nn.Sequential(
-            # First convolution block
-            nn.Conv2d(total_channels, hidden_channels, kernel_size=1),
-            nn.BatchNorm2d(hidden_channels),
-            nn.ReLU(inplace=True),
-            nn.Dropout2d(p=dropout_rate),
-            
-            # Second convolution block
-            nn.Conv2d(hidden_channels, hidden_channels // 2, kernel_size=1),
-            nn.BatchNorm2d(hidden_channels // 2),
-            nn.ReLU(inplace=True),
-            nn.Dropout2d(p=dropout_rate),
-            
-            # Final prediction layer
-            nn.Conv2d(hidden_channels // 2, out_channels, kernel_size=1),
-            nn.AdaptiveAvgPool2d((1, 1)),
+        # Tool Recognition Branch
+        self.tool_branch = nn.Sequential(
+            nn.Conv2d(1024, 512, kernel_size=1),
+            nn.ReLU(),
+            nn.Dropout2d(0.6),
+            nn.Conv2d(512, 64, kernel_size=1),
+            nn.ReLU(),
+            nn.Conv2d(64, 64, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.BatchNorm2d(64),
+            nn.Conv2d(64, num_tools, kernel_size=1),
+            nn.AdaptiveAvgPool2d((1,1)),
             nn.Flatten()
         )
         
-    def forward(
-        self,
-        x: torch.Tensor,
-        guidance: Optional[torch.Tensor] = None
-    ) -> torch.Tensor:
-        """Forward pass through task branch.
+        # Verb Recognition Branch (guided by Tool activations)
+        self.verb_branch = nn.Sequential(
+            nn.Conv2d(1024 + num_tools, 512, kernel_size=1),
+            nn.ReLU(),
+            nn.Dropout2d(0.6),
+            nn.Conv2d(512, num_verbs, kernel_size=1),
+            nn.AdaptiveAvgPool2d((1,1)),
+            nn.Flatten()
+        )
+        
+        # IV Recognition Branch (guided by Tool and Verb activations)
+        self.iv_branch = nn.Sequential(
+            nn.Conv2d(1024 + num_tools + num_verbs, 512, kernel_size=1),
+            nn.ReLU(),
+            nn.Dropout2d(0.6),
+            nn.Conv2d(512, num_iv, kernel_size=1),
+            nn.AdaptiveAvgPool2d((1,1)),
+            nn.Flatten()
+        )
+        
+        # Phase Recognition Branch (guided by Tool activations)
+        self.phase_branch = nn.Sequential(
+            nn.Conv2d(1024 + num_tools, 512, kernel_size=1),
+            nn.ReLU(),
+            nn.Dropout2d(0.6),
+            nn.Conv2d(512, num_phases, kernel_size=1),
+            nn.AdaptiveAvgPool2d((1,1)),
+            nn.Flatten()
+        )
+
+        # Define valid Instrument-Verb combinations
+        self.register_buffer('instrument_verb_mapping', torch.tensor([
+            [1, 1, 1, 1, 1, 0, 0, 0, 0, 0],  # Grasper
+            [1, 1, 1, 0, 1, 1, 0, 0, 0, 0],  # Bipolar
+            [1, 1, 0, 0, 1, 1, 1, 0, 0, 0],  # Hook
+            [1, 0, 0, 0, 1, 1, 1, 0, 0, 0],  # Scissors
+            [1, 0, 0, 0, 0, 0, 0, 1, 0, 0],  # Clipper
+            [1, 1, 0, 0, 1, 0, 0, 0, 1, 1],  # Irrigator
+        ], dtype=torch.float32))
+
+    def forward(self, x):
+        """
+        Forward pass of the model.
         
         Args:
-            x: Input features [batch_size, in_channels, height, width]
-            guidance: Optional guidance features [batch_size, guidance_channels, height, width]
+            x (torch.Tensor): Input tensor of shape (batch_size, channels, height, width)
             
         Returns:
-            Task predictions [batch_size, out_channels]
+            tuple: Predictions for IV pairs, tools, verbs, and phases
         """
-        if guidance is not None:
-            x = torch.cat([x, guidance], dim=1)
+        # Extract and process shared features
+        features = self.feature_extractor(x)
+        shared = self.shared_layers(features)
         
-        return self.network(x)
+        # Tool recognition
+        tool_output = self.tool_branch(shared)
+        tool_activations = torch.sigmoid(tool_output).unsqueeze(-1).unsqueeze(-1)
+        
+        # Create tool-guided features
+        tool_guided_features = torch.cat(
+            [shared, tool_activations.expand(-1, -1, shared.size(2), shared.size(3))], 
+            dim=1
+        )
+        
+        # Verb recognition with tool guidance
+        verb_output = self.verb_branch(tool_guided_features)
+        verb_activations = torch.sigmoid(verb_output).unsqueeze(-1).unsqueeze(-1)
+        
+        # Apply instrument-verb compatibility mask
+        verb_mask = torch.mm(torch.sigmoid(tool_output), self.instrument_verb_mapping)
+        masked_verb_output = verb_output * verb_mask
+        
+        # IV recognition with tool and verb guidance
+        iv_guided_features = torch.cat(
+            [tool_guided_features, verb_activations.expand(-1, -1, shared.size(2), shared.size(3))], 
+            dim=1
+        )
+        iv_output = self.iv_branch(iv_guided_features)
+        
+        # Phase recognition with tool guidance
+        phase_output = self.phase_branch(tool_guided_features)
+        
+        return iv_output, tool_output, masked_verb_output, phase_output
 
-
-class InstrumentVerbMapping(nn.Module):
-    """Module for instrument-verb compatibility mapping.
+class CholecT50Model(pl.LightningModule):
+    """
+    PyTorch Lightning module for training and evaluating the CholecT50 model.
     
-    This module maintains and applies the compatibility matrix between
-    instruments and verbs to ensure valid instrument-verb combinations.
+    This class handles the training loop, loss computation, optimization,
+    and evaluation metrics for the multi-task surgical workflow recognition model.
     """
     
-    def __init__(self):
-        """Initialize the instrument-verb mapping matrix."""
-        super().__init__()
-        
-        # Define the compatibility matrix
-        mapping = torch.tensor([
-            # Grasper
-            [1, 1, 1, 1, 1, 0, 0, 0, 0, 0],
-            # Bipolar
-            [1, 1, 1, 0, 1, 1, 0, 0, 0, 0],
-            # Hook
-            [1, 1, 0, 0, 1, 1, 1, 0, 0, 0],
-            # Scissors
-            [1, 0, 0, 0, 1, 1, 1, 0, 0, 0],
-            # Clipper
-            [1, 0, 0, 0, 0, 0, 0, 1, 0, 0],
-            # Irrigator
-            [1, 1, 0, 0, 1, 0, 0, 0, 1, 1]
-        ], dtype=torch.float32)
-        
-        # Register as buffer to save with model
-        self.register_buffer('mapping', mapping)
-    
-    def forward(self, tool_probabilities: torch.Tensor) -> torch.Tensor:
-        """Apply instrument-verb compatibility mapping.
+    def __init__(self, learning_rate=1e-3, lr_tool=5e-5, lr_verb=1e-3, lr_iv=3e-4, lr_phase=5e-4):
+        """
+        Initialize the Lightning module.
         
         Args:
-            tool_probabilities: Tool detection probabilities [batch_size, num_tools]
+            learning_rate (float): Base learning rate for shared layers
+            lr_tool (float): Learning rate for tool recognition branch
+            lr_verb (float): Learning rate for verb recognition branch
+            lr_iv (float): Learning rate for IV pair recognition branch
+            lr_phase (float): Learning rate for phase recognition branch
+        """
+        super().__init__()
+        
+        # Define model dimensions
+        num_tools = 6
+        num_verbs = 10
+        num_iv = 26
+        num_phases = 7
+        
+        self.model = InstrumentGuidedMultiTaskModel(num_tools, num_verbs, num_iv, num_phases)
+        
+        # Load class weight balancing factors
+        weights = get_weight_balancing('cholect50-challenge')
+        self.tool_weights = torch.tensor(weights['tool'])
+        self.verb_weights = torch.tensor(weights['verb'])
+        
+        # Define loss functions
+        self.tool_criterion = nn.BCEWithLogitsLoss(pos_weight=self.tool_weights)
+        self.verb_criterion = nn.BCEWithLogitsLoss(pos_weight=self.verb_weights)
+        self.iv_criterion = nn.BCEWithLogitsLoss()
+        self.phase_criterion = nn.BCEWithLogitsLoss()
+        
+        # Store learning rates
+        self.learning_rate = learning_rate
+        self.lr_tool = lr_tool
+        self.lr_verb = lr_verb
+        self.lr_iv = lr_iv
+        self.lr_phase = lr_phase
+        
+        # Task importance weights for loss combination
+        self.iv_weight = 1.7
+        self.tool_weight = 0.8
+        self.verb_weight = 1.3
+        self.phase_weight = 1.0
+        
+        # Initialize prediction and target collectors for metric computation
+        self.predictions = {"iv": [], "tools": [], "verbs": [], "phases": []}
+        self.targets = {"iv": [], "tools": [], "verbs": [], "phases": []}
+
+    def forward(self, x):
+        """Forward pass wrapper for the underlying model."""
+        return self.model(x)
+    
+    def configure_optimizers(self):
+        """
+        Configure optimizers and learning rate schedulers.
+        
+        Returns:
+            dict: Optimizer and learning rate scheduler configuration
+        """
+        # Define parameter groups with different learning rates
+        params = [
+            {'params': self.model.feature_extractor.parameters(), 'lr': self.learning_rate},
+            {'params': self.model.shared_layers.parameters(), 'lr': self.learning_rate},
+            {'params': self.model.tool_branch.parameters(), 'lr': self.lr_tool},
+            {'params': self.model.verb_branch.parameters(), 'lr': self.lr_verb},
+            {'params': self.model.iv_branch.parameters(), 'lr': self.lr_iv},
+            {'params': self.model.phase_branch.parameters(), 'lr': self.lr_phase},
+        ]
+        
+        # Initialize optimizer and scheduler
+        optimizer = torch.optim.AdamW(params, weight_decay=1e-2)
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, 'min', patience=2, factor=0.5
+        )
+        
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {
+                "scheduler": scheduler,
+                "monitor": "val/total_loss",
+            },
+        }
+    
+    def training_step(self, batch, batch_idx):
+        """
+        Training step logic.
+        
+        Args:
+            batch (tuple): Input batch containing images and labels
+            batch_idx (int): Index of the current batch
             
         Returns:
-            Verb compatibility mask [batch_size, num_verbs]
+            dict: Dictionary containing loss values
         """
-        return torch.mm(tool_probabilities, self.mapping)
-    
-class CholecT50Model(pl.LightningModule):
-        """
-        Main model for surgical workflow recognition.
-        This PyTorch Lightning module combines all components for multi-task learning:
-        - Feature extraction (ResNet50 backbone)
-        - Instrument-guided attention
-        - Task-specific prediction branches
-        - Training and validation logic
-        """
+        img, labels = batch
+        iv_label, tool_label, verb_label, _, phase_label = labels
         
-        def __init__(self, config: Optional[ModelConfig] = None):
-            """Initialize the model.
-            
-            Args:
-                config: Model configuration, uses default if not provided
-            """
-            super().__init__()
-            self.config = config or ModelConfig()
-            self.save_hyperparameters()
-            
-            # Build model components
-            self._build_backbone()
-            self._build_task_branches()
-            self._init_criterions()
-            self._init_metric_tracking()
+        # Forward pass
+        iv_output, tool_output, verb_output, phase_output = self(img)
+        
+        # Compute individual losses
+        iv_loss = self.iv_criterion(iv_output, iv_label.float())
+        tool_loss = self.tool_criterion(tool_output, tool_label.float())
+        verb_loss = self.verb_criterion(verb_output, verb_label.float())
+        phase_loss = self.phase_criterion(phase_output, phase_label.float())
+        
+        # Compute weighted total loss
+        total_loss = (self.iv_weight * iv_loss + self.tool_weight * tool_loss + 
+                     self.verb_weight * verb_loss + self.phase_weight * phase_loss)
+        
+        # Log losses
+        self.log("train/iv_loss", iv_loss)
+        self.log("train/tool_loss", tool_loss)
+        self.log("train/verb_loss", verb_loss)
+        self.log("train/phase_loss", phase_loss)
+        self.log("train/total_loss", total_loss)
+        
+        return {
+            "loss": total_loss, 
+            "iv_loss": iv_loss, 
+            "tool_loss": tool_loss, 
+            "verb_loss": verb_loss, 
+            "phase_loss": phase_loss
+        }
+    def validation_step(self, batch, batch_idx):
+        """
+        Validation step logic.
+        
+        Similar to training step but also accumulates predictions for metric computation.
+        """
+        img, labels = batch
+        iv_label, tool_label, verb_label, _, phase_label = labels
+        
+        # Forward pass
+        iv_output, tool_output, verb_output, phase_output = self(img)
+        
+        # Compute losses
+        iv_loss = self.iv_criterion(iv_output, iv_label.float())
+        tool_loss = self.tool_criterion(tool_output, tool_label.float())
+        verb_loss = self.verb_criterion(verb_output, verb_label.float())
+        phase_loss = self.phase_criterion(phase_output, phase_label.float())
+        
+        total_loss = (self.iv_weight * iv_loss + self.tool_weight * tool_loss + 
+                     self.verb_weight * verb_loss + self.phase_weight * phase_loss)
+        
+        # Log validation losses
+        self.log("val/iv_loss", iv_loss)
+        self.log("val/tool_loss", tool_loss)
+        self.log("val/verb_loss", verb_loss)
+        self.log("val/phase_loss", phase_loss)
+        self.log("val/total_loss", total_loss)
+        
+        # Accumulate predictions and targets for metric computation
+        self.predictions["iv"].append(iv_output.cpu().numpy())
+        self.predictions["tools"].append(tool_output.cpu().numpy())
+        self.predictions["verbs"].append(verb_output.cpu().numpy())
+        self.predictions["phases"].append(phase_output.cpu().numpy())
+        self.targets["iv"].append(iv_label.cpu().numpy())
+        self.targets["tools"].append(tool_label.cpu().numpy())
+        self.targets["verbs"].append(verb_label.cpu().numpy())
+        self.targets["phases"].append(phase_label.cpu().numpy())
+        
+        return {
+            "val_loss": total_loss, 
+            "iv_loss": iv_loss, 
+            "tool_loss": tool_loss, 
+            "verb_loss": verb_loss, 
+            "phase_loss": phase_loss
+        }
+    
+    def on_validation_epoch_end(self):
+        """
+        Called at the end of validation epoch to compute metrics.
+        
+        Computes mean Average Precision (mAP) for all tasks and logs results.
+        """
+        # Compute mAP for each task
+        mAP_iv = self.compute_mAP("iv")
+        mAP_tools = self.compute_mAP("tools")
+        mAP_verbs = self.compute_mAP("verbs")
+        mAP_phases = self.compute_mAP("phases")
+        
+        # Log metrics
+        self.log("val/mAP_iv", mAP_iv)
+        self.log("val/mAP_tools", mAP_tools)
+        self.log("val/mAP_verbs", mAP_verbs)
+        self.log("val/mAP_phases", mAP_phases)
+        
+        # Reset accumulators for next epoch
+        self.predictions = {"iv": [], "tools": [], "verbs": [], "phases": []}
+        self.targets = {"iv": [], "tools": [], "verbs": [], "phases": []}
+    
+    def test_step(self, batch, batch_idx):
+        """
+        Test step logic. Uses the same procedure as validation step.
+        """
+        return self.validation_step(batch, batch_idx)
+    
+    def on_test_epoch_end(self):
+        """
+        Called at the end of test epoch. Uses the same metric computation as validation.
+        """
+        self.on_validation_epoch_end()
 
-        def _build_backbone(self):
-            """Initialize feature extraction backbone."""
-            # Load pretrained ResNet50
-            resnet = resnet50(pretrained=True)
-            self.backbone = nn.Sequential(*list(resnet.children())[:-2])
+    def compute_mAP(self, component):
+        """
+        Compute mean Average Precision for a specific component/task.
+        
+        Args:
+            component (str): Name of the component to compute mAP for ('iv', 'tools', 'verbs', or 'phases')
             
-            # Freeze early layers
-            for param in self.backbone[:-3].parameters():
-                param.requires_grad = False
-                
-            # Feature refinement
-            self.feature_refinement = nn.Sequential(
-                nn.Conv2d(self.config.feature_dim, self.config.hidden_dim, 1),
-                nn.BatchNorm2d(self.config.hidden_dim),
-                nn.ReLU(inplace=True),
-                nn.Dropout2d(p=self.config.dropout_rate)
-            )
-            
-            # Attention mechanism
-            self.attention = InstrumentGuidedAttention(
-                feature_dim=self.config.hidden_dim + self.config.num_tools
-            )
+        Returns:
+            float: Mean Average Precision value
+        """
+        # Concatenate all predictions and targets for the component
+        targets = np.concatenate(self.targets[component])
+        predicts = np.concatenate(self.predictions[component])
+        
+        # Compute AP for each class and handle potential warnings
+        with warnings.catch_warnings():
+            # Compute classwise AP and handle NaN values
+            classwise = average_precision_score(targets, predicts, average=None)
+            classwise = np.array([0 if np.isnan(x) else x for x in classwise])
+            mean = np.nanmean(classwise)
+        
+        # Log AP for each class
+        for i, ap in enumerate(classwise):
+            self.log(f"val/AP_{component}_{i}", ap)
+        
+        return mean
 
-        def _build_task_branches(self):
-            """Initialize task-specific branches."""
-            # Tool detection branch
-            self.tool_branch = TaskBranch(
-                in_channels=self.config.hidden_dim,
-                out_channels=self.config.num_tools
-            )
-            
-            # Verb recognition branch (guided by tools)
-            self.verb_branch = TaskBranch(
-                in_channels=self.config.hidden_dim,
-                out_channels=self.config.num_verbs,
-                guidance_channels=self.config.num_tools
-            )
-            
-            # IV recognition branch (guided by tools and verbs)
-            self.iv_branch = TaskBranch(
-                in_channels=self.config.hidden_dim,
-                out_channels=self.config.num_iv,
-                guidance_channels=self.config.num_tools + self.config.num_verbs
-            )
-            
-            # Phase recognition branch (guided by tools)
-            self.phase_branch = TaskBranch(
-                in_channels=self.config.hidden_dim,
-                out_channels=self.config.num_phases,
-                guidance_channels=self.config.num_tools
-            )
-            
-            # Instrument-verb mapping
-            self.iv_mapping = InstrumentVerbMapping()
-
-        def _init_criterions(self):
-            """Initialize loss functions."""
-            weights = get_class_weights()
-            self.criterion_tool = nn.BCEWithLogitsLoss(pos_weight=weights['tool'])
-            self.criterion_verb = nn.BCEWithLogitsLoss(pos_weight=weights['verb'])
-            self.criterion_iv = nn.BCEWithLogitsLoss()
-            self.criterion_phase = nn.BCEWithLogitsLoss()
-
-        def _init_metric_tracking(self):
-            """Initialize metrics for tracking."""
-            self.predictions = {
-                "iv": [], "tools": [], "verbs": [], "phases": []
-            }
-            self.targets = {
-                "iv": [], "tools": [], "verbs": [], "phases": []
-            }
-
-        def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, ...]:
-            """Forward pass through the model.
-            
-            Args:
-                x: Input images [batch_size, channels, height, width]
-                
-            Returns:
-                Tuple of (iv_preds, tool_preds, verb_preds, phase_preds)
-            """
-            # Extract features
-            features = self.backbone(x)
-            features = self.feature_refinement(features)
-            
-            # Tool prediction
-            tool_preds = self.tool_branch(features)
-            tool_probs = torch.sigmoid(tool_preds)
-            
-            # Apply attention with tool guidance
-            tool_attention = tool_probs.unsqueeze(-1).unsqueeze(-1)
-            attended_features = self.attention(features, tool_attention.expand(-1, -1, *features.shape[-2:]))
-            
-            # Verb prediction with tool guidance
-            verb_preds = self.verb_branch(attended_features, tool_attention)
-            
-            # Apply instrument-verb compatibility
-            verb_probs = torch.sigmoid(verb_preds)
-            verb_mask = self.iv_mapping(tool_probs)
-            masked_verb_probs = verb_probs * verb_mask
-            
-            # Combine guidance for IV prediction
-            combined_guidance = torch.cat([
-                tool_attention,
-                masked_verb_probs.unsqueeze(-1).unsqueeze(-1)
-            ], dim=1)
-            
-            # IV and phase predictions
-            iv_preds = self.iv_branch(attended_features, combined_guidance)
-            phase_preds = self.phase_branch(attended_features, tool_attention)
-            
-            return iv_preds, tool_preds, verb_preds, phase_preds
-
-        def configure_optimizers(self):
-            """Configure optimizer and learning rate scheduler."""
-            # Group parameters by learning rate
-            param_groups = [
-                {'params': self.backbone.parameters(), 
-                'lr': self.config.learning_rates['backbone']},
-                {'params': self.tool_branch.parameters(), 
-                'lr': self.config.learning_rates['tool']},
-                {'params': self.verb_branch.parameters(), 
-                'lr': self.config.learning_rates['verb']},
-                {'params': self.iv_branch.parameters(), 
-                'lr': self.config.learning_rates['iv']},
-                {'params': self.phase_branch.parameters(), 
-                'lr': self.config.learning_rates['phase']}
-            ]
-            
-            optimizer = torch.optim.AdamW(param_groups, weight_decay=0.01)
-            scheduler = ReduceLROnPlateau(
-                optimizer,
-                mode='min',
-                factor=0.5,
-                patience=2,
-                verbose=True
-            )
-            
-            return {
-                "optimizer": optimizer,
-                "lr_scheduler": {
-                    "scheduler": scheduler,
-                    "monitor": "val_loss",
-                },
-            }
-        def compute_losses(
-            self,
-            predictions: Tuple[torch.Tensor, ...],
-            targets: Tuple[torch.Tensor, ...]
-        ) -> Dict[str, torch.Tensor]:
-            """Compute task-specific and combined losses.
-            
-            Args:
-                predictions: Model predictions (iv, tool, verb, phase)
-                targets: Ground truth labels (iv, tool, verb, phase)
-                
-            Returns:
-                Dictionary containing individual and total losses
-            """
-            iv_preds, tool_preds, verb_preds, phase_preds = predictions
-            iv_target, tool_target, verb_target, phase_target = targets
-            
-            # Compute individual losses
-            losses = {
-                'tool': self.criterion_tool(tool_preds, tool_target),
-                'verb': self.criterion_verb(verb_preds, verb_target),
-                'iv': self.criterion_iv(iv_preds, iv_target),
-                'phase': self.criterion_phase(phase_preds, phase_target)
-            }
-            
-            # Compute weighted total loss
-            total_loss = sum(
-                self.config.task_weights[task] * loss 
-                for task, loss in losses.items()
-            )
-            
-            losses['total'] = total_loss
-            return losses
-
-        def training_step(
-            self,
-            batch: Tuple[torch.Tensor, torch.Tensor],
-            batch_idx: int
-        ) -> torch.Tensor:
-            """Execute training step.
-            
-            Args:
-                batch: Tuple of (images, labels)
-                batch_idx: Index of current batch
-                
-            Returns:
-                Total loss value
-            """
-            # Unpack batch
-            images, (iv_target, tool_target, verb_target, _, phase_target) = batch
-            
-            # Forward pass
-            predictions = self(images)
-            
-            # Compute losses
-            losses = self.compute_losses(
-                predictions,
-                (iv_target, tool_target, verb_target, phase_target)
-            )
-            
-            # Log training metrics
-            self.log('train/loss', losses['total'])
-            for task, loss in losses.items():
-                if task != 'total':
-                    self.log(f'train/{task}_loss', loss)
-            
-            return losses['total']
-
-        def validation_step(
-            self,
-            batch: Tuple[torch.Tensor, torch.Tensor],
-            batch_idx: int
-        ) -> None:
-            """Execute validation step.
-            
-            Args:
-                batch: Tuple of (images, labels)
-                batch_idx: Index of current batch
-            """
-            # Unpack batch
-            images, (iv_target, tool_target, verb_target, _, phase_target) = batch
-            
-            # Forward pass
-            predictions = self(images)
-            iv_preds, tool_preds, verb_preds, phase_preds = predictions
-            
-            # Compute losses
-            losses = self.compute_losses(
-                predictions,
-                (iv_target, tool_target, verb_target, phase_target)
-            )
-            
-            # Log validation metrics
-            self.log('val/loss', losses['total'])
-            for task, loss in losses.items():
-                if task != 'total':
-                    self.log(f'val/{task}_loss', loss)
-            
-            # Store predictions and targets for mAP computation
-            self._store_predictions(
-                predictions=(iv_preds, tool_preds, verb_preds, phase_preds),
-                targets=(iv_target, tool_target, verb_target, phase_target)
-            )
-
-        def _store_predictions(
-            self,
-            predictions: Tuple[torch.Tensor, ...],
-            targets: Tuple[torch.Tensor, ...]
-        ) -> None:
-            """Store predictions and targets for metric computation.
-            
-            Args:
-                predictions: Model predictions
-                targets: Ground truth labels
-            """
-            # Map predictions and targets to their respective tasks
-            pred_dict = {
-                'iv': predictions[0],
-                'tools': predictions[1],
-                'verbs': predictions[2],
-                'phases': predictions[3]
-            }
-            target_dict = {
-                'iv': targets[0],
-                'tools': targets[1],
-                'verbs': targets[2],
-                'phases': targets[3]
-            }
-            
-            # Store as numpy arrays
-            for task in self.predictions.keys():
-                self.predictions[task].append(
-                    torch.sigmoid(pred_dict[task]).detach().cpu().numpy()
-                )
-                self.targets[task].append(
-                    target_dict[task].detach().cpu().numpy()
-                )
-
-        def on_validation_epoch_end(self) -> None:
-            """Compute metrics at the end of validation epoch."""
-            metrics = self._compute_metrics()
-            
-            # Log metrics
-            for name, value in metrics.items():
-                self.log(f'val/{name}', value)
-            
-            # Reset storage
-            self._init_metric_tracking()
-
-        def _compute_metrics(self) -> Dict[str, float]:
-            """Compute evaluation metrics (mAP).
-            
-            Returns:
-                Dictionary containing computed metrics
-            """
-            metrics = {}
-            
-            # Compute mAP for each task
-            for task in self.predictions.keys():
-                # Concatenate predictions and targets
-                y_pred = np.concatenate(self.predictions[task])
-                y_true = np.concatenate(self.targets[task])
-                
-                # Compute AP for each class
-                with np.errstate(invalid='ignore'):
-                    ap_scores = average_precision_score(
-                        y_true, y_pred, average=None
-                    )
-                    
-                    # Handle NaN scores (classes not present in validation set)
-                    ap_scores = np.nan_to_num(ap_scores, 0)
-                    
-                    # Compute mean AP
-                    map_score = np.mean(ap_scores)
-                
-                # Store metrics
-                metrics[f'mAP_{task}'] = float(map_score)
-                for i, ap in enumerate(ap_scores):
-                    metrics[f'AP_{task}_{i}'] = float(ap)
-            
-            return metrics
-
-        def test_step(
-            self,
-            batch: Tuple[torch.Tensor, torch.Tensor],
-            batch_idx: int
-        ) -> None:
-            """Execute test step (same as validation)."""
-            return self.validation_step(batch, batch_idx)
-
-        def on_test_epoch_end(self) -> None:
-            """Compute metrics at the end of test epoch."""
-            return self.on_validation_epoch_end()
+    def on_epoch_start(self):
+        """
+        Called at the start of each epoch.
+        
+        After 10 epochs, unfreeze the last two layers of the feature extractor
+        to allow fine-tuning of deeper features.
+        """
+        if self.current_epoch == 10:
+            for param in self.model.feature_extractor[-2:].parameters():
+                param.requires_grad = True
