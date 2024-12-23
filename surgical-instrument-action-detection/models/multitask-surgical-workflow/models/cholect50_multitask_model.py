@@ -6,6 +6,7 @@ from torchvision.models import resnet50
 from sklearn.metrics import average_precision_score
 import numpy as np
 import warnings
+from .archs.backbones import get_backbone
 
 def get_weight_balancing(case='cholect50'):
     """
@@ -30,7 +31,7 @@ class InstrumentGuidedMultiTaskModel(nn.Module):
     """
     Multi-task learning model for surgical workflow recognition with instrument guidance.
     
-    The model uses a ResNet50 backbone and performs four related tasks:
+    The model uses a flexible backbone architecture and performs four related tasks:
     1. Tool detection
     2. Verb (action) recognition
     3. Instrument-Verb (IV) pair recognition
@@ -40,7 +41,7 @@ class InstrumentGuidedMultiTaskModel(nn.Module):
     the verb and phase recognition, while both tool and verb predictions guide the IV recognition.
     """
     
-    def __init__(self, num_tools, num_verbs, num_iv, num_phases):
+    def __init__(self, num_tools, num_verbs, num_iv, num_phases, backbone_name='resnet50', pretrained=True):
         """
         Initialize the multi-task model.
         
@@ -49,16 +50,18 @@ class InstrumentGuidedMultiTaskModel(nn.Module):
             num_verbs (int): Number of action/verb classes
             num_iv (int): Number of instrument-verb pair classes
             num_phases (int): Number of surgical phase classes
+            backbone_name (str): Name of the backbone architecture to use
+            pretrained (bool): Whether to use pretrained weights for the backbone
         """
         super().__init__()
         
-        # Feature Extractor (ResNet50 Backbone)
-        resnet = resnet50(pretrained=True)
-        self.feature_extractor = nn.Sequential(*list(resnet.children())[:-2])
+        # Feature Extractor (Flexible Backbone)
+        self.feature_extractor = get_backbone(backbone_name, pretrained=pretrained)
+        backbone_channels = self.feature_extractor.get_output_channels()
         
         # Shared Feature Processing Layers
         self.shared_layers = nn.Sequential(
-            nn.Conv2d(2048, 1024, kernel_size=1),
+            nn.Conv2d(backbone_channels, 1024, kernel_size=1),
             nn.ReLU(),
             nn.Dropout2d(0.5)
         )
@@ -117,6 +120,32 @@ class InstrumentGuidedMultiTaskModel(nn.Module):
             [1, 0, 0, 0, 0, 0, 0, 1, 0, 0],  # Clipper
             [1, 1, 0, 0, 1, 0, 0, 0, 1, 1],  # Irrigator
         ], dtype=torch.float32))
+        
+        # Initialize weights for the new layers
+        self._initialize_weights()
+
+    def _initialize_weights(self):
+        """Initialize weights for all layers except the backbone"""
+        for m in [self.shared_layers, self.tool_branch, self.verb_branch, 
+                 self.iv_branch, self.phase_branch]:
+            for layer in m.modules():
+                if isinstance(layer, nn.Conv2d):
+                    nn.init.kaiming_normal_(layer.weight)
+                    if layer.bias is not None:
+                        nn.init.constant_(layer.bias, 0)
+                elif isinstance(layer, nn.BatchNorm2d):
+                    nn.init.constant_(layer.weight, 1)
+                    nn.init.constant_(layer.bias, 0)
+
+    def freeze_backbone(self):
+        """Freeze backbone layers"""
+        for param in self.feature_extractor.parameters():
+            param.requires_grad = False
+
+    def unfreeze_backbone(self):
+        """Unfreeze backbone layers"""
+        for param in self.feature_extractor.parameters():
+            param.requires_grad = True
 
     def forward(self, x):
         """
