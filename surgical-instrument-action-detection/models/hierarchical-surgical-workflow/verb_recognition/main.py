@@ -1,7 +1,7 @@
 import pytorch_lightning as pl
 from pytorch_lightning.loggers import WandbLogger
 from pytorch_lightning.callbacks import ModelCheckpoint
-from models.constrain_model import VerbRecognitionModel
+from models.SurgicalActionNet import SurgicalVerbRecognition
 from utils.verbdataloader import VerbDataModule
 import os
 
@@ -16,7 +16,7 @@ def main():
     datamodule = VerbDataModule(base_dir, batch_size, num_workers)
     
     print("Initializing Model...")
-    model = VerbRecognitionModel(
+    model = SurgicalVerbRecognition(
         num_classes=10,
         learning_rate=1e-5,
         backbone_learning_rate=1e-6,
