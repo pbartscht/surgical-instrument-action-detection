@@ -44,7 +44,7 @@ def main():
     
     # Simple trainer setup
     trainer = pl.Trainer(
-        max_epochs=40,
+        max_epochs=50,
         accelerator='gpu',
         devices=1,
         precision='16-mixed',
