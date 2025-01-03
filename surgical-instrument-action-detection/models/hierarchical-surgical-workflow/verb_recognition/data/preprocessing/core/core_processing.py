@@ -38,21 +38,21 @@ def create_directory_structure(base_dir):
 
 def load_ground_truth_from_json(dataset_dir, video):
     """
-    Verbesserte Ground Truth Ladung mit Überprüfung auf eindeutige Verb-Zuordnungen
+    Improved ground truth data loading with check for unique verb assignments    
     """
     labels_folder = os.path.join(dataset_dir, "CholecT50", "labels")
     json_file = os.path.join(labels_folder, f"{video}.json")
     
     frame_annotations = defaultdict(lambda: {
         'instruments': defaultdict(int),
-        'verbs': defaultdict(set)  # Nutze set für unique Verben
+        'verbs': defaultdict(set) 
     })
     
     with open(json_file, 'r') as f:
         data = json.load(f)
         annotations = data['annotations']
         
-        # Sammle erst alle Informationen
+        # Collect all necessary informations
         for frame, instances in annotations.items():
             frame_number = int(frame)
             for instance in instances:
@@ -67,7 +67,7 @@ def load_ground_truth_from_json(dataset_dir, video):
                         verb_name = VERB_MAPPING[verb]
                         frame_annotations[frame_number]['verbs'][instrument_name].add(verb_name)
         
-        # Bereinige nicht eindeutige Fälle
+        # Clean up ambiguous cases
         final_annotations = defaultdict(dict)
         for frame_number, frame_data in frame_annotations.items():
             final_annotations[frame_number]['instruments'] = {}
@@ -75,7 +75,7 @@ def load_ground_truth_from_json(dataset_dir, video):
             
             for instrument, count in frame_data['instruments'].items():
                 verbs = frame_data['verbs'][instrument]
-                # Nur wenn genau eine Instanz und ein eindeutiges Verb
+                # Only if exactly one instance and a unique verb
                 if count == 1 and len(verbs) == 1:
                     final_annotations[frame_number]['instruments'][instrument] = 1
                     final_annotations[frame_number]['verbs'][instrument] = verbs.pop()
