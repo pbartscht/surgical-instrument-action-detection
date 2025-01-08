@@ -25,17 +25,16 @@ def main():
     
     # Initialize WandB logger first to get the run ID
     wandb_logger = WandbLogger(project='verb-recognition')
-    run_id = wandb_logger.experiment.id
     run_name = wandb_logger.experiment.name
     
     # Create a unique directory for this run's checkpoints
-    checkpoint_dir = os.path.join('checkpoints', f'{run_name}-{run_id}')
+    checkpoint_dir = os.path.join('checkpoints', f'{run_name}')
     os.makedirs(checkpoint_dir, exist_ok=True)
     
     # Updated checkpoint callback with run information
     checkpoint_callback = ModelCheckpoint(
         dirpath=checkpoint_dir,
-        filename=f'verb-model-{run_name}-{run_id}' + '-epoch={epoch:02d}-val_loss={val/loss:.3f}',
+        filename='{run_name}-epoch{epoch}',  # Variablen in geschweiften Klammern als String
         monitor='val/loss',
         mode='min',
         save_top_k=3,
@@ -57,7 +56,7 @@ def main():
     
     # Start training
     try:
-        print(f"Starting training... Run ID: {run_id}, Run Name: {run_name}")
+        print(f"Starting training... Run Name: {run_name}")
         trainer.fit(model, datamodule)
     except Exception as e:
         print(f"Error during training: {str(e)}")
