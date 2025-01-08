@@ -1,393 +1,523 @@
 import os
 import sys
 from pathlib import Path
-from PIL import Image, ImageDraw, ImageFont
-from collections import defaultdict
 import torch
 import torch.nn as nn
 import torchvision.transforms as transforms
 import numpy as np
 import json
+from PIL import Image, ImageDraw, ImageFont
+from collections import defaultdict
 from tqdm import tqdm
 from ultralytics import YOLO
+import pytorch_lightning as pl
 
-# Setze Working Directory und Python Path für korrekte Imports
-current_dir = Path(os.path.dirname(os.path.abspath(__file__)))
-verb_recognition_dir = current_dir.parent / 'verb_recognition'
-os.chdir(verb_recognition_dir)
-sys.path.insert(0, str(verb_recognition_dir))
+# Path configuration
+current_dir = Path(__file__).resolve().parent
+hierarchical_dir = current_dir.parent
+sys.path.append(str(hierarchical_dir))
 
-from models.SurgicalActionNet import SurgicalVerbRecognition
+# Custom imports
+from verb_recognition.models.SurgicalActionNet import SurgicalVerbRecognition
 
-# Globale Konfiguration
-class Config:
-    CONFIDENCE_THRESHOLD = 0.6
-    IOU_THRESHOLD = 0.3
-    VIDEOS_TO_ANALYZE = ["VID92", "VID96", "VID103", "VID110", "VID111"]
+# Constants
+CONFIDENCE_THRESHOLD = 0.6
+IOU_THRESHOLD = 0.3
+VIDEOS_TO_ANALYZE = ["VID92"]  # Initially only VID92
+
+# Global mappings
+TOOL_MAPPING = {
+    0: 'grasper', 1: 'bipolar', 2: 'hook', 
+    3: 'scissors', 4: 'clipper', 5: 'irrigator'
+}
+
+VERB_MAPPING = {
+    0: 'grasp', 1: 'retract', 2: 'dissect', 3: 'coagulate', 
+    4: 'clip', 5: 'cut', 6: 'aspirate', 7: 'irrigate', 
+    8: 'pack', 9: 'null_verb'
+}
+
+# Mapping between verb model indices and evaluation indices
+VERB_MODEL_TO_EVAL_MAPPING = {
+    0: 2,   # Model: 'dissect' -> Eval: 'dissect'
+    1: 1,   # Model: 'retract' -> Eval: 'retract'
+    2: 9,   # Model: 'null_verb' -> Eval: 'null_verb'
+    3: 3,   # Model: 'coagulate' -> Eval: 'coagulate'
+    4: 0,   # Model: 'grasp' -> Eval: 'grasp'
+    5: 4,   # Model: 'clip' -> Eval: 'clip'
+    6: 6,   # Model: 'aspirate' -> Eval: 'aspirate'
+    7: 5,   # Model: 'cut' -> Eval: 'cut'
+    8: 7,   # Model: 'irrigate' -> Eval: 'irrigate'
+    9: 9    # Model: 'null_verb' -> Eval: 'null_verb'
+}
+
+def calculate_precision_recall(y_true: np.ndarray, y_pred: np.ndarray, threshold: float) -> tuple[float, float, dict]:
+    """Calculates precision and recall for a threshold."""
+    predictions = (y_pred >= threshold).astype(int)
+    TP = np.sum((predictions == 1) & (y_true == 1))
+    FP = np.sum((predictions == 1) & (y_true == 0))
+    FN = np.sum((predictions == 0) & (y_true == 1))
     
-    # Paths
-    BASE_DIR = Path("/home/Bartscht/YOLO")
-    DATASET_DIR = Path("/data/Bartscht")
-    YOLO_WEIGHTS = BASE_DIR / "runs/detect/train35/weights/best.pt"
-    VERB_WEIGHTS = BASE_DIR / "surgical-instrument-action-detection/models/hierarchical-surgical-workflow/verb_recognition/checkpoints/expert-field/expert-field-epoch33/loss=0.824.ckpt"
-    OUTPUT_DIR = Path("/data/Bartscht/VID92_val")
+    precision = TP / (TP + FP) if (TP + FP) > 0 else 0
+    recall = TP / (TP + FN) if (TP + FN) > 0 else 0
     
-    # Mappings
-    TOOL_MAPPING = {
-        0: 'grasper',
-        1: 'bipolar',
-        2: 'hook',
-        3: 'scissors',
-        4: 'clipper',
-        5: 'irrigator'
-    }
+    return precision, recall, {'TP': TP, 'FP': FP, 'FN': FN}
 
-    VERB_MAPPING = {
-        0: 'grasp',
-        1: 'retract',
-        2: 'dissect',
-        3: 'coagulate',
-        4: 'clip',
-        5: 'cut',
-        6: 'aspirate',
-        7: 'irrigate',
-        8: 'pack',
-        9: 'null_verb'
-    }
+def calculate_ap(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    """Calculates Average Precision with interpolation of all points."""
+    if len(y_true) == 0:
+        return 0.0
     
-    # Image transforms
-    TRANSFORMS = transforms.Compose([
-        transforms.Resize((224, 224)),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], 
-                           std=[0.229, 0.224, 0.225])
-    ])
+    # Sort by confidence in descending order
+    sort_idx = np.argsort(y_pred)[::-1]
+    y_true = y_true[sort_idx]
+    y_pred = y_pred[sort_idx]
+    
+    # Calculate cumulative metrics
+    tp = np.cumsum(y_true)
+    fp = np.cumsum(1 - y_true)
+    
+    # Calculate precision and recall
+    precision = tp / (tp + fp)
+    recall = tp / np.sum(y_true)
+    
+    # Add start and end points
+    precision = np.concatenate([[0], precision, [0]])
+    recall = np.concatenate([[0], recall, [1]])
+    
+    # Interpolate precision
+    for i in range(len(precision)-2, -1, -1):
+        precision[i] = max(precision[i], precision[i+1])
+    
+    # Calculate AP
+    ap = 0
+    for i in range(len(recall)-1):
+        ap += (recall[i+1] - recall[i]) * precision[i+1]
+    
+    return ap
 
-class HierarchicalEvaluator:
-    def __init__(self, config):
-        self.config = config
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        print(f"Using device: {self.device}")
+class ModelLoader:
+    def __init__(self):
+        self.hierarchical_dir = hierarchical_dir
+        self.setup_paths()
+
+    def setup_paths(self):
+        """Defines all important paths for the models"""
+        # YOLO model path
+        self.yolo_weights = self.hierarchical_dir / "Instrument-classification-detection/weights/instrument_detector/best_v35.pt"
+        # Verb model path
+        self.verb_model_path = self.hierarchical_dir / "verb_recognition/checkpoints/expert-field/expert-field-epoch33/loss=0.824.ckpt"
         
-        # Modelle laden
-        self.load_models()
+        # Dataset path
+        self.dataset_path = Path("/data/Bartscht/CholecT50")
         
-        # Output Directory erstellen
-        self.config.OUTPUT_DIR.mkdir(exist_ok=True)
-    
-    def load_models(self):
-        """Lädt beide Modelle (YOLO und VerbRecognition)"""
+        print(f"YOLO weights path: {self.yolo_weights}")
+        print(f"Verb model path: {self.verb_model_path}")
+        print(f"Dataset path: {self.dataset_path}")
+
+        # Validate paths
+        if not self.yolo_weights.exists():
+            raise FileNotFoundError(f"YOLO weights not found at: {self.yolo_weights}")
+        if not self.verb_model_path.exists():
+            raise FileNotFoundError(f"Verb model checkpoint not found at: {self.verb_model_path}")
+        if not self.dataset_path.exists():
+            raise FileNotFoundError(f"Dataset not found at: {self.dataset_path}")
+
+    def load_yolo_model(self):
         try:
-            # YOLO laden
-            print("Loading YOLO model...")
-            self.yolo_model = YOLO(str(self.config.YOLO_WEIGHTS))
+            model = YOLO(str(self.yolo_weights))
             print("YOLO model loaded successfully")
-            
-            # Verb Recognition Model laden
-            print("Loading Verb Recognition model...")
-            self.verb_model = SurgicalVerbRecognition.load_from_checkpoint(
-                str(self.config.VERB_WEIGHTS),
-                map_location=self.device
-            )
-            self.verb_model.to(self.device)
-            self.verb_model.eval()
-            print("Verb Recognition model loaded successfully")
-            
+            return model
         except Exception as e:
-            print(f"Error loading models: {str(e)}")
-            raise
-    
-    def load_ground_truth(self, video):
-        """Lädt Ground Truth Annotationen"""
-        labels_folder = self.config.DATASET_DIR / "CholecT50" / "labels"
-        json_file = labels_folder / f"{video}.json"
+            print(f"Error details: {str(e)}")
+            raise Exception(f"Error loading YOLO model: {str(e)}")
+
+    def load_verb_model(self):
+        try:
+            model = SurgicalVerbRecognition.load_from_checkpoint(
+                checkpoint_path=str(self.verb_model_path)
+            )
+            model.eval()
+            print("Verb recognition model loaded successfully")
+            return model
+        except Exception as e:
+            print(f"Error details: {str(e)}")
+            raise Exception(f"Error loading verb model: {str(e)}")
         
+class HierarchicalEvaluator:
+    def __init__(self, yolo_model, verb_model, dataset_dir):
+        """
+        Initializes the HierarchicalEvaluator.
+        
+        :param yolo_model: Pre-trained YOLO model for instrument detection
+        :param verb_model: Pre-trained verb recognition model
+        :param dataset_dir: Directory of the CholecT50 dataset
+        """
+        # Device for computations (CUDA if available, otherwise CPU)
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        
+        # YOLO model for instrument detection
+        self.yolo_model = yolo_model
+        
+        # Move verb recognition model to computing device
+        self.verb_model = verb_model.to(self.device)
+        self.verb_model.eval()  # Set model to evaluation mode
+        
+        # Path to dataset
+        self.dataset_dir = dataset_dir
+        
+        # Transformations for image preprocessing
+        self.transform = transforms.Compose([
+            transforms.Resize((224, 224)),  # Size change
+            transforms.ToTensor(),  # Convert to tensor
+            # Normalization with ImageNet means and standard deviations
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        ])
+
+        self.VALID_PAIRS = {
+            'grasper': ['grasp', 'retract', 'null_verb'],
+            'hook': ['dissect', 'cut', 'null_verb', 'coagulate'],
+            'bipolar': ['coagulate', 'dissect', 'null_verb'],
+            'clipper': ['clip', 'null_verb'],
+            'scissors': ['cut', 'null_verb'],
+            'irrigator': ['aspirate', 'irrigate', 'null_verb']
+        }
+
+    def load_ground_truth(self, video):
+        """
+        Loads ground truth annotations for a specific video.
+        
+        :param video: Video identifier (e.g., "VID92")
+        :return: Dictionary with frame annotations
+        """
+        # Path to label files
+        labels_folder = os.path.join(self.dataset_dir, "labels")
+        json_file = os.path.join(labels_folder, f"{video}.json")
+        
+        # Defaultdict for frame annotations
         frame_annotations = defaultdict(lambda: {
             'instruments': defaultdict(int),
             'verbs': defaultdict(int),
             'pairs': defaultdict(int)
         })
         
+        # Load JSON file
         with open(json_file, 'r') as f:
             data = json.load(f)
             annotations = data['annotations']
             
+            # Process annotations
             for frame, instances in annotations.items():
                 frame_number = int(frame)
                 for instance in instances:
                     instrument = instance[1]
                     verb = instance[7]
                     
+                    # Validate and map instrument
                     if isinstance(instrument, int) and 0 <= instrument < 6:
-                        instrument_name = self.config.TOOL_MAPPING[instrument]
+                        instrument_name = TOOL_MAPPING[instrument]
                         frame_annotations[frame_number]['instruments'][instrument_name] += 1
                         
+                        # Validate and map verb
                         if isinstance(verb, int) and 0 <= verb < 10:
-                            verb_name = self.config.VERB_MAPPING[verb]
+                            verb_name = VERB_MAPPING[verb]
                             frame_annotations[frame_number]['verbs'][verb_name] += 1
+                            
+                            # Create instrument-verb pair
                             pair_key = f"{instrument_name}_{verb_name}"
                             frame_annotations[frame_number]['pairs'][pair_key] += 1
         
         return frame_annotations
 
-    def process_frame(self, img_path, ground_truth):
-        """Verarbeitet ein einzelnes Frame"""
+    def evaluate_frame(self, img_path, ground_truth, save_visualization=True):
+        """
+        Evaluates a frame according to the hierarchical recognition process:
+        1. YOLO detects instruments
+        2. Each instrument is processed sequentially
+        3. Verb prediction with valid pairs
+        
+        :param img_path: Path to image
+        :param ground_truth: Ground truth annotations for the frame
+        :param save_visualization: Whether visualization should be saved
+        :return: List of recognized instrument-verb pairs
+        """
+        # Load and prepare image
         img = Image.open(img_path)
         original_img = img.copy()
-        
-        # Vorbereitung der Metriken
-        frame_predictions = {
-            'instruments': defaultdict(list),
-            'verbs': defaultdict(list),
-            'pairs': defaultdict(list)
-        }
-        
-        # YOLO Predictions
-        yolo_results = self.yolo_model(img)
-        
-        # Visualization vorbereiten
         draw = ImageDraw.Draw(original_img)
         try:
             font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 20)
         except:
             font = ImageFont.load_default()
         
-        # YOLO Detektionen verarbeiten
-        for result in yolo_results:
-            boxes = result.boxes
-            for box in boxes:
-                # Box Information extrahieren
-                x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
-                confidence = box.conf[0].cpu().numpy()
-                class_id = int(box.cls[0].cpu().numpy())
+        try:
+            yolo_results = self.yolo_model(img)
+            valid_detections = []
+            
+            # Print all detected instruments first
+            print("\nDetected instruments in frame:")
+            for detection in yolo_results[0].boxes:
+                instrument_class = int(detection.cls)
+                confidence = float(detection.conf)
+                if instrument_class < 6 and confidence >= CONFIDENCE_THRESHOLD:
+                    instrument_name = TOOL_MAPPING[instrument_class]
+                    print(f"- Found {instrument_name} with confidence {confidence:.2f}")
+                    valid_detections.append({
+                        'class': instrument_class,
+                        'confidence': confidence,
+                        'box': detection.xyxy[0]
+                    })
+            
+            valid_detections.sort(key=lambda x: x['confidence'], reverse=True)
+            frame_pairs = []
+            
+            # Process each detection
+            for idx, detection in enumerate(valid_detections):
+                print(f"\nProcessing instrument {idx + 1}:")
+                instrument_class = detection['class']
+                instrument_name = TOOL_MAPPING[instrument_class]
+                box = detection['box']
+                confidence = detection['confidence']
                 
-                if confidence >= self.config.CONFIDENCE_THRESHOLD:
-                    instrument_name = self.config.TOOL_MAPPING[class_id]
+                print(f"- Working on {instrument_name} (confidence: {confidence:.2f})")
+                
+                x1, y1, x2, y2 = map(int, box)
+                instrument_crop = img.crop((x1, y1, x2, y2))
+                crop_tensor = self.transform(instrument_crop).unsqueeze(0).to(self.device)
+                
+                # Get verb predictions
+                verb_outputs = self.verb_model(crop_tensor, [instrument_name])
+                verb_probs = verb_outputs['probabilities']
+                
+                # Print top 3 verb predictions for this instrument
+                print(f"Top 3 verb predictions for {instrument_name}:")
+                top_verbs = []
+                for verb_model_idx in torch.topk(verb_probs[0], k=3).indices.cpu().numpy():
+                    try:
+                        eval_verb_idx = VERB_MODEL_TO_EVAL_MAPPING[verb_model_idx]
+                        verb_name = VERB_MAPPING[eval_verb_idx]
+                        verb_prob = float(verb_probs[0][verb_model_idx])
+                        
+                        print(f"  - {verb_name}: {verb_prob:.3f}")
+                        
+                        if (verb_name in self.VALID_PAIRS[instrument_name] and 
+                            verb_prob > 0 and verb_name != 'null_verb'):
+                            top_verbs.append({
+                                'name': verb_name,
+                                'probability': verb_prob
+                            })
+                    except KeyError as e:
+                        print(f"Warning: Unexpected verb model index {verb_model_idx}")
+                
+                # Best verb selection and visualization
+                if top_verbs:
+                    best_verb = max(top_verbs, key=lambda x: x['probability'])
+                    pair = f"{instrument_name}_{best_verb['name']}"
+                    frame_pairs.append(pair)
                     
-                    # Crop und Transform
-                    crop = img.crop((x1, y1, x2, y2))
-                    crop_tensor = self.config.TRANSFORMS(crop).unsqueeze(0).to(self.device)
-                    
-                    # Verb Prediction
-                    with torch.no_grad():
-                        verb_output = self.verb_model(crop_tensor)
-                        verb_probs = torch.nn.functional.softmax(verb_output, dim=1)
-                        max_verb_idx = torch.argmax(verb_probs).item()
-                        verb_name = self.config.VERB_MAPPING[max_verb_idx]
-                        verb_conf = verb_probs[0][max_verb_idx].item()
-                    
-                    # Speichere Predictions
-                    frame_predictions['instruments'][instrument_name].append(confidence)
-                    frame_predictions['verbs'][verb_name].append(verb_conf)
-                    frame_predictions['pairs'][f"{instrument_name}_{verb_name}"].append(
-                        min(confidence, verb_conf)
-                    )
-                    
-                    # Visualisierung
+                    # Visualization
                     draw.rectangle([x1, y1, x2, y2], outline='red', width=3)
-                    label = f"{instrument_name}-{verb_name}\nI:{confidence:.2f}, V:{verb_conf:.2f}"
-                    draw.text((x1, y1-25), label, fill='blue', font=font)
-        
-        # Ground Truth visualisieren
-        self._draw_ground_truth(draw, ground_truth, img.size, font)
-        
-        # Speichere annotiertes Bild
-        save_path = self.config.OUTPUT_DIR / os.path.basename(img_path)
-        original_img.save(save_path)
-        
-        return frame_predictions
-    
-    def _draw_ground_truth(self, draw, ground_truth, img_size, font):
-        """Zeichnet Ground Truth Informationen"""
-        img_width, img_height = img_size
-        y_offset = img_height - 150
-        
-        draw.text((img_width-300, y_offset), "Ground Truth:", fill='green', font=font)
-        y_offset += 25
-        
-        for pair, count in ground_truth['pairs'].items():
-            if count > 0:
-                draw.text((img_width-300, y_offset), f"- {pair}", fill='green', font=font)
-                y_offset += 25
+                    text_color = 'blue' if confidence >= CONFIDENCE_THRESHOLD else 'orange'
+                    draw.text((x1, y1-25), 
+                            f"{instrument_name}-{best_verb['name']}\n"
+                            f"Conf: {confidence:.2f}, Verb: {best_verb['probability']:.2f}", 
+                            fill=text_color, font=font)
+            
+            # Rest of the visualization code...
+            return frame_pairs
+            
+        except Exception as e:
+            print(f"Error processing frame: {str(e)}")
+            return []
 
     def evaluate(self):
-        """Führt die komplette Evaluation durch"""
-        results = {}
+        """
+        Performs evaluation across all specified videos.
+        Calculates metrics for instruments, verbs, and instrument-verb pairs.
+        """
+        metrics = {
+            'instruments': defaultdict(list),
+            'verbs': defaultdict(list),
+            'pairs': defaultdict(list)
+        }
         
-        for video in self.config.VIDEOS_TO_ANALYZE:
+        total_metrics = {
+            'instruments': {'TP': 0, 'FP': 0, 'FN': 0},
+            'verbs': {'TP': 0, 'FP': 0, 'FN': 0},
+            'pairs': {'TP': 0, 'FP': 0, 'FN': 0}
+        }
+        
+        for video in VIDEOS_TO_ANALYZE:
             print(f"\nProcessing {video}...")
-            
-            # Ground Truth laden
             ground_truth = self.load_ground_truth(video)
             
-            # Frames laden
-            video_folder = self.config.DATASET_DIR / "CholecT50" / "videos" / video
-            frame_files = sorted(
-                [f for f in os.listdir(video_folder) if f.endswith('.png')],
-                key=lambda x: int(x.split('.')[0])
-            )
+            video_folder = os.path.join(self.dataset_dir, "videos", video)
+            frame_files = sorted([f for f in os.listdir(video_folder) if f.endswith('.png')])
             
-            video_metrics = defaultdict(list)
-            
-            # Frames verarbeiten
-            for frame_file in tqdm(frame_files, desc=f"Processing {video}"):
+            for frame_file in tqdm(frame_files, desc=f"Evaluating {video}"):
                 frame_number = int(frame_file.split('.')[0])
-                img_path = video_folder / frame_file
+                img_path = os.path.join(video_folder, frame_file)
                 
-                # Frame verarbeiten
-                frame_predictions = self.process_frame(
-                    str(img_path),
-                    ground_truth[frame_number]
-                )
-                
-                # Metriken sammeln
-                self._update_metrics(video_metrics, frame_predictions, 
-                                  ground_truth[frame_number])
-            
-            # Ergebnisse berechnen
-            results[video] = self._calculate_metrics(video_metrics)
-            
-            # Ergebnisse speichern
-            metrics_file = self.config.OUTPUT_DIR / f"{video}_metrics.json"
-            with open(metrics_file, 'w') as f:
-                json.dump(results[video], f, indent=4)
-            
-            # Ergebnisse ausgeben
-            self._print_metrics(video, results[video])
-        
-        return results
-
-    def _update_metrics(self, metrics, predictions, ground_truth):
-        """Aktualisiert die Evaluationsmetriken"""
-        for category in ['instruments', 'verbs', 'pairs']:
-            for item, predictions_list in predictions[category].items():
-                if predictions_list:  # Wenn Vorhersagen existieren
-                    metrics[category].append({
-                        'item': item,
-                        'prediction': max(predictions_list),  # Beste Konfidenz
-                        'ground_truth': ground_truth[category][item] > 0
-                    })
-    
-    def _calculate_metrics(self, metrics):
-        """Berechnet die finalen Metriken"""
+                try:
+                    frame_predictions, frame_metrics = self.evaluate_frame(
+                        img_path,
+                        ground_truth[frame_number],
+                        save_visualization=True
+                    )
+                    
+                    # Check if detections are present
+                    has_predictions = any(bool(preds) for category_preds in frame_predictions.values() 
+                                    for preds in category_preds.values())
+                    
+                    if not has_predictions:
+                        # Add negative samples for ground truth annotations
+                        for category in ['instruments', 'verbs', 'pairs']:
+                            for item, count in ground_truth[frame_number][category].items():
+                                if count > 0:
+                                    metrics[category][item].append({
+                                        'gt': True,
+                                        'pred_confidence': 0.0
+                                    })
+                                    print(f"Missed {category}: {item} in frame {frame_number}")
+                    else:
+                        # Update metrics for found detections
+                        for category in ['instruments', 'verbs', 'pairs']:
+                            for item, predictions in frame_predictions[category].items():
+                                if predictions:
+                                    gt_count = ground_truth[frame_number][category][item]
+                                    pred_confidence = max(predictions)
+                                    
+                                    metrics[category][item].append({
+                                        'gt': gt_count > 0,
+                                        'pred_confidence': pred_confidence
+                                    })
+                                    
+                                    # Logging for False Positives
+                                    if not gt_count > 0:
+                                        print(f"False Positive {category}: {item} in frame {frame_number}")
+                    
+                    # Update total metrics
+                    for category in ['instruments', 'verbs', 'pairs']:
+                        total_metrics[category]['TP'] += frame_metrics[category]['TP']
+                        total_metrics[category]['FP'] += frame_metrics[category]['FP']
+                        total_metrics[category]['FN'] += frame_metrics[category]['FN']
+                        
+                except Exception as e:
+                    print(f"Error processing frame {frame_number}: {str(e)}")
+                    continue
+                # Calculate final metrics
         results = {}
+        print("\nFinal Evaluation Results:")
+        print("========================")
         
         for category in ['instruments', 'verbs', 'pairs']:
-            if not metrics[category]:
-                continue
-                
-            y_true = np.array([m['ground_truth'] for m in metrics[category]])
-            y_pred = np.array([m['prediction'] for m in metrics[category]])
+            print(f"\n{category.upper()} METRICS:")
+            print("-" * 20)
             
+            # Global metrics
+            category_total = total_metrics[category]
+            print(f"Total True Positives: {category_total['TP']}")
+            print(f"Total False Positives: {category_total['FP']}")
+            print(f"Total False Negatives: {category_total['FN']}")
+            
+            if category_total['TP'] + category_total['FP'] > 0:
+                precision = category_total['TP'] / (category_total['TP'] + category_total['FP'])
+                recall = category_total['TP'] / (category_total['TP'] + category_total['FN'])
+                f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0
+                
+                print(f"Overall Precision: {precision:.4f}")
+                print(f"Overall Recall: {recall:.4f}")
+                print(f"Overall F1-Score: {f1:.4f}")
+            
+            # Per-class metrics
+            category_aps = {}
+            for item, predictions in metrics[category].items():
+                if predictions:
+                    y_true = np.array([p['gt'] for p in predictions])
+                    y_pred = np.array([p['pred_confidence'] for p in predictions])
+                    ap = calculate_ap(y_true, y_pred)
+                    category_aps[item] = ap
+                    
+                    print(f"\n{item}:")
+                    print(f"AP: {ap:.4f}")
+                    print(f"Total predictions: {len(predictions)}")
+                    print(f"True positives: {np.sum(y_true)}")
+                    print(f"False positives: {len(predictions) - np.sum(y_true)}")
+                    
+                    if len(predictions) > 0:
+                        mean_conf = np.mean([p['pred_confidence'] for p in predictions])
+                        print(f"Mean confidence: {mean_conf:.4f}")
+            
+            # Calculate mAP
+            mean_ap = np.mean(list(category_aps.values())) if category_aps else 0
             results[category] = {
-                'precision': self._calculate_precision(y_true, y_pred),
-                'recall': self._calculate_recall(y_true, y_pred),
-                'f1_score': self._calculate_f1(y_true, y_pred),
-                'accuracy': self._calculate_accuracy(y_true, y_pred)
+                'per_class_ap': category_aps,
+                'mAP': mean_ap,
+                'metrics': total_metrics[category]
             }
+            print(f"\nmAP: {mean_ap:.4f}")
         
+        # Save detailed results
+        results_path = os.path.join("/data/Bartscht/VID92_val", "evaluation_results.json")
+        with open(results_path, 'w') as f:
+            json.dump({
+                'metrics': total_metrics,
+                'results': {k: {
+                    'mAP': v['mAP'],
+                    'per_class_ap': v['per_class_ap'],
+                    'metrics': v['metrics']
+                } for k, v in results.items()}
+            }, f, indent=4)
+        
+        print(f"\nDetailed results saved to: {results_path}")
         return results
-    
-    def _calculate_precision(self, y_true, y_pred, threshold=0.5):
-        """Berechnet Precision"""
-        predictions = (y_pred >= threshold).astype(int)
-        tp = np.sum((predictions == 1) & (y_true == 1))
-        fp = np.sum((predictions == 1) & (y_true == 0))
-        return tp / (tp + fp) if (tp + fp) > 0 else 0
-    
-    def _calculate_recall(self, y_true, y_pred, threshold=0.5):
-        """Berechnet Recall"""
-        predictions = (y_pred >= threshold).astype(int)
-        tp = np.sum((predictions == 1) & (y_true == 1))
-        fn = np.sum((predictions == 0) & (y_true == 1))
-        return tp / (tp + fn) if (tp + fn) > 0 else 0
-    
-    def _calculate_f1(self, y_true, y_pred, threshold=0.5):
-        """Berechnet F1-Score"""
-        precision = self._calculate_precision(y_true, y_pred, threshold)
-        recall = self._calculate_recall(y_true, y_pred, threshold)
-        return 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0
-    
-    def _calculate_accuracy(self, y_true, y_pred, threshold=0.5):
-        """Berechnet Accuracy"""
-        predictions = (y_pred >= threshold).astype(int)
-        return np.mean(predictions == y_true)
-    
-    def _print_metrics(self, video, results):
-        """Gibt die Metriken aus"""
-        print(f"\nResults for {video}:")
-        print("=" * 50)
         
-        for category, metrics in results.items():
-            print(f"\n{category.upper()}:")
-            print("-" * 30)
-            for metric_name, value in metrics.items():
-                print(f"{metric_name}: {value:.4f}")
-
 def main():
-    """Hauptfunktion für die Evaluation"""
+    # Initialize ModelLoader
     try:
-        print("\n=== Starting Surgical Workflow Evaluation ===")
+        loader = ModelLoader()
         
-        # Konfiguration erstellen
-        config = Config()
+        # Load models
+        yolo_model = loader.load_yolo_model()
+        verb_model = loader.load_verb_model()
         
-        # Prüfe ob alle notwendigen Pfade existieren
-        required_paths = [
-            config.YOLO_WEIGHTS,
-            config.VERB_WEIGHTS,
-            config.DATASET_DIR
-        ]
+        # Dataset directory
+        dataset_dir = str(loader.dataset_path)
         
-        for path in required_paths:
-            if not path.exists():
-                raise FileNotFoundError(f"Required path not found: {path}")
+        # Verify dataset structure
+        labels_dir = os.path.join(dataset_dir, "labels")
+        videos_dir = os.path.join(dataset_dir, "videos")
         
-        print("\nAll required paths verified.")
-        print(f"YOLO weights: {config.YOLO_WEIGHTS}")
-        print(f"Verb model weights: {config.VERB_WEIGHTS}")
-        print(f"Dataset directory: {config.DATASET_DIR}")
+        print("\nDataset Structure Check:")
+        print(f"Labels Directory: {labels_dir}")
+        print(f"Videos Directory: {videos_dir}")
         
-        # Erstelle Output-Verzeichnis
-        config.OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-        print(f"\nOutput directory created/verified: {config.OUTPUT_DIR}")
+        # Verify directories exist
+        if not os.path.exists(labels_dir):
+            raise FileNotFoundError(f"Labels directory not found: {labels_dir}")
+        if not os.path.exists(videos_dir):
+            raise FileNotFoundError(f"Videos directory not found: {videos_dir}")
         
-        # Evaluator initialisieren
-        print("\nInitializing evaluator...")
-        evaluator = HierarchicalEvaluator(config)
+        # List available videos
+        available_videos = os.listdir(videos_dir)
+        print("\nAvailable Videos:")
+        for video in available_videos:
+            print(f"- {video}")
         
-        # Evaluation durchführen
-        print("\nStarting evaluation...")
+        # Create Evaluator
+        evaluator = HierarchicalEvaluator(
+            yolo_model=yolo_model, 
+            verb_model=verb_model, 
+            dataset_dir=dataset_dir
+        )
+        
+        # Run Evaluation
         results = evaluator.evaluate()
         
-        # Gesamtergebnisse speichern
-        results_file = config.OUTPUT_DIR / "complete_results.json"
-        with open(results_file, 'w') as f:
-            json.dump(results, f, indent=4)
+        print("\nEvaluation Completed Successfully!")
         
-        # Zusammenfassung der Ergebnisse
-        print("\n=== Evaluation Summary ===")
-        for video, video_results in results.items():
-            print(f"\nResults for {video}:")
-            print("-" * 30)
-            
-            for category, metrics in video_results.items():
-                print(f"\n{category.upper()}:")
-                for metric_name, value in metrics.items():
-                    print(f"  {metric_name}: {value:.4f}")
-        
-        print(f"\nComplete results saved to: {results_file}")
-        print("\nEvaluation completed successfully!")
-        
-    except FileNotFoundError as e:
-        print(f"\nError: Required file not found: {e}")
-        sys.exit(1)
     except Exception as e:
-        print(f"\nError during evaluation: {str(e)}")
-        print("\nTraceback:")
-        import traceback
-        traceback.print_exc()
-        sys.exit(1)
+        print(f"❌ Error during initialization or evaluation: {str(e)}")
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
