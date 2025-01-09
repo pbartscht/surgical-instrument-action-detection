@@ -64,18 +64,19 @@ def setup_arg_parser() -> argparse.ArgumentParser:
     )
     return parser
 
-def setup_callbacks(model_name: str) -> list:
+def setup_callbacks(checkpoint_dir: str, run_name: str) -> list:
     """Set up training callbacks.
     
     Args:
-        model_name: Name of the model for checkpoint naming
+        checkpoint_dir: Directory to save checkpoints
+        run_name: Name of the current run for checkpoint naming
         
     Returns:
         list: List of configured callbacks
     """
     checkpoint_callback = ModelCheckpoint(
-        dirpath='checkpoints',
-        filename=f'{model_name}-{{epoch:02d}}-{{val_loss:.2f}}',
+        dirpath=checkpoint_dir,
+        filename=f'{run_name}-epoch-{{epoch:02d}}',
         monitor='val_loss',
         mode='min',
         save_top_k=3,
@@ -110,37 +111,43 @@ def train_model(
     if not os.path.exists(dataset_dir):
         raise FileNotFoundError(f"Dataset directory not found: {dataset_dir}")
         
-    # Initialize wandb logger
+    # Initialize wandb logger first to get the run ID
     wandb_logger = WandbLogger(
         project=project_name,
         log_model=True
     )
+    run_name = wandb_logger.experiment.name
+    
+    # Create a unique directory for this run's checkpoints
+    checkpoint_dir = os.path.join('checkpoints', f'{run_name}')
+    os.makedirs(checkpoint_dir, exist_ok=True)
     
     # Initialize data module and model
     datamodule = CholecT50_DataModule(dataset_dir, batch_size)
     model = CholecT50Model()
     
-    # Configure trainer
+    # Configure trainer with updated callbacks
     trainer = pl.Trainer(
         accelerator="cuda",
         devices=1,
         max_epochs=max_epochs,
         precision="16-mixed",
         logger=wandb_logger,
-        callbacks=setup_callbacks("ResNet50"),
+        callbacks=setup_callbacks(checkpoint_dir, run_name),
         deterministic=True,  # For reproducibility
         gradient_clip_val=0.5,  # Prevent exploding gradients
     )
     
     try:
+        print(f"Starting training... Run Name: {run_name}")
         # Train and test the model
         trainer.fit(model, datamodule)
         trainer.test(model, datamodule)
         
-        # Save final checkpoint
-        checkpoint_path = Path("checkpoints") / "ResNet_cholect45-crossval_final.ckpt"
-        trainer.save_checkpoint(checkpoint_path)
-        print(f"Model saved to {checkpoint_path}")
+        # Save final checkpoint with run name
+        final_checkpoint_path = os.path.join(checkpoint_dir, f"{run_name}-final.ckpt")
+        trainer.save_checkpoint(final_checkpoint_path)
+        print(f"Model saved to {final_checkpoint_path}")
         
     except Exception as e:
         print(f"Training failed with error: {str(e)}")
