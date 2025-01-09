@@ -63,7 +63,7 @@ class ModelLoader:
         # YOLO model path
         self.yolo_weights = self.hierarchical_dir / "Instrument-classification-detection/weights/instrument_detector/best_v35.pt"
         # Verb model path
-        self.verb_model_path = self.hierarchical_dir / "verb_recognition/checkpoints/expert-field/expert-field-epoch33/loss=0.824.ckpt"
+        self.verb_model_path = self.hierarchical_dir / "verb_recognition/checkpoints/jumping-tree-47/last.ckpt"
         
         # Dataset path
         self.dataset_path = Path("/data/Bartscht/CholecT50")
