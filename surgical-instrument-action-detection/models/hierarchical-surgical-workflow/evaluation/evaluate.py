@@ -5,6 +5,7 @@ import torch
 import torch.nn as nn
 import torchvision.transforms as transforms
 import numpy as np
+from sklearn.metrics import average_precision_score
 import json
 from PIL import Image, ImageDraw, ImageFont
 from collections import defaultdict
@@ -23,7 +24,7 @@ from verb_recognition.models.SurgicalActionNet import SurgicalVerbRecognition
 # Constants
 CONFIDENCE_THRESHOLD = 0.6
 IOU_THRESHOLD = 0.3
-VIDEOS_TO_ANALYZE = ["VID92"]  # Initially only VID92
+VIDEOS_TO_ANALYZE = ["VID92", "VID96", "VID103", "VID110", "VID111"]
 
 # Global mappings
 TOOL_MAPPING = {
@@ -51,50 +52,6 @@ VERB_MODEL_TO_EVAL_MAPPING = {
     9: 9    # Model: 'null_verb' -> Eval: 'null_verb'
 }
 
-def calculate_precision_recall(y_true: np.ndarray, y_pred: np.ndarray, threshold: float) -> tuple[float, float, dict]:
-    """Calculates precision and recall for a threshold."""
-    predictions = (y_pred >= threshold).astype(int)
-    TP = np.sum((predictions == 1) & (y_true == 1))
-    FP = np.sum((predictions == 1) & (y_true == 0))
-    FN = np.sum((predictions == 0) & (y_true == 1))
-    
-    precision = TP / (TP + FP) if (TP + FP) > 0 else 0
-    recall = TP / (TP + FN) if (TP + FN) > 0 else 0
-    
-    return precision, recall, {'TP': TP, 'FP': FP, 'FN': FN}
-
-def calculate_ap(y_true: np.ndarray, y_pred: np.ndarray) -> float:
-    """Calculates Average Precision with interpolation of all points."""
-    if len(y_true) == 0:
-        return 0.0
-    
-    # Sort by confidence in descending order
-    sort_idx = np.argsort(y_pred)[::-1]
-    y_true = y_true[sort_idx]
-    y_pred = y_pred[sort_idx]
-    
-    # Calculate cumulative metrics
-    tp = np.cumsum(y_true)
-    fp = np.cumsum(1 - y_true)
-    
-    # Calculate precision and recall
-    precision = tp / (tp + fp)
-    recall = tp / np.sum(y_true)
-    
-    # Add start and end points
-    precision = np.concatenate([[0], precision, [0]])
-    recall = np.concatenate([[0], recall, [1]])
-    
-    # Interpolate precision
-    for i in range(len(precision)-2, -1, -1):
-        precision[i] = max(precision[i], precision[i+1])
-    
-    # Calculate AP
-    ap = 0
-    for i in range(len(recall)-1):
-        ap += (recall[i+1] - recall[i]) * precision[i+1]
-    
-    return ap
 
 class ModelLoader:
     def __init__(self):
@@ -231,77 +188,102 @@ class HierarchicalEvaluator:
 
     def evaluate_frame(self, img_path, ground_truth, save_visualization=True):
         """
-        Evaluates a frame according to the hierarchical recognition process:
+        Evaluates a single frame using hierarchical recognition:
         1. YOLO detects instruments
-        2. Each instrument is processed sequentially
-        3. Verb prediction with valid pairs
+        2. For each detected instrument, predict the surgical verb
+        3. Create instrument-verb pairs
         
-        :param img_path: Path to image
-        :param ground_truth: Ground truth annotations for the frame
-        :param save_visualization: Whether visualization should be saved
-        :return: List of recognized instrument-verb pairs
+        Args:
+            img_path: Path to the frame image
+            ground_truth: Ground truth annotations for this frame
+            save_visualization: Whether to save visualization of detections
+        
+        Returns:
+            List of predictions, each containing:
+            [video_frame, instrument, verb, instrument_verb_pair, instrument_conf, verb_conf]
         """
-        # Load and prepare image
+        # Initialize predictions list and extract frame information
+        frame_predictions = []
+        frame_number = int(os.path.basename(img_path).split('.')[0])
+        video_name = os.path.basename(os.path.dirname(img_path))
+        
+        # Load and prepare image for visualization
         img = Image.open(img_path)
         original_img = img.copy()
         draw = ImageDraw.Draw(original_img)
         try:
+            # Try to load a nice font, fallback to default if not available
             font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 20)
+            small_font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 16)
         except:
             font = ImageFont.load_default()
+            small_font = ImageFont.load_default()
         
         try:
+            # Step 1: Instrument Detection using YOLO
             yolo_results = self.yolo_model(img)
             valid_detections = []
             
-            # Print all detected instruments first
+            # Print detected instruments (for debugging)
             print("\nDetected instruments in frame:")
+            
+            # Process each YOLO detection
             for detection in yolo_results[0].boxes:
                 instrument_class = int(detection.cls)
                 confidence = float(detection.conf)
+                
+                # Only consider predictions above confidence threshold
                 if instrument_class < 6 and confidence >= CONFIDENCE_THRESHOLD:
                     instrument_name = TOOL_MAPPING[instrument_class]
                     print(f"- Found {instrument_name} with confidence {confidence:.2f}")
+                    
+                    # Store valid detection
                     valid_detections.append({
                         'class': instrument_class,
                         'confidence': confidence,
-                        'box': detection.xyxy[0]
+                        'box': detection.xyxy[0],
+                        'name': instrument_name
                     })
             
+            # Sort detections by confidence (process high confidence detections first)
             valid_detections.sort(key=lambda x: x['confidence'], reverse=True)
-            frame_pairs = []
             
-            # Process each detection
+            # Step 2: Process each detected instrument
             for idx, detection in enumerate(valid_detections):
                 print(f"\nProcessing instrument {idx + 1}:")
-                instrument_class = detection['class']
-                instrument_name = TOOL_MAPPING[instrument_class]
+                instrument_name = detection['name']
                 box = detection['box']
                 confidence = detection['confidence']
                 
                 print(f"- Working on {instrument_name} (confidence: {confidence:.2f})")
                 
+                # Crop image region with the detected instrument
                 x1, y1, x2, y2 = map(int, box)
                 instrument_crop = img.crop((x1, y1, x2, y2))
+                
+                # Prepare cropped image for verb model
                 crop_tensor = self.transform(instrument_crop).unsqueeze(0).to(self.device)
                 
-                # Get verb predictions
+                # Step 3: Predict verb for the detected instrument
                 verb_outputs = self.verb_model(crop_tensor, [instrument_name])
                 verb_probs = verb_outputs['probabilities']
                 
-                # Print top 3 verb predictions for this instrument
+                # Get top 3 verb predictions for this instrument
                 print(f"Top 3 verb predictions for {instrument_name}:")
                 top_verbs = []
+                
+                # Process top 3 verb predictions
                 for verb_model_idx in torch.topk(verb_probs[0], k=3).indices.cpu().numpy():
                     try:
+                        # Map model index to evaluation index
                         eval_verb_idx = VERB_MODEL_TO_EVAL_MAPPING[verb_model_idx]
                         verb_name = VERB_MAPPING[eval_verb_idx]
                         verb_prob = float(verb_probs[0][verb_model_idx])
                         
                         print(f"  - {verb_name}: {verb_prob:.3f}")
                         
-                        if (verb_name in self.VALID_PAIRS[instrument_name] and 
-                            verb_prob > 0 and verb_name != 'null_verb'):
+                        # Only consider valid instrument-verb combinations
+                        if (verb_name in self.VALID_PAIRS[instrument_name]):
                             top_verbs.append({
                                 'name': verb_name,
                                 'probability': verb_prob
@@ -309,104 +291,325 @@ class HierarchicalEvaluator:
                     except KeyError as e:
                         print(f"Warning: Unexpected verb model index {verb_model_idx}")
                 
-                # Best verb selection and visualization
+                # Step 4: Create prediction and visualization for best verb
                 if top_verbs:
+                    # Get verb with highest probability
                     best_verb = max(top_verbs, key=lambda x: x['probability'])
-                    pair = f"{instrument_name}_{best_verb['name']}"
-                    frame_pairs.append(pair)
+                    verb_name = best_verb['name']
+                    verb_conf = best_verb['probability']
+                    pair = f"{instrument_name}_{verb_name}"
                     
-                    # Visualization
+                    # Format: [frame_id, instrument, verb, pair, instrument_conf, verb_conf]
+                    prediction = [
+                        f"{video_name}_frame{frame_number}",
+                        instrument_name,
+                        verb_name,
+                        pair,
+                        confidence,    # YOLO confidence score
+                        verb_conf     # Verb model confidence score
+                    ]
+                    frame_predictions.append(prediction)
+                    
+                    # Draw bounding box and predictions
                     draw.rectangle([x1, y1, x2, y2], outline='red', width=3)
                     text_color = 'blue' if confidence >= CONFIDENCE_THRESHOLD else 'orange'
                     draw.text((x1, y1-25), 
-                            f"{instrument_name}-{best_verb['name']}\n"
-                            f"Conf: {confidence:.2f}, Verb: {best_verb['probability']:.2f}", 
+                            f"Pred: {instrument_name}-{verb_name}\n"
+                            f"Conf: {confidence:.2f}, Verb: {verb_conf:.2f}", 
                             fill=text_color, font=font)
             
-            # Rest of the visualization code...
-            return frame_pairs
+            # Step 5: Add ground truth visualization
+            img_width, img_height = original_img.size
+            gt_y_start = img_height - 150  # Start position for ground truth text
             
+            # Draw background for ground truth
+            draw.rectangle([10, gt_y_start, img_width-10, img_height-10], 
+                        fill='white', outline='black')
+            
+            # Write ground truth heading and pairs
+            draw.text((20, gt_y_start + 5), "Ground Truth:", fill='black', font=font)
+            
+            y_pos = gt_y_start + 35
+            for pair, count in ground_truth['pairs'].items():
+                if count > 0:
+                    draw.text((20, y_pos), f"GT: {pair}", fill='green', font=small_font)
+                    y_pos += 20
+            
+            # Save visualization if requested
+            if save_visualization:
+                viz_dir = os.path.join("/data/Bartscht/VID92_val", "visualizations")
+                os.makedirs(viz_dir, exist_ok=True)
+                save_path = os.path.join(viz_dir, f"{video_name}_frame{frame_number}.png")
+                original_img.save(save_path)
+            
+            return frame_predictions
+                
         except Exception as e:
-            print(f"Error processing frame: {str(e)}")
+            print(f"Error processing frame {frame_number}: {str(e)}")
             return []
 
     def evaluate(self):
         """
-        Performs evaluation across all specified videos.
-        Calculates metrics for instruments, verbs, and instrument-verb pairs.
+        Comprehensive evaluation of model performance across all specified videos.
+        Ensures all possible classes are evaluated, even if they're never predicted.
+        
+        The evaluation process:
+        1. Initializes tracking for ALL possible classes (not just predicted ones)
+        2. Processes each video frame by frame
+        3. Updates metrics and predictions
+        4. Calculates final metrics including:
+            - Traditional metrics (Precision, Recall, F1)
+            - Average Precision (AP) for ALL classes
+            - mean Average Precision (mAP) across all classes
+        
+        Returns:
+            Dictionary containing all evaluation metrics
         """
-        metrics = {
-            'instruments': defaultdict(list),
-            'verbs': defaultdict(list),
-            'pairs': defaultdict(list)
+        # Initialize collection structures for ALL possible classes
+        all_predictions = {
+            'instruments': {instr: [] for instr in TOOL_MAPPING.values()},
+            'verbs': {verb: [] for verb in VERB_MAPPING.values()},
+            'pairs': {}
         }
         
-        total_metrics = {
+        # Initialize all possible instrument-verb pairs based on VALID_PAIRS
+        for instrument, valid_verbs in self.VALID_PAIRS.items():
+            for verb in valid_verbs:
+                pair = f"{instrument}_{verb}"
+                all_predictions['pairs'][pair] = []
+        
+        # Traditional metrics counters
+        results = {
             'instruments': {'TP': 0, 'FP': 0, 'FN': 0},
             'verbs': {'TP': 0, 'FP': 0, 'FN': 0},
             'pairs': {'TP': 0, 'FP': 0, 'FN': 0}
         }
         
+        # Track occurrences of each class in ground truth
+        ground_truth_occurrences = {
+            'instruments': defaultdict(int),
+            'verbs': defaultdict(int),
+            'pairs': defaultdict(int)
+        }
+        
+        print("\nStarting evaluation process...")
+        
+        # Process each video in the evaluation set
         for video in VIDEOS_TO_ANALYZE:
             print(f"\nProcessing {video}...")
+            
+            # Load ground truth annotations
             ground_truth = self.load_ground_truth(video)
             
+            # Get frame files
             video_folder = os.path.join(self.dataset_dir, "videos", video)
             frame_files = sorted([f for f in os.listdir(video_folder) if f.endswith('.png')])
             
+            # Process each frame
             for frame_file in tqdm(frame_files, desc=f"Evaluating {video}"):
                 frame_number = int(frame_file.split('.')[0])
                 img_path = os.path.join(video_folder, frame_file)
                 
-                try:
-                    frame_predictions, frame_metrics = self.evaluate_frame(
-                        img_path,
-                        ground_truth[frame_number],
-                        save_visualization=True
+                # Get frame predictions
+                frame_predictions = self.evaluate_frame(
+                    img_path,
+                    ground_truth[frame_number],
+                    save_visualization=True
+                )
+                
+                # Get ground truth for this frame
+                gt_frame = ground_truth[frame_number]
+                
+                # Update ground truth occurrence counters
+                for instr, count in gt_frame['instruments'].items():
+                    if count > 0:
+                        ground_truth_occurrences['instruments'][instr] += 1
+                for verb, count in gt_frame['verbs'].items():
+                    if count > 0:
+                        ground_truth_occurrences['verbs'][verb] += 1
+                for pair, count in gt_frame['pairs'].items():
+                    if count > 0:
+                        ground_truth_occurrences['pairs'][pair] += 1
+                
+                # Track matched predictions
+                matched = {
+                    'instruments': set(),
+                    'verbs': set(),
+                    'pairs': set()
+                }
+                
+                # Process frame predictions
+                for pred in frame_predictions:
+                    _, instrument, verb, pair, instrument_conf, verb_conf = pred
+                    pair_conf = min(instrument_conf, verb_conf)
+                    
+                    # Update predictions for AP calculation
+                    # For instruments
+                    all_predictions['instruments'][instrument].append({
+                        'confidence': instrument_conf,
+                        'ground_truth': 1 if gt_frame['instruments'][instrument] > 0 else 0
+                    })
+                    
+                    # For verbs
+                    all_predictions['verbs'][verb].append({
+                        'confidence': verb_conf,
+                        'ground_truth': 1 if gt_frame['verbs'][verb] > 0 else 0
+                    })
+                    
+                    # For pairs
+                    all_predictions['pairs'][pair].append({
+                        'confidence': pair_conf,
+                        'ground_truth': 1 if gt_frame['pairs'][pair] > 0 else 0
+                    })
+                    
+                    # Update traditional metrics
+                    self._update_traditional_metrics(
+                        results, matched, gt_frame,
+                        instrument, verb, pair
                     )
-                    
-                    # Check if detections are present
-                    has_predictions = any(bool(preds) for category_preds in frame_predictions.values() 
-                                    for preds in category_preds.values())
-                    
-                    if not has_predictions:
-                        # Add negative samples for ground truth annotations
-                        for category in ['instruments', 'verbs', 'pairs']:
-                            for item, count in ground_truth[frame_number][category].items():
-                                if count > 0:
-                                    metrics[category][item].append({
-                                        'gt': True,
-                                        'pred_confidence': 0.0
-                                    })
-                                    print(f"Missed {category}: {item} in frame {frame_number}")
+                
+                # Count False Negatives
+                self._count_false_negatives(results, matched, gt_frame)
+        
+        # Calculate and format final metrics
+        final_metrics = self._calculate_final_metrics(
+            results, all_predictions, ground_truth_occurrences
+        )
+        
+        # Print detailed evaluation results
+        self._print_evaluation_results(final_metrics, ground_truth_occurrences)
+        
+        return final_metrics
+
+    def _update_traditional_metrics(self, results, matched, gt_frame, instrument, verb, pair):
+        """
+        Updates the traditional metrics (TP, FP) for a single prediction.
+        
+        Args:
+            results: Dictionary containing current metrics
+            matched: Set of already matched predictions
+            gt_frame: Ground truth for current frame
+            instrument, verb, pair: Current prediction elements
+        """
+        # Instruments
+        if gt_frame['instruments'][instrument] > 0:
+            if instrument not in matched['instruments']:
+                results['instruments']['TP'] += 1
+                matched['instruments'].add(instrument)
+        else:
+            results['instruments']['FP'] += 1
+        
+        # Verbs
+        if gt_frame['verbs'][verb] > 0:
+            if verb not in matched['verbs']:
+                results['verbs']['TP'] += 1
+                matched['verbs'].add(verb)
+        else:
+            results['verbs']['FP'] += 1
+        
+        # Pairs
+        if gt_frame['pairs'][pair] > 0:
+            if pair not in matched['pairs']:
+                results['pairs']['TP'] += 1
+                matched['pairs'].add(pair)
+        else:
+            results['pairs']['FP'] += 1
+
+    def _count_false_negatives(self, results, matched, gt_frame):
+        """
+        Counts false negatives for all categories in current frame.
+        
+        Args:
+            results: Dictionary containing current metrics
+            matched: Set of already matched predictions
+            gt_frame: Ground truth for current frame
+        """
+        # Instruments FN
+        results['instruments']['FN'] += sum(
+            1 for inst, count in gt_frame['instruments'].items()
+            if count > 0 and inst not in matched['instruments']
+        )
+        
+        # Verbs FN
+        results['verbs']['FN'] += sum(
+            1 for verb, count in gt_frame['verbs'].items()
+            if count > 0 and verb not in matched['verbs']
+        )
+        
+        # Pairs FN
+        results['pairs']['FN'] += sum(
+            1 for pair, count in gt_frame['pairs'].items()
+            if count > 0 and pair not in matched['pairs']
+        )
+
+    def _calculate_final_metrics(self, results, all_predictions, gt_occurrences):
+        """
+        Calculates final metrics including AP for all possible classes.
+        
+        Args:
+            results: Dictionary containing traditional metrics
+            all_predictions: Predictions for each class
+            gt_occurrences: Count of ground truth occurrences per class
+        
+        Returns:
+            Dictionary containing all final metrics
+        """
+        final_metrics = {}
+        
+        for category in ['instruments', 'verbs', 'pairs']:
+            TP = results[category]['TP']
+            FP = results[category]['FP']
+            FN = results[category]['FN']
+            
+            # Calculate traditional metrics
+            precision = TP / (TP + FP) if (TP + FP) > 0 else 0
+            recall = TP / (TP + FN) if (TP + FN) > 0 else 0
+            f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0
+            
+            # Calculate AP for each possible class
+            category_aps = {}
+            
+            for item_name in all_predictions[category].keys():
+                predictions = all_predictions[category][item_name]
+                gt_count = gt_occurrences[category][item_name]
+                
+                if gt_count > 0:  # Only calculate AP if class appears in ground truth
+                    if predictions:
+                        y_true = np.array([p['ground_truth'] for p in predictions])
+                        y_scores = np.array([p['confidence'] for p in predictions])
+                        ap = average_precision_score(y_true, y_scores)
                     else:
-                        # Update metrics for found detections
-                        for category in ['instruments', 'verbs', 'pairs']:
-                            for item, predictions in frame_predictions[category].items():
-                                if predictions:
-                                    gt_count = ground_truth[frame_number][category][item]
-                                    pred_confidence = max(predictions)
-                                    
-                                    metrics[category][item].append({
-                                        'gt': gt_count > 0,
-                                        'pred_confidence': pred_confidence
-                                    })
-                                    
-                                    # Logging for False Positives
-                                    if not gt_count > 0:
-                                        print(f"False Positive {category}: {item} in frame {frame_number}")
-                    
-                    # Update total metrics
-                    for category in ['instruments', 'verbs', 'pairs']:
-                        total_metrics[category]['TP'] += frame_metrics[category]['TP']
-                        total_metrics[category]['FP'] += frame_metrics[category]['FP']
-                        total_metrics[category]['FN'] += frame_metrics[category]['FN']
-                        
-                except Exception as e:
-                    print(f"Error processing frame {frame_number}: {str(e)}")
-                    continue
-                # Calculate final metrics
-        results = {}
+                        ap = 0.0  # Class exists in ground truth but was never predicted
+                else:
+                    ap = None  # Class never appears in ground truth
+                
+                category_aps[item_name] = ap
+            
+            # Calculate mAP (excluding None values)
+            valid_aps = [ap for ap in category_aps.values() if ap is not None]
+            map_score = np.mean(valid_aps) if valid_aps else 0.0
+            
+            final_metrics[category] = {
+                'traditional': {
+                    'TP': TP, 'FP': FP, 'FN': FN,
+                    'precision': precision,
+                    'recall': recall,
+                    'f1': f1
+                },
+                'per_class_ap': category_aps,
+                'mAP': map_score
+            }
+        
+        return final_metrics
+
+    def _print_evaluation_results(self, final_metrics, gt_occurrences):
+        """
+        Prints detailed evaluation results including class coverage analysis.
+        
+        Args:
+            final_metrics: Dictionary containing all calculated metrics
+            gt_occurrences: Count of ground truth occurrences per class
+        """
         print("\nFinal Evaluation Results:")
         print("========================")
         
@@ -414,63 +617,28 @@ class HierarchicalEvaluator:
             print(f"\n{category.upper()} METRICS:")
             print("-" * 20)
             
-            # Global metrics
-            category_total = total_metrics[category]
-            print(f"Total True Positives: {category_total['TP']}")
-            print(f"Total False Positives: {category_total['FP']}")
-            print(f"Total False Negatives: {category_total['FN']}")
+            # Print traditional metrics
+            trad = final_metrics[category]['traditional']
+            print(f"True Positives: {trad['TP']}")
+            print(f"False Positives: {trad['FP']}")
+            print(f"False Negatives: {trad['FN']}")
+            print(f"Precision: {trad['precision']:.4f}")
+            print(f"Recall: {trad['recall']:.4f}")
+            print(f"F1-Score: {trad['f1']:.4f}")
             
-            if category_total['TP'] + category_total['FP'] > 0:
-                precision = category_total['TP'] / (category_total['TP'] + category_total['FP'])
-                recall = category_total['TP'] / (category_total['TP'] + category_total['FN'])
-                f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0
-                
-                print(f"Overall Precision: {precision:.4f}")
-                print(f"Overall Recall: {recall:.4f}")
-                print(f"Overall F1-Score: {f1:.4f}")
+            # Print per-class metrics
+            print("\nPer-class Average Precision:")
+            aps = final_metrics[category]['per_class_ap']
             
-            # Per-class metrics
-            category_aps = {}
-            for item, predictions in metrics[category].items():
-                if predictions:
-                    y_true = np.array([p['gt'] for p in predictions])
-                    y_pred = np.array([p['pred_confidence'] for p in predictions])
-                    ap = calculate_ap(y_true, y_pred)
-                    category_aps[item] = ap
-                    
-                    print(f"\n{item}:")
-                    print(f"AP: {ap:.4f}")
-                    print(f"Total predictions: {len(predictions)}")
-                    print(f"True positives: {np.sum(y_true)}")
-                    print(f"False positives: {len(predictions) - np.sum(y_true)}")
-                    
-                    if len(predictions) > 0:
-                        mean_conf = np.mean([p['pred_confidence'] for p in predictions])
-                        print(f"Mean confidence: {mean_conf:.4f}")
+            for class_name, ap in aps.items():
+                gt_count = gt_occurrences[category][class_name]
+                if ap is None:
+                    print(f"{class_name}: No ground truth instances")
+                else:
+                    ap_str = f"{ap:.4f}" if ap > 0 else "0.0000 (never predicted)"
+                    print(f"{class_name}: AP = {ap_str} (GT count: {gt_count})")
             
-            # Calculate mAP
-            mean_ap = np.mean(list(category_aps.values())) if category_aps else 0
-            results[category] = {
-                'per_class_ap': category_aps,
-                'mAP': mean_ap,
-                'metrics': total_metrics[category]
-            }
-            print(f"\nmAP: {mean_ap:.4f}")
-        
-        # Save detailed results
-        results_path = os.path.join("/data/Bartscht/VID92_val", "evaluation_results.json")
-        with open(results_path, 'w') as f:
-            json.dump({
-                'metrics': total_metrics,
-                'results': {k: {
-                    'mAP': v['mAP'],
-                    'per_class_ap': v['per_class_ap'],
-                    'metrics': v['metrics']
-                } for k, v in results.items()}
-            }, f, indent=4)
-        
-        print(f"\nDetailed results saved to: {results_path}")
-        return results
+            print(f"\nmAP: {final_metrics[category]['mAP']:.4f}")
         
 def main():
     # Initialize ModelLoader

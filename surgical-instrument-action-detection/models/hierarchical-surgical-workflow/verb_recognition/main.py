@@ -34,7 +34,7 @@ def main():
     # Updated checkpoint callback with run information
     checkpoint_callback = ModelCheckpoint(
         dirpath=checkpoint_dir,
-        filename='{run_name}-epoch{epoch}',  # Variablen in geschweiften Klammern als String
+        filename=f'{run_name}-epoch-' + '{epoch:02d}',
         monitor='val/loss',
         mode='min',
         save_top_k=3,
