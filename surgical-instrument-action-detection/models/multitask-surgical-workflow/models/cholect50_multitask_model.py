@@ -23,6 +23,8 @@ def get_weight_balancing(case='cholect50'):
             'tool': [0.08495163, 0.88782288, 0.11259564, 2.61948830, 1.784866470, 1.144624170],
             'verb': [0.39862805, 0.06981640, 0.08332925, 0.81876204, 1.415868390, 2.269359150, 
                     1.28428410, 7.35822511, 18.67857143, 0.45704490],
+            'iv':[1.29, 5.18, 22.24, 0.1, 1.36, 4.1, 47.77, 23.31, 9.02, 42.06, 0.12, 8.34, 227.62, 3.51, 25.8, 1.68, 1.81, 14.38, 9.37, 10.57, 0.51, 10.43, 1.54, 36.5, 24.34, 10.18],
+            'phase': [19.16, 2.44, 11.84, 3.57, 22.23, 13.73, 17.72],
         },
     }
     return switcher.get(case)
@@ -224,12 +226,14 @@ class CholecT50Model(pl.LightningModule):
         weights = get_weight_balancing('cholect50-challenge')
         self.tool_weights = torch.tensor(weights['tool'])
         self.verb_weights = torch.tensor(weights['verb'])
+        self.iv_weights = torch.tensor(weights['iv'])
+        self.phase_weights = torch.tensor(weights['phase'])  
         
         # Define loss functions
         self.tool_criterion = nn.BCEWithLogitsLoss(pos_weight=self.tool_weights)
         self.verb_criterion = nn.BCEWithLogitsLoss(pos_weight=self.verb_weights)
-        self.iv_criterion = nn.BCEWithLogitsLoss()
-        self.phase_criterion = nn.BCEWithLogitsLoss()
+        self.iv_criterion = nn.BCEWithLogitsLoss(pos_weight=self.iv_weights)
+        self.phase_criterion = nn.BCEWithLogitsLoss(pos_weight=self.phase_weights)
         
         # Store learning rates
         self.learning_rate = learning_rate
@@ -238,15 +242,35 @@ class CholecT50Model(pl.LightningModule):
         self.lr_iv = lr_iv
         self.lr_phase = lr_phase
         
-        # Task importance weights for loss combination
-        self.iv_weight = 1.7
-        self.tool_weight = 0.8
-        self.verb_weight = 1.3
-        self.phase_weight = 1.0
-        
         # Initialize prediction and target collectors for metric computation
         self.predictions = {"iv": [], "tools": [], "verbs": [], "phases": []}
         self.targets = {"iv": [], "tools": [], "verbs": [], "phases": []}
+
+        # Initial calculation of the task weights
+        self.calculate_task_weights()
+
+    def calculate_task_weights(self):
+        # Calculate variance/spread of weights for each task
+        iv_spread = (self.iv_weights.max() - self.iv_weights.min()) / self.iv_weights.mean()
+        tool_spread = (self.tool_weights.max() - self.tool_weights.min()) / self.tool_weights.mean()
+        verb_spread = (self.verb_weights.max() - self.verb_weights.min()) / self.verb_weights.mean()
+        phase_spread = (self.phase_weights.max() - self.phase_weights.min()) / self.phase_weights.mean()
+        
+        # Calculate task weights based on the variance
+        total_spread = iv_spread + tool_spread + verb_spread + phase_spread
+        self.iv_weight = iv_spread / total_spread
+        self.tool_weight = tool_spread / total_spread
+        self.verb_weight = verb_spread / total_spread
+        self.phase_weight = phase_spread / total_spread
+
+    def normalize_losses(self, iv_loss, tool_loss, verb_loss, phase_loss):
+        """Normalisiert die Losses basierend auf den Klassengewichten"""
+        # Normalisiere jeden Loss durch die durchschnittlichen Gewichte
+        norm_iv_loss = iv_loss / self.iv_weights.mean()
+        norm_tool_loss = tool_loss / self.tool_weights.mean()
+        norm_verb_loss = verb_loss / self.verb_weights.mean()
+        norm_phase_loss = phase_loss / self.phase_weights.mean()
+        return norm_iv_loss, norm_tool_loss, norm_verb_loss, norm_phase_loss    
 
     def forward(self, x):
         """Forward pass wrapper for the underlying model."""
@@ -271,9 +295,18 @@ class CholecT50Model(pl.LightningModule):
         
         # Initialize optimizer and scheduler
         optimizer = torch.optim.AdamW(params, weight_decay=1e-2)
+        
+        # Gradient Clipping Konfiguration
+        self.clip_gradients = True
+        self.clip_val = 1.0
+        
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             optimizer, 'min', patience=2, factor=0.5
         )
+        
+        # Logging der Gradienten-Norm aktivieren
+        for param_group in optimizer.param_groups:
+            param_group['gradient_clip_val'] = self.clip_val
         
         return {
             "optimizer": optimizer,
@@ -306,23 +339,48 @@ class CholecT50Model(pl.LightningModule):
         verb_loss = self.verb_criterion(verb_output, verb_label.float())
         phase_loss = self.phase_criterion(phase_output, phase_label.float())
         
-        # Compute weighted total loss
-        total_loss = (self.iv_weight * iv_loss + self.tool_weight * tool_loss + 
-                     self.verb_weight * verb_loss + self.phase_weight * phase_loss)
+        # Normalize losses based on class weights
+        norm_iv_loss, norm_tool_loss, norm_verb_loss, norm_phase_loss = self.normalize_losses(
+            iv_loss, tool_loss, verb_loss, phase_loss
+        )
         
-        # Log losses
+        # Compute weighted total loss using dynamic task weights
+        total_loss = (
+            self.iv_weight * norm_iv_loss +
+            self.tool_weight * norm_tool_loss +
+            self.verb_weight * norm_verb_loss +
+            self.phase_weight * norm_phase_loss
+        )
+        
+        # Log individual losses
         self.log("train/iv_loss", iv_loss)
         self.log("train/tool_loss", tool_loss)
         self.log("train/verb_loss", verb_loss)
         self.log("train/phase_loss", phase_loss)
         self.log("train/total_loss", total_loss)
         
+        # Log task weights
+        self.log("train/weight_iv", self.iv_weight)
+        self.log("train/weight_tool", self.tool_weight)
+        self.log("train/weight_verb", self.verb_weight)
+        self.log("train/weight_phase", self.phase_weight)
+        
+        # Log normalized losses
+        self.log("train/norm_iv_loss", norm_iv_loss)
+        self.log("train/norm_tool_loss", norm_tool_loss)
+        self.log("train/norm_verb_loss", norm_verb_loss)
+        self.log("train/norm_phase_loss", norm_phase_loss)
+        
         return {
-            "loss": total_loss, 
-            "iv_loss": iv_loss, 
-            "tool_loss": tool_loss, 
-            "verb_loss": verb_loss, 
-            "phase_loss": phase_loss
+            "loss": total_loss,
+            "iv_loss": iv_loss,
+            "tool_loss": tool_loss,
+            "verb_loss": verb_loss,
+            "phase_loss": phase_loss,
+            "norm_iv_loss": norm_iv_loss,
+            "norm_tool_loss": norm_tool_loss,
+            "norm_verb_loss": norm_verb_loss,
+            "norm_phase_loss": norm_phase_loss
         }
     def validation_step(self, batch, batch_idx):
         """
@@ -342,8 +400,18 @@ class CholecT50Model(pl.LightningModule):
         verb_loss = self.verb_criterion(verb_output, verb_label.float())
         phase_loss = self.phase_criterion(phase_output, phase_label.float())
         
-        total_loss = (self.iv_weight * iv_loss + self.tool_weight * tool_loss + 
-                     self.verb_weight * verb_loss + self.phase_weight * phase_loss)
+        # Normalize losses based on class weights
+        norm_iv_loss, norm_tool_loss, norm_verb_loss, norm_phase_loss = self.normalize_losses(
+            iv_loss, tool_loss, verb_loss, phase_loss
+        )
+        
+        # Compute weighted total loss using dynamic task weights
+        total_loss = (
+            self.iv_weight * norm_iv_loss +
+            self.tool_weight * norm_tool_loss +
+            self.verb_weight * norm_verb_loss +
+            self.phase_weight * norm_phase_loss
+        )
         
         # Log validation losses
         self.log("val/iv_loss", iv_loss)
@@ -351,6 +419,18 @@ class CholecT50Model(pl.LightningModule):
         self.log("val/verb_loss", verb_loss)
         self.log("val/phase_loss", phase_loss)
         self.log("val/total_loss", total_loss)
+        
+        # Log task weights
+        self.log("val/weight_iv", self.iv_weight)
+        self.log("val/weight_tool", self.tool_weight)
+        self.log("val/weight_verb", self.verb_weight)
+        self.log("val/weight_phase", self.phase_weight)
+        
+        # Log normalized losses
+        self.log("val/norm_iv_loss", norm_iv_loss)
+        self.log("val/norm_tool_loss", norm_tool_loss)
+        self.log("val/norm_verb_loss", norm_verb_loss)
+        self.log("val/norm_phase_loss", norm_phase_loss)
         
         # Accumulate predictions and targets for metric computation
         self.predictions["iv"].append(iv_output.cpu().numpy())
@@ -363,11 +443,15 @@ class CholecT50Model(pl.LightningModule):
         self.targets["phases"].append(phase_label.cpu().numpy())
         
         return {
-            "val_loss": total_loss, 
-            "iv_loss": iv_loss, 
-            "tool_loss": tool_loss, 
-            "verb_loss": verb_loss, 
-            "phase_loss": phase_loss
+            "val_loss": total_loss,
+            "iv_loss": iv_loss,
+            "tool_loss": tool_loss,
+            "verb_loss": verb_loss,
+            "phase_loss": phase_loss,
+            "norm_iv_loss": norm_iv_loss,
+            "norm_tool_loss": norm_tool_loss,
+            "norm_verb_loss": norm_verb_loss,
+            "norm_phase_loss": norm_phase_loss
         }
     
     def on_validation_epoch_end(self):
