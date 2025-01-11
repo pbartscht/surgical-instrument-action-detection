@@ -296,17 +296,10 @@ class CholecT50Model(pl.LightningModule):
         # Initialize optimizer and scheduler
         optimizer = torch.optim.AdamW(params, weight_decay=1e-2)
         
-        # Gradient Clipping Konfiguration
-        self.clip_gradients = True
-        self.clip_val = 1.0
         
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             optimizer, 'min', patience=2, factor=0.5
         )
-        
-        # Logging der Gradienten-Norm aktivieren
-        for param_group in optimizer.param_groups:
-            param_group['gradient_clip_val'] = self.clip_val
         
         return {
             "optimizer": optimizer,

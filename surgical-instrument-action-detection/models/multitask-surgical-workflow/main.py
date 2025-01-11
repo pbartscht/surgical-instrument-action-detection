@@ -51,7 +51,8 @@ def main():
         precision='16-mixed',
         logger=wandb_logger,
         callbacks=[checkpoint_callback],
-        gradient_clip_val=0.5,
+        gradient_clip_val=1.0, 
+        gradient_clip_algorithm="norm",
         deterministic=True
     )
     
