@@ -19,7 +19,7 @@ Dataset access steps:
 - pathlib
 
 ## Video Processing
-
+The video extraction script ([video_preprocessing.py](video_preprocessing.py)) extracts frames from surgical videos from HeiChole.
 ### Usage
 
 \```bash
@@ -59,7 +59,7 @@ The implemented solution reduces storage requirements through:
 
 ### Overview
 
-The label processing script (`label_preprocessing.py`) aligns the original HeiChole dataset labels with the extracted video frames. It processes three types of annotations:
+The label processing script ([label_preprocessing.py](label_preprocessing.py)) aligns the original HeiChole dataset labels with the extracted video frames. It processes three types of annotations:
 - Surgical phases (7 classes)
 - Instrument presence (7 instruments)
 - Surgical actions (4 types)
