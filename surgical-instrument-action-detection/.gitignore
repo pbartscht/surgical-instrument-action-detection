@@ -50,3 +50,10 @@ logs/
 # Temp files
 tmp/
 temp/
+
+*.ckpt
+*.pth
+*.h5
+*.hdf5
+checkpoints/
+weights/
