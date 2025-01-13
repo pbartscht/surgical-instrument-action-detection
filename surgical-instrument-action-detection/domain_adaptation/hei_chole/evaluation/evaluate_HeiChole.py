@@ -24,29 +24,72 @@ hierarchical_dir = project_root / "models" / "hierarchical-surgical-workflow"
 sys.path.append(str(project_root))
 sys.path.append(str(hierarchical_dir))
 
-# Debug printing to verify paths
-print("\nPython Path:")
-print("Current directory:", current_dir)
-print("Project root:", project_root)
-print("Hierarchical directory:", hierarchical_dir)
-print("\nSystem path includes:")
-for p in sys.path:
-    print(f"- {p}")
-
 # Now try the imports
 try:
     from verb_recognition.models.SurgicalActionNet import SurgicalVerbRecognition
     print("\n✓ Successfully imported SurgicalVerbRecognition")
 except ImportError as e:
     print(f"\n✗ Failed to import SurgicalVerbRecognition: {str(e)}")
-    print("Check if the following path exists:")
-    verb_recognition_path = hierarchical_dir / "verb_recognition"
-    print(f"- {verb_recognition_path}")
-    if verb_recognition_path.exists():
-        print("Directory exists!")
-        print("Contents:", list(verb_recognition_path.glob("*")))
-    else:
-        print("Directory does not exist!")
+
+# Constants
+CONFIDENCE_THRESHOLD = 0.6
+IOU_THRESHOLD = 0.3
+
+# Global mappings
+TOOL_MAPPING = {
+    0: 'grasper', 1: 'bipolar', 2: 'hook', 
+    3: 'scissors', 4: 'clipper', 5: 'irrigator'
+}
+
+VERB_MAPPING = {
+    0: 'grasp', 1: 'retract', 2: 'dissect', 3: 'coagulate', 
+    4: 'clip', 5: 'cut', 6: 'aspirate', 7: 'irrigate', 
+    8: 'pack', 9: 'null_verb'
+}
+
+# Mapping between verb model indices and evaluation indices
+VERB_MODEL_TO_EVAL_MAPPING = {
+    0: 2,   # Model: 'dissect' -> Eval: 'dissect'
+    1: 1,   # Model: 'retract' -> Eval: 'retract'
+    2: 9,   # Model: 'null_verb' -> Eval: 'null_verb'
+    3: 3,   # Model: 'coagulate' -> Eval: 'coagulate'
+    4: 0,   # Model: 'grasp' -> Eval: 'grasp'
+    5: 4,   # Model: 'clip' -> Eval: 'clip'
+    6: 6,   # Model: 'aspirate' -> Eval: 'aspirate'
+    7: 5,   # Model: 'cut' -> Eval: 'cut'
+    8: 7,   # Model: 'irrigate' -> Eval: 'irrigate'
+    9: 9    # Model: 'null_verb' -> Eval: 'null_verb'
+}
+
+# Constants for Dataset Mappings
+CHOLECT50_TO_HEICHOLE_INSTRUMENT_MAPPING = {
+    'grasper': 'grasper',
+    'bipolar': 'coagulation',
+    'clipper': 'clipper',
+    'hook': None,  # No direct mapping
+    'scissors': 'scissors',
+    'irrigator': 'suction_irrigation'
+}
+
+CHOLECT50_TO_HEICHOLE_VERB_MAPPING = {
+    'grasp': 'grasp',
+    'retract': 'hold',
+    'dissect': 'hold',
+    'coagulate': 'hold',
+    'clip': 'clip',
+    'cut': 'cut',
+    'irrigate': 'suction_irrigation',
+    'aspirate': 'hold',
+    'pack': 'hold',
+    'null_verb': 'hold'
+}
+
+HEICHOLE_SPECIFIC_INSTRUMENTS = {
+    'specimen_bag',
+    'stapler'
+}
+
+
 
 class ModelLoader:
     def __init__(self):
@@ -97,36 +140,61 @@ class ModelLoader:
             print(f"Error details: {str(e)}")
             raise Exception(f"Error loading verb model: {str(e)}")
 
-class HierarchicalEvaluator:
+class HeiCholeEvaluator:
     def __init__(self, yolo_model, verb_model, dataset_dir):
+        """
+        Initialize the HeiChole evaluator.
+        
+        Args:
+            yolo_model: Pre-trained YOLO model for instrument detection
+            verb_model: Pre-trained verb recognition model
+            dataset_dir: Path to HeiChole dataset
+        """
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.yolo_model = yolo_model
         self.verb_model = verb_model.to(self.device)
         self.verb_model.eval()
         self.dataset_dir = dataset_dir
         
+        # Image transformation pipeline
         self.transform = transforms.Compose([
             transforms.Resize((224, 224)),
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
         ])
 
+    def map_cholect50_prediction(self, instrument, verb):
+        """
+        Maps CholecT50 predictions to HeiChole format.
+        
+        Args:
+            instrument: Predicted instrument from CholecT50 model
+            verb: Predicted verb from CholecT50 model
+            
+        Returns:
+            Tuple (mapped_instrument, mapped_verb) in HeiChole format
+        """
+        mapped_instrument = CHOLECT50_TO_HEICHOLE_INSTRUMENT_MAPPING.get(instrument)
+        mapped_verb = CHOLECT50_TO_HEICHOLE_VERB_MAPPING.get(verb)
+        
+        return mapped_instrument, mapped_verb
+
     def load_ground_truth(self, video):
         """
-        Loads binary ground truth annotations for instruments and actions from HeiChole dataset.
+        Loads binary ground truth annotations for HeiChole dataset.
         
-        :param video: Video identifier (e.g., "VID01")
-        :return: Dictionary with frame annotations
+        Args:
+            video: Video identifier (e.g., "VID01")
+            
+        Returns:
+            Dictionary with binary frame annotations
         """
         labels_folder = os.path.join(self.dataset_dir, "Labels")
         json_file = os.path.join(labels_folder, f"{video}.json")
         
-        print(f"Loading annotations from: {json_file}")
-        
-        # Simplified frame annotations without pairs
         frame_annotations = defaultdict(lambda: {
             'instruments': defaultdict(int),
-            'verbs': defaultdict(int)
+            'actions': defaultdict(int)
         })
         
         try:
@@ -134,58 +202,20 @@ class HierarchicalEvaluator:
                 data = json.load(f)
                 frames = data.get('frames', {})
                 
-                print(f"\nDebug Information:")
-                print(f"Total frames in JSON: {len(frames)}")
-                
-                # Sample the first frame to understand structure
-                first_frame = list(frames.items())[0]
-                print(f"\nExample frame structure:")
-                print(json.dumps(first_frame[1], indent=2))
-                
-                processed_frames = 0
-                frames_with_instruments = 0
-                frames_with_actions = 0
-                
                 for frame_num, frame_data in frames.items():
                     frame_number = int(frame_num)
-                    processed_frames += 1
                     
-                    has_instruments = False
-                    has_actions = False
-                    
-                    # Get binary instrument annotations
+                    # Process instruments (binary)
                     instruments = frame_data.get('instruments', {})
                     for instr_name, present in instruments.items():
-                        # Binary: 1 if instrument is present (value > 0), 0 otherwise
-                        if present > 0:
-                            frame_annotations[frame_number]['instruments'][instr_name] = 1
-                            has_instruments = True
+                        # Convert to binary: 1 if present, 0 if not
+                        frame_annotations[frame_number]['instruments'][instr_name] = 1 if present > 0 else 0
                     
-                    # Get binary action annotations
+                    # Process actions (binary)
                     actions = frame_data.get('actions', {})
                     for action_name, present in actions.items():
-                        # Binary: 1 if action is present (value > 0), 0 otherwise
-                        if present > 0:
-                            frame_annotations[frame_number]['verbs'][action_name] = 1
-                            has_actions = True
-                    
-                    if has_instruments:
-                        frames_with_instruments += 1
-                    if has_actions:
-                        frames_with_actions += 1
-                
-                print(f"\nProcessing Statistics:")
-                print(f"Total frames processed: {processed_frames}")
-                print(f"Frames with instruments: {frames_with_instruments}")
-                print(f"Frames with actions: {frames_with_actions}")
-                
-                # Sample a few processed frames
-                print("\nSample of processed frames:")
-                sample_frames = list(frame_annotations.keys())[:3]
-                for frame_num in sample_frames:
-                    print(f"\nFrame {frame_num}:")
-                    print("Instruments:", dict(frame_annotations[frame_num]['instruments']))
-                    print("Actions:", dict(frame_annotations[frame_num]['verbs']))
+                        # Convert to binary: 1 if present, 0 if not
+                        frame_annotations[frame_number]['actions'][action_name] = 1 if present > 0 else 0
                 
                 return frame_annotations
                 
@@ -193,7 +223,237 @@ class HierarchicalEvaluator:
             print(f"Error loading annotations: {str(e)}")
             raise
 
+    def evaluate_frame(self, img_path, ground_truth, save_visualization=True):
+        """
+        Evaluates a single frame and maps predictions to HeiChole format.
+        
+        Args:
+            img_path: Path to the frame image
+            ground_truth: Ground truth annotations for this frame
+            save_visualization: Whether to save visualization
+            
+        Returns:
+            List of mapped predictions with binary confidence scores
+        """
+        frame_predictions = []
+        frame_number = int(os.path.basename(img_path).split('.')[0])
+        video_name = os.path.basename(os.path.dirname(img_path))
+        
+        img = Image.open(img_path)
+        original_img = img.copy()
+        draw = ImageDraw.Draw(original_img)
+        
+        try:
+            # YOLO predictions
+            yolo_results = self.yolo_model(img)
+            valid_detections = []
+            
+            # Process YOLO detections
+            for detection in yolo_results[0].boxes:
+                instrument_class = int(detection.cls)
+                confidence = float(detection.conf)
+                
+                if confidence >= CONFIDENCE_THRESHOLD:
+                    cholect50_instrument = TOOL_MAPPING[instrument_class]
+                    mapped_instrument, _ = self.map_cholect50_prediction(cholect50_instrument, None)
+                    
+                    if mapped_instrument:  # Only process if mapping exists
+                        valid_detections.append({
+                            'class': instrument_class,
+                            'confidence': confidence,
+                            'box': detection.xyxy[0],
+                            'name': mapped_instrument
+                        })
+            
+            # Sort by confidence
+            valid_detections.sort(key=lambda x: x['confidence'], reverse=True)
+            
+            # Process each detection
+            for detection in valid_detections:
+                mapped_instrument = detection['name']
+                box = detection['box']
+                confidence = detection['confidence']
+                
+                # Get instrument crop for verb prediction
+                x1, y1, x2, y2 = map(int, box)
+                instrument_crop = img.crop((x1, y1, x2, y2))
+                crop_tensor = self.transform(instrument_crop).unsqueeze(0).to(self.device)
+                
+                # Predict verb
+                verb_outputs = self.verb_model(crop_tensor, [mapped_instrument])
+                verb_probs = verb_outputs['probabilities']
+                
+                # Get top verb predictions
+                top_verbs = []
+                for verb_idx in torch.topk(verb_probs[0], k=3).indices.cpu().numpy():
+                    cholect50_verb = VERB_MAPPING[VERB_MODEL_TO_EVAL_MAPPING[verb_idx]]
+                    mapped_verb = CHOLECT50_TO_HEICHOLE_VERB_MAPPING.get(cholect50_verb)
+                    
+                    if mapped_verb is not None:
+                        top_verbs.append({
+                            'name': mapped_verb,
+                            'probability': float(verb_probs[0][verb_idx])
+                        })
+                
+                # Create prediction for best verb
+                if top_verbs:
+                    best_verb = max(top_verbs, key=lambda x: x['probability'])
+                    verb_name = best_verb['name']
+                    verb_conf = best_verb['probability']
+                    
+                    # Store binary prediction (confidence above threshold = 1)
+                    prediction = {
+                        'frame_id': f"{video_name}_frame{frame_number}",
+                        'instrument': {
+                            'name': mapped_instrument,
+                            'confidence': confidence,
+                            'binary_pred': 1 if confidence >= CONFIDENCE_THRESHOLD else 0
+                        },
+                        'action': {
+                            'name': verb_name,
+                            'confidence': verb_conf,
+                            'binary_pred': 1 if verb_conf >= CONFIDENCE_THRESHOLD else 0
+                        }
+                    }
+                    frame_predictions.append(prediction)
+                    
+                    # Visualization
+                    if save_visualization:
+                        draw.rectangle([x1, y1, x2, y2], outline='red', width=3)
+                        text = f"{mapped_instrument}\n{verb_name}\nConf: {confidence:.2f}"
+                        draw.text((x1, y1-40), text, fill='blue')
+            
+            # Save visualization
+            if save_visualization:
+                viz_dir = os.path.join(self.dataset_dir, "visualizations")
+                os.makedirs(viz_dir, exist_ok=True)
+                save_path = os.path.join(viz_dir, f"{video_name}_frame{frame_number}.png")
+                original_img.save(save_path)
+            
+            return frame_predictions
+            
+        except Exception as e:
+            print(f"Error processing frame {frame_number}: {str(e)}")
+            return []
+
+    def evaluate(self, videos_to_analyze):
+        """
+        Evaluates model performance across specified videos using binary metrics.
+        
+        Args:
+            videos_to_analyze: List of video IDs to evaluate
+            
+        Returns:
+            Dictionary containing binary evaluation metrics
+        """
+        # Initialize binary prediction tracking
+        predictions = {
+            'instruments': defaultdict(list),  # {instrument_name: [{confidence, binary_gt}, ...]}
+            'actions': defaultdict(list)      # {action_name: [{confidence, binary_gt}, ...]}
+        }
+        
+        print("\nStarting binary evaluation process...")
+        
+        # Process each video
+        for video in videos_to_analyze:
+            print(f"\nProcessing {video}...")
+            
+            # Load ground truth
+            ground_truth = self.load_ground_truth(video)
+            
+            # Get frame files
+            video_folder = os.path.join(self.dataset_dir, "Videos", video)
+            frame_files = sorted([f for f in os.listdir(video_folder) if f.endswith('.png')])
+            
+            # Process frames
+            for frame_file in tqdm(frame_files, desc=f"Evaluating {video}"):
+                frame_number = int(frame_file.split('.')[0])
+                img_path = os.path.join(video_folder, frame_file)
+                
+                # Get frame predictions
+                frame_predictions = self.evaluate_frame(
+                    img_path,
+                    ground_truth[frame_number],
+                    save_visualization=True
+                )
+                
+                # Get ground truth for this frame
+                gt_frame = ground_truth[frame_number]
+                
+                # Update predictions and ground truth
+                for pred in frame_predictions:
+                    # Process instrument predictions
+                    instrument = pred['instrument']
+                    predictions['instruments'][instrument['name']].append({
+                        'confidence': instrument['confidence'],
+                        'binary_gt': gt_frame['instruments'].get(instrument['name'], 0)
+                    })
+                    
+                    # Process action predictions
+                    action = pred['action']
+                    predictions['actions'][action['name']].append({
+                        'confidence': action['confidence'],
+                        'binary_gt': gt_frame['actions'].get(action['name'], 0)
+                    })
+        
+        # Calculate binary metrics
+        metrics = self._calculate_binary_metrics(predictions)
+        
+        return metrics
+
+    def _calculate_binary_metrics(self, predictions):
+        """
+        Calculates binary classification metrics including AP.
+        
+        Args:
+            predictions: Dictionary containing predictions and ground truth
+            
+        Returns:
+            Dictionary with binary metrics
+        """
+        metrics = {
+            'instruments': {},
+            'actions': {}
+        }
+        
+        # Calculate metrics for instruments and actions
+        for category in ['instruments', 'actions']:
+            category_metrics = {}
+            
+            for name, preds in predictions[category].items():
+                if preds:  # Skip if no predictions
+                    # Extract ground truth and confidence scores
+                    y_true = np.array([p['binary_gt'] for p in preds])
+                    y_scores = np.array([p['confidence'] for p in preds])
+                    
+                    # Calculate binary metrics
+                    try:
+                        # Average Precision (handles binary case automatically)
+                        ap = average_precision_score(y_true, y_scores)
+                        
+                        # Store metrics
+                        category_metrics[name] = {
+                            'average_precision': ap,
+                            'num_predictions': len(preds),
+                            'num_positives': int(y_true.sum())
+                        }
+                    except Exception as e:
+                        print(f"Error calculating metrics for {name}: {str(e)}")
+                        continue
+            
+            # Calculate mean AP for category
+            valid_aps = [m['average_precision'] for m in category_metrics.values() if m['average_precision'] is not None]
+            mean_ap = np.mean(valid_aps) if valid_aps else 0.0
+            
+            metrics[category] = {
+                'per_class': category_metrics,
+                'mean_ap': mean_ap
+            }
+        
+        return metrics
+    
 def main():
+    """Main function for HeiChole evaluation"""
     try:
         # Initialize ModelLoader
         loader = ModelLoader()
@@ -202,27 +462,72 @@ def main():
         yolo_model = loader.load_yolo_model()
         verb_model = loader.load_verb_model()
         
-        # Create evaluator
-        evaluator = HierarchicalEvaluator(
-            yolo_model=yolo_model,
-            verb_model=verb_model,
-            dataset_dir=str(loader.dataset_path)
+        # Dataset directory
+        dataset_dir = str(loader.dataset_path)
+        
+        # Verify dataset structure (corrected "Videos" capitalization)
+        labels_dir = os.path.join(dataset_dir, "Labels")
+        videos_dir = os.path.join(dataset_dir, "Videos")  # Changed from "videos" to "Videos"
+        
+        print("\nDataset Structure Check:")
+        print(f"Labels Directory: {labels_dir}")
+        print(f"Videos Directory: {videos_dir}")
+        
+        # Verify directories exist
+        if not os.path.exists(labels_dir):
+            raise FileNotFoundError(f"Labels directory not found: {labels_dir}")
+        if not os.path.exists(videos_dir):
+            raise FileNotFoundError(f"Videos directory not found: {videos_dir}")
+        
+        # List and filter available videos
+        available_videos = [v for v in os.listdir(videos_dir) 
+                          if os.path.isdir(os.path.join(videos_dir, v))]
+        print("\nAvailable Videos:")
+        for idx, video in enumerate(sorted(available_videos), 1):
+            print(f"{idx}. {video}")
+        
+        # Videos to analyze (can be modified or made interactive)
+        videos_to_analyze = ["VID01"]  # Example videos
+        print(f"\nSelected videos for evaluation: {videos_to_analyze}")
+        
+        # Create HeiChole Evaluator
+        evaluator = HeiCholeEvaluator(
+            yolo_model=yolo_model, 
+            verb_model=verb_model, 
+            dataset_dir=dataset_dir
         )
         
-        # Test ground truth loading
-        test_video = "VID01"
-        print(f"\nTesting ground truth loading for {test_video}...")
-        annotations = evaluator.load_ground_truth(test_video)
+        # Run Evaluation
+        results = evaluator.evaluate(videos_to_analyze)
         
-        # Print sample of loaded annotations
-        print("\nSample of loaded annotations:")
-        sample_frame = list(annotations.keys())[0]
-        print(f"Frame {sample_frame}:")
-        print("Instruments:", dict(annotations[sample_frame]['instruments']))
-        print("Actions:", dict(annotations[sample_frame]['verbs']))
+        # Print results
+        print("\nEvaluation Results:")
+        print("===================")
+        
+        for category in ['instruments', 'actions']:
+            print(f"\n{category.upper()} RESULTS:")
+            print("-" * 20)
+            
+            # Print mean AP
+            print(f"Mean AP: {results[category]['mean_ap']:.4f}")
+            
+            # Print per-class results
+            print("\nPer-class results:")
+            for name, metrics in results[category]['per_class'].items():
+                ap = metrics['average_precision']
+                num_pred = metrics['num_predictions']
+                num_pos = metrics['num_positives']
+                print(f"{name}:")
+                print(f"  - AP: {ap:.4f}")
+                print(f"  - Total predictions: {num_pred}")
+                print(f"  - Total positives: {num_pos}")
+        
+        print("\nEvaluation Completed Successfully!")
         
     except Exception as e:
         print(f"❌ Error during initialization or evaluation: {str(e)}")
-
+        import traceback
+        traceback.print_exc()
+        
 if __name__ == '__main__':
     main()
