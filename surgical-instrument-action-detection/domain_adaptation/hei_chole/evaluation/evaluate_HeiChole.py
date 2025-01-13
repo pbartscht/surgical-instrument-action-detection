@@ -57,7 +57,7 @@ class ModelLoader:
     def setup_paths(self):
         """Defines all important paths for the models"""
         # YOLO model path
-        self.yolo_weights = self.project_root / "Instrument-classification-detection/weights/instrument_detector/best_v35.pt"
+        self.yolo_weights = self.hierarchical_dir / "Instrument-classification-detection" / "weights" / "instrument_detector" / "best_v35.pt"
         # Verb model path
         self.verb_model_path = self.hierarchical_dir / "verb_recognition/checkpoints/jumping-tree-47/last.ckpt"
         
@@ -113,58 +113,79 @@ class HierarchicalEvaluator:
 
     def load_ground_truth(self, video):
         """
-        Loads ground truth annotations for a specific video from HeiChole dataset.
+        Loads binary ground truth annotations for instruments and actions from HeiChole dataset.
         
         :param video: Video identifier (e.g., "VID01")
         :return: Dictionary with frame annotations
         """
-        # Path to label files
         labels_folder = os.path.join(self.dataset_dir, "Labels")
         json_file = os.path.join(labels_folder, f"{video}.json")
         
-        # Debug print
         print(f"Loading annotations from: {json_file}")
         
-        # Defaultdict for frame annotations
+        # Simplified frame annotations without pairs
         frame_annotations = defaultdict(lambda: {
             'instruments': defaultdict(int),
-            'verbs': defaultdict(int),
-            'pairs': defaultdict(int)
+            'verbs': defaultdict(int)
         })
         
         try:
-            # Load JSON file
             with open(json_file, 'r') as f:
                 data = json.load(f)
                 frames = data.get('frames', {})
                 
-                # Debug print
-                print(f"Found {len(frames)} frames in annotation file")
+                print(f"\nDebug Information:")
+                print(f"Total frames in JSON: {len(frames)}")
                 
-                # Process each frame
+                # Sample the first frame to understand structure
+                first_frame = list(frames.items())[0]
+                print(f"\nExample frame structure:")
+                print(json.dumps(first_frame[1], indent=2))
+                
+                processed_frames = 0
+                frames_with_instruments = 0
+                frames_with_actions = 0
+                
                 for frame_num, frame_data in frames.items():
                     frame_number = int(frame_num)
+                    processed_frames += 1
                     
-                    # Get instruments
+                    has_instruments = False
+                    has_actions = False
+                    
+                    # Get binary instrument annotations
                     instruments = frame_data.get('instruments', {})
-                    for instr_name, count in instruments.items():
-                        if count > 0:
-                            frame_annotations[frame_number]['instruments'][instr_name] += 1
+                    for instr_name, present in instruments.items():
+                        # Binary: 1 if instrument is present (value > 0), 0 otherwise
+                        if present > 0:
+                            frame_annotations[frame_number]['instruments'][instr_name] = 1
+                            has_instruments = True
                     
-                    # Get actions (verbs)
+                    # Get binary action annotations
                     actions = frame_data.get('actions', {})
-                    for action_name, count in actions.items():
-                        if count > 0:
-                            frame_annotations[frame_number]['verbs'][action_name] += 1
-                            
-                            # Create instrument-verb pairs for active instruments and actions
-                            for instr_name, instr_count in instruments.items():
-                                if instr_count > 0:
-                                    pair_key = f"{instr_name}_{action_name}"
-                                    frame_annotations[frame_number]['pairs'][pair_key] += 1
+                    for action_name, present in actions.items():
+                        # Binary: 1 if action is present (value > 0), 0 otherwise
+                        if present > 0:
+                            frame_annotations[frame_number]['verbs'][action_name] = 1
+                            has_actions = True
+                    
+                    if has_instruments:
+                        frames_with_instruments += 1
+                    if has_actions:
+                        frames_with_actions += 1
                 
-                # Debug print
-                print(f"Processed annotations for {len(frame_annotations)} frames")
+                print(f"\nProcessing Statistics:")
+                print(f"Total frames processed: {processed_frames}")
+                print(f"Frames with instruments: {frames_with_instruments}")
+                print(f"Frames with actions: {frames_with_actions}")
+                
+                # Sample a few processed frames
+                print("\nSample of processed frames:")
+                sample_frames = list(frame_annotations.keys())[:3]
+                for frame_num in sample_frames:
+                    print(f"\nFrame {frame_num}:")
+                    print("Instruments:", dict(frame_annotations[frame_num]['instruments']))
+                    print("Actions:", dict(frame_annotations[frame_num]['verbs']))
                 
                 return frame_annotations
                 
@@ -199,7 +220,6 @@ def main():
         print(f"Frame {sample_frame}:")
         print("Instruments:", dict(annotations[sample_frame]['instruments']))
         print("Actions:", dict(annotations[sample_frame]['verbs']))
-        print("Pairs:", dict(annotations[sample_frame]['pairs']))
         
     except Exception as e:
         print(f"❌ Error during initialization or evaluation: {str(e)}")
