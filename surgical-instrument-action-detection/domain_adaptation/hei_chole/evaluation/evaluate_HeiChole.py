@@ -452,8 +452,97 @@ class HeiCholeEvaluator:
         
         return metrics
     
+def analyze_label_distribution(dataset_dir, videos):
+    """
+    Analyzes the distribution of ground truth labels, including zero occurrences.
+    
+    Args:
+        dataset_dir: Path to dataset directory
+        videos: List of video IDs to analyze
+    """
+    # Define all possible classes (from mapping)
+    all_possible_instruments = {
+        'grasper', 'coagulation', 'clipper', 'scissors', 
+        'suction_irrigation', 'specimen_bag', 'stapler'
+    }
+    
+    all_possible_actions = {
+        'grasp', 'hold', 'clip', 'cut'
+    }
+    
+    # Initialize counters
+    frequencies = {
+        'instruments': defaultdict(int),
+        'actions': defaultdict(int)
+    }
+    
+    total_frames = 0
+    
+    print("\nAnalyzing ground truth label distribution...")
+    
+    # Process each video
+    for video in videos:
+        print(f"\nProcessing {video}...")
+        json_file = os.path.join(dataset_dir, "Labels", f"{video}.json")
+        
+        try:
+            with open(json_file, 'r') as f:
+                data = json.load(f)
+                frames = data.get('frames', {})
+                total_frames += len(frames)
+                
+                # Count occurrences
+                for frame_data in frames.values():
+                    # Process instruments
+                    instruments = frame_data.get('instruments', {})
+                    for instr, present in instruments.items():
+                        if present > 0:
+                            frequencies['instruments'][instr] += 1
+                    
+                    # Process actions
+                    actions = frame_data.get('actions', {})
+                    for action, present in actions.items():
+                        if present > 0:
+                            frequencies['actions'][action] += 1
+        
+        except Exception as e:
+            print(f"Error processing {video}: {str(e)}")
+            continue
+    
+    # Print detailed statistics
+    print("\n==========================================")
+    print("Ground Truth Label Distribution Analysis")
+    print("==========================================")
+    print(f"\nTotal frames analyzed: {total_frames}")
+    
+    # Print instrument frequencies
+    print("\nINSTRUMENT FREQUENCIES:")
+    print("=" * 50)
+    print(f"{'Instrument':25s} {'Count':>8s} {'% of Frames':>12s} {'Present?':>10s}")
+    print("-" * 50)
+    
+    for instr in sorted(all_possible_instruments):
+        count = frequencies['instruments'][instr]
+        percentage = (count / total_frames) * 100 if total_frames > 0 else 0
+        present = "Yes" if count > 0 else "No"
+        print(f"{instr:25s} {count:8d} {percentage:11.2f}% {present:>10s}")
+    
+    # Print action frequencies
+    print("\nACTION FREQUENCIES:")
+    print("=" * 50)
+    print(f"{'Action':25s} {'Count':>8s} {'% of Frames':>12s} {'Present?':>10s}")
+    print("-" * 50)
+    
+    for action in sorted(all_possible_actions):
+        count = frequencies['actions'][action]
+        percentage = (count / total_frames) * 100 if total_frames > 0 else 0
+        present = "Yes" if count > 0 else "No"
+        print(f"{action:25s} {count:8d} {percentage:11.2f}% {present:>10s}")
+    
+    return frequencies
+
 def main():
-    """Main function for HeiChole evaluation"""
+    """Compare ground truth and model predictions for all videos in HeiChole dataset"""
     try:
         # Initialize ModelLoader
         loader = ModelLoader()
@@ -461,73 +550,86 @@ def main():
         # Load models
         yolo_model = loader.load_yolo_model()
         verb_model = loader.load_verb_model()
-        
-        # Dataset directory
         dataset_dir = str(loader.dataset_path)
         
-        # Verify dataset structure (corrected "Videos" capitalization)
-        labels_dir = os.path.join(dataset_dir, "Labels")
-        videos_dir = os.path.join(dataset_dir, "Videos")  # Changed from "videos" to "Videos"
+        # Get all video IDs from the Labels directory
+        labels_dir = Path(dataset_dir) / "Labels"
+        videos_to_analyze = [f.stem for f in labels_dir.glob("*.json")]
+        print(f"\nFound {len(videos_to_analyze)} videos to analyze: {', '.join(videos_to_analyze)}")
         
-        print("\nDataset Structure Check:")
-        print(f"Labels Directory: {labels_dir}")
-        print(f"Videos Directory: {videos_dir}")
+        print("\n==========================================")
+        print("GROUND TRUTH ANALYSIS")
+        print("==========================================")
         
-        # Verify directories exist
-        if not os.path.exists(labels_dir):
-            raise FileNotFoundError(f"Labels directory not found: {labels_dir}")
-        if not os.path.exists(videos_dir):
-            raise FileNotFoundError(f"Videos directory not found: {videos_dir}")
+        # Ground Truth Analysis using analyze_label_distribution
+        gt_distribution = analyze_label_distribution(dataset_dir, videos_to_analyze)
         
-        # List and filter available videos
-        available_videos = [v for v in os.listdir(videos_dir) 
-                          if os.path.isdir(os.path.join(videos_dir, v))]
-        print("\nAvailable Videos:")
-        for idx, video in enumerate(sorted(available_videos), 1):
-            print(f"{idx}. {video}")
+        # Running model predictions
+        print("\n==========================================")
+        print("MODEL PREDICTIONS ANALYSIS")
+        print("==========================================")
         
-        # Videos to analyze (can be modified or made interactive)
-        videos_to_analyze = ["VID01"]  # Example videos
-        print(f"\nSelected videos for evaluation: {videos_to_analyze}")
-        
-        # Create HeiChole Evaluator
+        # Create evaluator and run predictions
         evaluator = HeiCholeEvaluator(
             yolo_model=yolo_model, 
             verb_model=verb_model, 
             dataset_dir=dataset_dir
         )
         
-        # Run Evaluation
         results = evaluator.evaluate(videos_to_analyze)
         
-        # Print results
-        print("\nEvaluation Results:")
-        print("===================")
+        # Calculate total frames from all videos
+        total_frames = sum(len(Path(dataset_dir) / "Videos" / video).glob("*.png") 
+                         for video in videos_to_analyze)
         
-        for category in ['instruments', 'actions']:
-            print(f"\n{category.upper()} RESULTS:")
-            print("-" * 20)
-            
-            # Print mean AP
-            print(f"Mean AP: {results[category]['mean_ap']:.4f}")
-            
-            # Print per-class results
-            print("\nPer-class results:")
-            for name, metrics in results[category]['per_class'].items():
-                ap = metrics['average_precision']
-                num_pred = metrics['num_predictions']
-                num_pos = metrics['num_positives']
-                print(f"{name}:")
-                print(f"  - AP: {ap:.4f}")
-                print(f"  - Total predictions: {num_pred}")
-                print(f"  - Total positives: {num_pos}")
+        # Print final comparison
+        print("\n==========================================")
+        print("FINAL COMPARISON")
+        print("==========================================")
         
-        print("\nEvaluation Completed Successfully!")
+        print("\nGROUND TRUTH DISTRIBUTION:")
+        print("=" * 70)
+        print(f"{'Category':20s} {'Count':>10s} {'Percentage':>12s}")
+        print("-" * 70)
+        
+        print("\nINSTRUMENTS:")
+        for instr, count in sorted(gt_distribution['instruments'].items()):
+            percentage = (count / total_frames) * 100
+            print(f"{instr:20s} {count:10d} {percentage:11.2f}%")
+            
+        print("\nACTIONS:")
+        for action, count in sorted(gt_distribution['actions'].items()):
+            percentage = (count / total_frames) * 100
+            print(f"{action:20s} {count:10d} {percentage:11.2f}%")
+        
+        print("\nMODEL PREDICTIONS:")
+        print("=" * 70)
+        print(f"{'Category':20s} {'Predictions':>12s} {'AP Score':>10s}")
+        print("-" * 70)
+        
+        print("\nINSTRUMENTS:")
+        for instr, metrics in sorted(results['instruments']['per_class'].items()):
+            pred_count = metrics['num_predictions']
+            ap = metrics['average_precision']
+            percentage = (pred_count / total_frames) * 100
+            print(f"{instr:20s} {pred_count:10d} ({percentage:6.2f}%) {ap:8.4f}")
+            
+        print("\nACTIONS:")
+        for action, metrics in sorted(results['actions']['per_class'].items()):
+            pred_count = metrics['num_predictions']
+            ap = metrics['average_precision']
+            percentage = (pred_count / total_frames) * 100
+            print(f"{action:20s} {pred_count:10d} ({percentage:6.2f}%) {ap:8.4f}")
+        
+        print("\nMEAN AP SCORES:")
+        print("=" * 30)
+        print(f"Instruments mAP: {results['instruments']['mean_ap']:.4f}")
+        print(f"Actions mAP:     {results['actions']['mean_ap']:.4f}")
         
     except Exception as e:
-        print(f"❌ Error during initialization or evaluation: {str(e)}")
+        print(f"❌ Error during analysis: {str(e)}")
         import traceback
         traceback.print_exc()
-        
+
 if __name__ == '__main__':
     main()
