@@ -565,25 +565,21 @@ class BinaryMetricsCalculator:
         ]
 
     def calculate_metrics(self, predictions_per_frame, ground_truth):
-        """
-        Calculates all metrics (F1, Precision, Recall, AP) using binary predictions
-        """
         results = {
             'instruments': {'per_class': {}, 'mean_metrics': {}},
             'actions': {'per_class': {}, 'mean_metrics': {}}
         }
         
-        # Get total number of frames and create frame mapping
         all_frame_numbers = sorted(list(ground_truth.keys()))
         num_frames = len(all_frame_numbers)
         frame_to_idx = {frame: idx for idx, frame in enumerate(all_frame_numbers)}
         
-        # Process instruments and actions separately
         for category, label_list in [('instruments', self.instrument_labels), 
                                    ('actions', self.action_labels)]:
-            # Create matrices for binary predictions and ground truth
+            # Three matrices: ground truth, binary predictions, and confidence scores
             y_true = np.zeros((num_frames, len(label_list)), dtype=np.int32)
             y_pred = np.zeros((num_frames, len(label_list)), dtype=np.int32)
+            y_scores = np.zeros((num_frames, len(label_list)), dtype=np.float32)  # Neu!
             
             # Fill ground truth matrix
             for frame_num, frame_data in ground_truth.items():
@@ -592,9 +588,9 @@ class BinaryMetricsCalculator:
                     if label in frame_data[category]:
                         y_true[frame_idx, label_idx] = frame_data[category][label]
             
-            # Fill prediction matrix
+            # Fill prediction and scores matrices
             for frame_id, preds in predictions_per_frame.items():
-                frame_num = int(frame_id.split('_')[1])
+                frame_num = int(frame_id.split('_frame')[1])
                 if frame_num in frame_to_idx:
                     frame_idx = frame_to_idx[frame_num]
                     for pred in preds:
@@ -605,18 +601,17 @@ class BinaryMetricsCalculator:
                             name = pred['action']['name']
                             conf = pred['action']['confidence']
                             
-                        if conf >= self.confidence_threshold:
-                            try:
-                                label_idx = label_list.index(name)
-                                y_pred[frame_idx, label_idx] = 1
-                            except ValueError:
-                                continue
+                        try:
+                            label_idx = label_list.index(name)
+                            y_scores[frame_idx, label_idx] = conf  # Speichere confidence score
+                            y_pred[frame_idx, label_idx] = 1 if conf >= self.confidence_threshold else 0
+                        except ValueError:
+                            continue
             
             # Calculate metrics for each class
             f1_scores = f1_score(y_true, y_pred, average=None, zero_division=0)
             precision_scores = precision_score(y_true, y_pred, average=None, zero_division=0)
             recall_scores = recall_score(y_true, y_pred, average=None, zero_division=0)
-            ap_scores = []  # Binary AP scores
             
             # Count instances per class
             ins_count_pred = np.sum(y_pred, axis=0)
@@ -628,20 +623,19 @@ class BinaryMetricsCalculator:
             class_count = 0
             
             for i, label in enumerate(label_list):
-                if ins_count_gt[i] != 0 or ins_count_pred[i] != 0:
-                    # Calculate AP using binary predictions
-                    ap = average_precision_score(y_true[:, i], y_pred[:, i])
-                    ap_scores.append(ap)
-                    
-                    results[category]['per_class'][label] = {
-                        'f1_score': float(f1_scores[i]),
-                        'precision': float(precision_scores[i]),
-                        'recall': float(recall_scores[i]),
-                        'ap_score': float(ap),
-                        'support': int(ins_count_gt[i]),
-                        'predictions': int(ins_count_pred[i])
-                    }
-                    
+                # Wichtig: AP wird mit confidence scores berechnet!
+                ap = average_precision_score(y_true[:, i], y_scores[:, i])
+                
+                results[category]['per_class'][label] = {
+                    'f1_score': float(f1_scores[i]),
+                    'precision': float(precision_scores[i]),
+                    'recall': float(recall_scores[i]),
+                    'ap_score': float(ap),
+                    'support': int(ins_count_gt[i]),
+                    'predictions': int(ins_count_pred[i])
+                }
+                
+                if ins_count_gt[i] > 0:  # Nur Klassen mit Ground Truth
                     overall_f1 += f1_scores[i]
                     overall_ap += ap
                     class_count += 1
@@ -652,11 +646,11 @@ class BinaryMetricsCalculator:
                     'mean_f1': overall_f1 / class_count,
                     'mean_precision': np.mean(precision_scores[precision_scores > 0]),
                     'mean_recall': np.mean(recall_scores[recall_scores > 0]),
-                    'mean_ap': overall_ap / class_count,
-                    'accuracy': float(accuracy_score(y_true, y_pred))
+                    'mean_ap': overall_ap / class_count
                 }
         
         return results
+    
 def print_metrics_report(metrics):
     """Prints a formatted report of the metrics"""
     print("\n====== EVALUATION METRICS REPORT ======")
@@ -734,7 +728,7 @@ def main():
             video_folder = os.path.join(dataset_dir, "Videos", video)
             for frame_file in os.listdir(video_folder):
                 if frame_file.endswith('.png'):
-                    frame_id = f"{video}_{frame_file.split('.')[0]}"
+                    frame_id = f"{video}_frame{frame_file.split('.')[0]}"
                     img_path = os.path.join(video_folder, frame_file)
                     
                     # Get Frame Predictions
