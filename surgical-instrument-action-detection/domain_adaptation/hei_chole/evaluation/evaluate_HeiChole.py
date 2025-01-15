@@ -11,7 +11,7 @@ from collections import defaultdict
 from tqdm import tqdm
 from ultralytics import YOLO
 import pytorch_lightning as pl
-from sklearn.metrics import f1_score, precision_score, recall_score, average_precision_score
+from sklearn.metrics import f1_score, precision_score, recall_score, average_precision_score, accuracy_score
 from collections import defaultdict
 
 # Get the current script's directory and navigate to project root
@@ -33,7 +33,7 @@ except ImportError as e:
     print(f"\n✗ Failed to import SurgicalVerbRecognition: {str(e)}")
 
 # Constants
-CONFIDENCE_THRESHOLD = 0.6
+CONFIDENCE_THRESHOLD = 0.1
 IOU_THRESHOLD = 0.3
 
 # Global mappings
@@ -543,124 +543,120 @@ def analyze_label_distribution(dataset_dir, videos):
     return frequencies
 
 class BinaryMetricsCalculator:
-    def __init__(self, confidence_threshold=0.6):
+    def __init__(self, confidence_threshold=0.1):
         self.confidence_threshold = confidence_threshold
         
-    def _convert_to_binary_predictions(self, predictions_per_frame):
-        """
-        Converts frame-based predictions to binary labels.
-        Multiple detections of the same class are counted as a single detection.
-        """
-        binary_predictions = defaultdict(lambda: {'instruments': defaultdict(int), 
-                                                'actions': defaultdict(int)})
+        # Define fixed order of labels matching ground truth JSON structure
+        self.instrument_labels = [
+            'grasper',
+            'clipper', 
+            'coagulation',
+            'scissors',
+            'suction_irrigation',
+            'specimen_bag',
+            'stapler'
+        ]
         
-        for frame_id, frame_preds in predictions_per_frame.items():
-            # For each instrument/action in a frame, set to 1 if confidence > threshold
-            for pred in frame_preds:
-                instr = pred['instrument']
-                action = pred['action']
-                
-                # If confidence above threshold, set to 1 (ignore multiple detections)
-                if instr['confidence'] >= self.confidence_threshold:
-                    binary_predictions[frame_id]['instruments'][instr['name']] = 1
-                    
-                if action['confidence'] >= self.confidence_threshold:
-                    binary_predictions[frame_id]['actions'][action['name']] = 1
-                    
-        return binary_predictions
-    
+        self.action_labels = [
+            'grasp',
+            'hold',
+            'cut',
+            'clip'
+        ]
+
     def calculate_metrics(self, predictions_per_frame, ground_truth):
         """
-        Calculates F1-Score and other metrics for binary classification.
-        
-        Args:
-            predictions_per_frame: Dict with predictions per frame
-            ground_truth: Dict with ground truth labels per frame
+        Calculates all metrics (F1, Precision, Recall, AP) using binary predictions
         """
-        # Convert predictions to binary format
-        binary_predictions = self._convert_to_binary_predictions(predictions_per_frame)
-        
-        # Initialize metrics dictionary
-        metrics = {
-            'instruments': defaultdict(list),
-            'actions': defaultdict(list)
-        }
-        
-        # Collect all predicted and ground truth labels
-        all_frames = set(list(binary_predictions.keys()) + list(ground_truth.keys()))
-        
-        # For each frame, collect the binary labels
-        for frame_id in all_frames:
-            pred_frame = binary_predictions.get(frame_id, {'instruments': {}, 'actions': {}})
-            gt_frame = ground_truth.get(frame_id, {'instruments': {}, 'actions': {}})
-            
-            # Process instruments and actions
-            for category in ['instruments', 'actions']:
-                # Get all unique labels for this category
-                all_labels = set(list(pred_frame[category].keys()) + 
-                               list(gt_frame[category].keys()))
-                
-                # For each label, store prediction and ground truth
-                for label in all_labels:
-                    pred_value = pred_frame[category].get(label, 0)
-                    gt_value = gt_frame[category].get(label, 0)
-                    
-                    metrics[category][label].append({
-                        'pred': pred_value,
-                        'gt': gt_value
-                    })
-        
-        # Calculate final metrics
         results = {
             'instruments': {'per_class': {}, 'mean_metrics': {}},
             'actions': {'per_class': {}, 'mean_metrics': {}}
         }
         
-        # Calculate metrics for each category
-        for category in ['instruments', 'actions']:
-            all_f1 = []
-            all_precision = []
-            all_recall = []
-            all_ap = []
+        # Get total number of frames and create frame mapping
+        all_frame_numbers = sorted(list(ground_truth.keys()))
+        num_frames = len(all_frame_numbers)
+        frame_to_idx = {frame: idx for idx, frame in enumerate(all_frame_numbers)}
+        
+        # Process instruments and actions separately
+        for category, label_list in [('instruments', self.instrument_labels), 
+                                   ('actions', self.action_labels)]:
+            # Create matrices for binary predictions and ground truth
+            y_true = np.zeros((num_frames, len(label_list)), dtype=np.int32)
+            y_pred = np.zeros((num_frames, len(label_list)), dtype=np.int32)
             
-            for label, values in metrics[category].items():
-                # Extract arrays for calculations
-                y_true = np.array([v['gt'] for v in values])
-                y_pred = np.array([v['pred'] for v in values])
-                
-                if len(y_true) > 0:  # Only calculate if data exists
-                    # Calculate metrics
-                    f1 = f1_score(y_true, y_pred)
-                    precision = precision_score(y_true, y_pred)
-                    recall = recall_score(y_true, y_pred)
-                    ap = average_precision_score(y_true, y_pred)
+            # Fill ground truth matrix
+            for frame_num, frame_data in ground_truth.items():
+                frame_idx = frame_to_idx[frame_num]
+                for label_idx, label in enumerate(label_list):
+                    if label in frame_data[category]:
+                        y_true[frame_idx, label_idx] = frame_data[category][label]
+            
+            # Fill prediction matrix
+            for frame_id, preds in predictions_per_frame.items():
+                frame_num = int(frame_id.split('_')[1])
+                if frame_num in frame_to_idx:
+                    frame_idx = frame_to_idx[frame_num]
+                    for pred in preds:
+                        if category == 'instruments':
+                            name = pred['instrument']['name']
+                            conf = pred['instrument']['confidence']
+                        else:
+                            name = pred['action']['name']
+                            conf = pred['action']['confidence']
+                            
+                        if conf >= self.confidence_threshold:
+                            try:
+                                label_idx = label_list.index(name)
+                                y_pred[frame_idx, label_idx] = 1
+                            except ValueError:
+                                continue
+            
+            # Calculate metrics for each class
+            f1_scores = f1_score(y_true, y_pred, average=None, zero_division=0)
+            precision_scores = precision_score(y_true, y_pred, average=None, zero_division=0)
+            recall_scores = recall_score(y_true, y_pred, average=None, zero_division=0)
+            ap_scores = []  # Binary AP scores
+            
+            # Count instances per class
+            ins_count_pred = np.sum(y_pred, axis=0)
+            ins_count_gt = np.sum(y_true, axis=0)
+            
+            # Calculate per-class metrics
+            overall_f1 = 0
+            overall_ap = 0
+            class_count = 0
+            
+            for i, label in enumerate(label_list):
+                if ins_count_gt[i] != 0 or ins_count_pred[i] != 0:
+                    # Calculate AP using binary predictions
+                    ap = average_precision_score(y_true[:, i], y_pred[:, i])
+                    ap_scores.append(ap)
                     
-                    # Store per-class metrics
                     results[category]['per_class'][label] = {
-                        'f1_score': f1,
-                        'precision': precision,
-                        'recall': recall,
-                        'ap_score': ap,
-                        'support': int(y_true.sum()),
-                        'predictions': int(y_pred.sum())
+                        'f1_score': float(f1_scores[i]),
+                        'precision': float(precision_scores[i]),
+                        'recall': float(recall_scores[i]),
+                        'ap_score': float(ap),
+                        'support': int(ins_count_gt[i]),
+                        'predictions': int(ins_count_pred[i])
                     }
                     
-                    # Collect for average calculation
-                    all_f1.append(f1)
-                    all_precision.append(precision)
-                    all_recall.append(recall)
-                    all_ap.append(ap)
+                    overall_f1 += f1_scores[i]
+                    overall_ap += ap
+                    class_count += 1
             
-            # Calculate average values
-            results[category]['mean_metrics'] = {
-                'mean_f1': np.mean(all_f1) if all_f1 else 0.0,
-                'mean_precision': np.mean(all_precision) if all_precision else 0.0,
-                'mean_recall': np.mean(all_recall) if all_recall else 0.0,
-                'mean_ap': np.mean(all_ap) if all_ap else 0.0
-            }
+            # Calculate mean metrics
+            if class_count > 0:
+                results[category]['mean_metrics'] = {
+                    'mean_f1': overall_f1 / class_count,
+                    'mean_precision': np.mean(precision_scores[precision_scores > 0]),
+                    'mean_recall': np.mean(recall_scores[recall_scores > 0]),
+                    'mean_ap': overall_ap / class_count,
+                    'accuracy': float(accuracy_score(y_true, y_pred))
+                }
         
         return results
-
 def print_metrics_report(metrics):
     """Prints a formatted report of the metrics"""
     print("\n====== EVALUATION METRICS REPORT ======")
@@ -699,36 +695,36 @@ def main():
         videos_to_analyze = [f.stem for f in labels_dir.glob("*.json")]
         print(f"\nFound {len(videos_to_analyze)} videos to analyze: {', '.join(videos_to_analyze)}")
         
+        # Für Test mit einem Video:
+        #videos_to_analyze = ["VID01"]  
+        #print(f"\nTesting with video: {videos_to_analyze[0]}")
+
         print("\n==========================================")
         print("GROUND TRUTH ANALYSIS")
         print("==========================================")
         
-        # Ground Truth Analysis using analyze_label_distribution
+        # Ground Truth Analysis
         gt_distribution = analyze_label_distribution(dataset_dir, videos_to_analyze)
         
-        # Running model predictions
         print("\n==========================================")
         print("MODEL PREDICTIONS ANALYSIS")
         print("==========================================")
         
-        # Create evaluator and run predictions
+        # Create evaluator
         evaluator = HeiCholeEvaluator(
             yolo_model=yolo_model, 
             verb_model=verb_model, 
             dataset_dir=dataset_dir
         )
         
-        # Get AP score results
-        ap_results = evaluator.evaluate(videos_to_analyze)
-        
         # Initialize Binary Metrics Calculator
-        metrics_calculator = BinaryMetricsCalculator(confidence_threshold=0.6)
+        metrics_calculator = BinaryMetricsCalculator(confidence_threshold=0.1)
         
-        # Collect Predictions and Ground Truth for F1-Score calculation
+        # Collect Predictions and Ground Truth
         predictions_per_frame = {}
         ground_truth = {}
         
-        # For each video and frame
+        # Process each video
         for video in videos_to_analyze:
             # Load Ground Truth
             gt = evaluator.load_ground_truth(video)
@@ -751,14 +747,14 @@ def main():
                     if frame_predictions:
                         predictions_per_frame[frame_id] = frame_predictions
         
-        # Calculate F1-Score and other binary metrics
+        # Calculate metrics
         binary_metrics = metrics_calculator.calculate_metrics(predictions_per_frame, ground_truth)
         
-        # Calculate total frames from all videos
+        # Calculate total frames
         total_frames = sum(sum(1 for _ in (Path(dataset_dir) / "Videos" / video).glob("*.png")) 
                          for video in videos_to_analyze)
         
-        # Print final comparison
+        # Print results
         print("\n==========================================")
         print("FINAL COMPARISON")
         print("==========================================")
@@ -789,30 +785,24 @@ def main():
         
         # Print Instrument Metrics
         print("\nINSTRUMENTS:")
-        for instr, ap_metric in sorted(ap_results['instruments']['per_class'].items()):
-            pred_count = ap_metric['num_predictions']
-            ap = ap_metric['average_precision']
-            
-            # Get binary metrics for this instrument
-            binary_metric = binary_metrics['instruments']['per_class'].get(instr, {})
-            f1 = binary_metric.get('f1_score', 0.0)
-            precision = binary_metric.get('precision', 0.0)
-            recall = binary_metric.get('recall', 0.0)
+        for instr, metrics in sorted(binary_metrics['instruments']['per_class'].items()):
+            pred_count = metrics['predictions']
+            ap = metrics['ap_score']
+            f1 = metrics['f1_score']
+            precision = metrics['precision']
+            recall = metrics['recall']
             
             percentage = (pred_count / total_frames) * 100
             print(f"{instr:20s} {pred_count:10d} ({percentage:6.2f}%) {ap:8.4f} {f1:8.4f} {precision:8.4f} {recall:8.4f}")
         
         # Print Action Metrics
         print("\nACTIONS:")
-        for action, ap_metric in sorted(ap_results['actions']['per_class'].items()):
-            pred_count = ap_metric['num_predictions']
-            ap = ap_metric['average_precision']
-            
-            # Get binary metrics for this action
-            binary_metric = binary_metrics['actions']['per_class'].get(action, {})
-            f1 = binary_metric.get('f1_score', 0.0)
-            precision = binary_metric.get('precision', 0.0)
-            recall = binary_metric.get('recall', 0.0)
+        for action, metrics in sorted(binary_metrics['actions']['per_class'].items()):
+            pred_count = metrics['predictions']
+            ap = metrics['ap_score']
+            f1 = metrics['f1_score']
+            precision = metrics['precision']
+            recall = metrics['recall']
             
             percentage = (pred_count / total_frames) * 100
             print(f"{action:20s} {pred_count:10d} ({percentage:6.2f}%) {ap:8.4f} {f1:8.4f} {precision:8.4f} {recall:8.4f}")
@@ -821,10 +811,10 @@ def main():
         print("\nMEAN SCORES:")
         print("=" * 50)
         print("INSTRUMENTS:")
-        print(f"mAP: {ap_results['instruments']['mean_ap']:.4f}")
+        print(f"mAP: {binary_metrics['instruments']['mean_metrics']['mean_ap']:.4f}")
         print(f"F1:  {binary_metrics['instruments']['mean_metrics']['mean_f1']:.4f}")
         print("\nACTIONS:")
-        print(f"mAP: {ap_results['actions']['mean_ap']:.4f}")
+        print(f"mAP: {binary_metrics['actions']['mean_metrics']['mean_ap']:.4f}")
         print(f"F1:  {binary_metrics['actions']['mean_metrics']['mean_f1']:.4f}")
         
     except Exception as e:
