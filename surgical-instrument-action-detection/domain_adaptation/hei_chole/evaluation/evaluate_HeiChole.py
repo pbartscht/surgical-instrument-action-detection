@@ -67,7 +67,7 @@ CHOLECT50_TO_HEICHOLE_INSTRUMENT_MAPPING = {
     'grasper': 'grasper',
     'bipolar': 'coagulation',
     'clipper': 'clipper',
-    'hook': None,  # No direct mapping
+    'hook': 'coagulation',  # revised: hook is also a coagulation instrument
     'scissors': 'scissors',
     'irrigator': 'suction_irrigation'
 }
