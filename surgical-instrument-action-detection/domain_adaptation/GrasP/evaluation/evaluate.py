@@ -375,86 +375,259 @@ class GraSPEvaluator:
             print(f"Error processing frame {frame_number}: {str(e)}")
             return []
 
-    def print_statistics(self):
-        """Print comprehensive statistics comparing ground truth and predictions"""
-        print("\n" + "="*100)
-        print("GROUND TRUTH AND PREDICTION STATISTICS")
-        print("="*100)
+    def calculate_metrics(self, category_data):
+        """
+        Calculate metrics using sklearn for a given category
         
-        # Print instrument statistics
+        Args:
+            category_data: Dict with 'gt' and 'pred' lists of labels
+        Returns:
+            Dict with precision, recall, f1, and ap scores
+        """
+        y_true = np.array(category_data['gt'])
+        y_pred = np.array(category_data['pred'])
+        
+        precision = precision_score(y_true, y_pred, average='macro', zero_division=0)
+        recall = recall_score(y_true, y_pred, average='macro', zero_division=0)
+        f1 = f1_score(y_true, y_pred, average='macro', zero_division=0)
+        ap = average_precision_score(y_true, y_pred, average='macro')
+        
+        return {
+            'precision': precision,
+            'recall': recall,
+            'f1': f1,
+            'ap': ap
+        }
+
+    def prepare_binary_labels(self, category):
+        """
+        Prepare binary labels for a category (instruments, actions, or pairs)
+        
+        Args:
+            category: String indicating which category to prepare
+        Returns:
+            Dict with 'gt' and 'pred' binary label arrays
+        """
+        if category == 'instruments':
+            all_instruments = sorted(self.instrument_id_to_name.values())
+            labels = {
+                'gt': [],
+                'pred': []
+            }
+            
+            for frame_data in self.frame_data.values():
+                gt_instruments = set(inst['name'] for inst in frame_data['gt_instruments'])
+                pred_instruments = set(frame_data['pred_instruments'])
+                
+                # Create binary vectors for this frame
+                for instrument in all_instruments:
+                    labels['gt'].append(1 if instrument in gt_instruments else 0)
+                    labels['pred'].append(1 if instrument in pred_instruments else 0)
+                    
+        elif category == 'actions':
+            all_actions = sorted(self.action_id_to_name.values())
+            labels = {
+                'gt': [],
+                'pred': []
+            }
+            
+            for frame_data in self.frame_data.values():
+                gt_actions = set()
+                for inst in frame_data['gt_instruments']:
+                    if 'valid_actions' in inst:
+                        gt_actions.update(inst['valid_actions'])
+                        
+                pred_actions = set(frame_data['pred_actions'])
+                
+                # Create binary vectors for this frame
+                for action in all_actions:
+                    labels['gt'].append(1 if action in gt_actions else 0)
+                    labels['pred'].append(1 if action in pred_actions else 0)
+                    
+        elif category == 'pairs':
+            all_pairs = sorted(set(list(self.gt_instrument_action_pairs.keys()) + 
+                                list(self.pred_instrument_action_pairs.keys())))
+            labels = {
+                'gt': [],
+                'pred': []
+            }
+            
+            for frame_data in self.frame_data.values():
+                gt_pairs = set(f"{pair['instrument_name']}_{pair['action']}" 
+                            for pair in frame_data['gt_pairs'])
+                pred_pairs = set(f"{pair['instrument_name']}_{pair['action']}" 
+                            for pair in frame_data['pred_pairs'])
+                
+                # Create binary vectors for this frame
+                for pair in all_pairs:
+                    labels['gt'].append(1 if pair in gt_pairs else 0)
+                    labels['pred'].append(1 if pair in pred_pairs else 0)
+                    
+        return labels
+
+    def print_statistics(self):
+        """Print comprehensive statistics including precision, recall and AP"""
+        print("\n" + "="*120)
+        print("GROUND TRUTH AND PREDICTION STATISTICS")
+        print("="*120)
+        
+        # Print instrument statistics with metrics
         print("\nINSTRUMENT INSTANCES:")
-        print("-"*80)
-        print(f"{'Instrument Type':<30} {'GT Count':<15} {'Pred Count':<15} {'Difference':<15}")
-        print("-"*80)
+        print("-"*120)
+        print(f"{'Instrument Type':<25} {'GT Count':<10} {'Pred Count':<10} {'TP':<8} {'FP':<8} {'FN':<8} {'Precision':<10} {'Recall':<10}")
+        print("-"*120)
         
         total_gt_instruments = 0
         total_pred_instruments = 0
+        instrument_metrics = {}
         
         for instr in sorted(self.instrument_id_to_name.values()):
             gt_count = self.gt_instrument_counts[instr]
             pred_count = self.pred_instrument_counts[instr]
-            diff = pred_count - gt_count
+            
+            # Calculate metrics
+            tp = min(gt_count, pred_count)  # True Positives
+            fp = max(0, pred_count - gt_count)  # False Positives
+            fn = max(0, gt_count - pred_count)  # False Negatives
+            
+            precision = tp / (tp + fp) if (tp + fp) > 0 else 0
+            recall = tp / (tp + fn) if (tp + fn) > 0 else 0
+            
+            instrument_metrics[instr] = {
+                'precision': precision,
+                'recall': recall,
+                'tp': tp,
+                'fp': fp,
+                'fn': fn
+            }
+            
             total_gt_instruments += gt_count
             total_pred_instruments += pred_count
-            print(f"{instr:<30} {gt_count:<15} {pred_count:<15} {diff:+<15}")
             
-        print("-"*80)
-        total_diff = total_pred_instruments - total_gt_instruments
-        print(f"{'Total':<30} {total_gt_instruments:<15} {total_pred_instruments:<15} {total_diff:+<15}")
+            print(f"{instr:<25} {gt_count:<10} {pred_count:<10} {tp:<8} {fp:<8} {fn:<8} {precision:,.3f}    {recall:,.3f}")
         
-        # Print action statistics
+        print("-"*120)
+        # Calculate overall instrument metrics
+        total_tp = sum(m['tp'] for m in instrument_metrics.values())
+        total_fp = sum(m['fp'] for m in instrument_metrics.values())
+        total_fn = sum(m['fn'] for m in instrument_metrics.values())
+        total_precision = total_tp / (total_tp + total_fp) if (total_tp + total_fp) > 0 else 0
+        total_recall = total_tp / (total_tp + total_fn) if (total_tp + total_fn) > 0 else 0
+        
+        print(f"{'Total':<25} {total_gt_instruments:<10} {total_pred_instruments:<10} {total_tp:<8} {total_fp:<8} {total_fn:<8} {total_precision:,.3f}    {total_recall:,.3f}")
+        
+        # Print action statistics with metrics
         print("\nACTIONS:")
-        print("-"*80)
-        print(f"{'Action':<30} {'GT Count':<15} {'Pred Count':<15} {'Difference':<15}")
-        print("-"*80)
+        print("-"*120)
+        print(f"{'Action':<25} {'GT Count':<10} {'Pred Count':<10} {'TP':<8} {'FP':<8} {'FN':<8} {'Precision':<10} {'Recall':<10}")
+        print("-"*120)
         
         total_gt_actions = 0
         total_pred_actions = 0
+        action_metrics = {}
         
         for action in sorted(self.action_id_to_name.values()):
             gt_count = self.gt_action_counts[action]
             pred_count = self.pred_action_counts[action]
-            diff = pred_count - gt_count
+            
+            # Calculate metrics
+            tp = min(gt_count, pred_count)
+            fp = max(0, pred_count - gt_count)
+            fn = max(0, gt_count - pred_count)
+            
+            precision = tp / (tp + fp) if (tp + fp) > 0 else 0
+            recall = tp / (tp + fn) if (tp + fn) > 0 else 0
+            
+            action_metrics[action] = {
+                'precision': precision,
+                'recall': recall,
+                'tp': tp,
+                'fp': fp,
+                'fn': fn
+            }
+            
             total_gt_actions += gt_count
             total_pred_actions += pred_count
-            print(f"{action:<30} {gt_count:<15.1f} {pred_count:<15} {diff:+.1f}")
             
-        print("-"*80)
-        total_diff = total_pred_actions - total_gt_actions
-        print(f"{'Total':<30} {total_gt_actions:<15.1f} {total_pred_actions:<15} {total_diff:+.1f}")
+            print(f"{action:<25} {gt_count:<10.1f} {pred_count:<10} {tp:<8.1f} {fp:<8.1f} {fn:<8.1f} {precision:,.3f}    {recall:,.3f}")
         
-        # Print pair statistics
+        print("-"*120)
+        # Calculate overall action metrics
+        total_tp = sum(m['tp'] for m in action_metrics.values())
+        total_fp = sum(m['fp'] for m in action_metrics.values())
+        total_fn = sum(m['fn'] for m in action_metrics.values())
+        total_precision = total_tp / (total_tp + total_fp) if (total_tp + total_fp) > 0 else 0
+        total_recall = total_tp / (total_tp + total_fn) if (total_tp + total_fn) > 0 else 0
+        
+        print(f"{'Total':<25} {total_gt_actions:<10.1f} {total_pred_actions:<10} {total_tp:<8.1f} {total_fp:<8.1f} {total_fn:<8.1f} {total_precision:,.3f}    {total_recall:,.3f}")
+        
+        # Print pair statistics with metrics
         print("\nINSTRUMENT-ACTION PAIRS:")
-        print("-"*100)
-        print(f"{'Pair':<50} {'GT Count':<15} {'Pred Count':<15} {'Difference':<15}")
-        print("-"*100)
+        print("-"*120)
+        print(f"{'Pair':<40} {'GT Count':<10} {'Pred Count':<10} {'TP':<8} {'FP':<8} {'FN':<8} {'Precision':<10} {'Recall':<10}")
+        print("-"*120)
         
-        # Combine all pair keys
         all_pairs = sorted(set(list(self.gt_instrument_action_pairs.keys()) + 
-                              list(self.pred_instrument_action_pairs.keys())))
+                            list(self.pred_instrument_action_pairs.keys())))
         
         total_gt_pairs = 0
         total_pred_pairs = 0
+        pair_metrics = {}
         
         for pair in all_pairs:
             gt_count = self.gt_instrument_action_pairs[pair]
             pred_count = self.pred_instrument_action_pairs[pair]
-            diff = pred_count - gt_count
+            
+            # Calculate metrics
+            tp = min(gt_count, pred_count)
+            fp = max(0, pred_count - gt_count)
+            fn = max(0, gt_count - pred_count)
+            
+            precision = tp / (tp + fp) if (tp + fp) > 0 else 0
+            recall = tp / (tp + fn) if (tp + fn) > 0 else 0
+            
+            pair_metrics[pair] = {
+                'precision': precision,
+                'recall': recall,
+                'tp': tp,
+                'fp': fp,
+                'fn': fn
+            }
+            
             total_gt_pairs += gt_count
             total_pred_pairs += pred_count
-            print(f"{pair:<50} {gt_count:<15.1f} {pred_count:<15} {diff:+.1f}")
             
-        print("-"*100)
-        total_diff = total_pred_pairs - total_gt_pairs
-        print(f"{'Total':<50} {total_gt_pairs:<15.1f} {total_pred_pairs:<15} {total_diff:+.1f}")
+            print(f"{pair:<40} {gt_count:<10.1f} {pred_count:<10} {tp:<8.1f} {fp:<8.1f} {fn:<8.1f} {precision:,.3f}    {recall:,.3f}")
         
-        # Print frame-wise summary
-        print("\nFRAME-WISE SUMMARY:")
-        print(f"Total frames processed: {len(self.frame_data)}")
-        print(f"Average GT instruments per frame: {total_gt_instruments/len(self.frame_data):.2f}")
-        print(f"Average predicted instruments per frame: {total_pred_instruments/len(self.frame_data):.2f}")
-        print(f"Average GT actions per frame: {total_gt_actions/len(self.frame_data):.2f}")
-        print(f"Average predicted actions per frame: {total_pred_actions/len(self.frame_data):.2f}")
+        print("-"*120)
+        # Calculate overall pair metrics
+        total_tp = sum(m['tp'] for m in pair_metrics.values())
+        total_fp = sum(m['fp'] for m in pair_metrics.values())
+        total_fn = sum(m['fn'] for m in pair_metrics.values())
+        total_precision = total_tp / (total_tp + total_fp) if (total_tp + total_fp) > 0 else 0
+        total_recall = total_tp / (total_tp + total_fn) if (total_tp + total_fn) > 0 else 0
+        
+        print(f"{'Total':<40} {total_gt_pairs:<10.1f} {total_pred_pairs:<10} {total_tp:<8.1f} {total_fp:<8.1f} {total_fn:<8.1f} {total_precision:,.3f}    {total_recall:,.3f}")
+        
+        # Print overall summary metrics
+        print("\nOVERALL METRIC SUMMARY:")
+        print("-"*50)
+        categories = ["Instruments", "Actions", "Instrument-Action Pairs"]
+        metrics = [
+            (total_gt_instruments, total_pred_instruments, instrument_metrics),
+            (total_gt_actions, total_pred_actions, action_metrics),
+            (total_gt_pairs, total_pred_pairs, pair_metrics)
+        ]
+        
+        for category, (gt_total, pred_total, category_metrics) in zip(categories, metrics):
+            mean_precision = sum(m['precision'] for m in category_metrics.values()) / len(category_metrics) if category_metrics else 0
+            mean_recall = sum(m['recall'] for m in category_metrics.values()) / len(category_metrics) if category_metrics else 0
+            f1_score = 2 * (mean_precision * mean_recall) / (mean_precision + mean_recall) if (mean_precision + mean_recall) > 0 else 0
+            
+            print(f"\n{category}:")
+            print(f"Mean Precision: {mean_precision:.3f}")
+            print(f"Mean Recall: {mean_recall:.3f}")
+            print(f"F1 Score: {f1_score:.3f}")
 
     def get_frame_annotations(self, frame_num):
         """Get annotations for a specific frame"""
@@ -466,6 +639,81 @@ class GraSPEvaluator:
             'pred_actions': [],
             'pred_pairs': []
         })
+def aggregate_metrics(all_metrics):
+    """
+    Aggregate metrics across multiple videos
+    
+    Args:
+        all_metrics (dict): Dictionary of metrics for each video
+    
+    Returns:
+        dict: Aggregated metrics across all videos
+    """
+    # Initialize aggregated metrics
+    aggregated_metrics = {
+        'instruments': {'gt': [], 'pred': []},
+        'actions': {'gt': [], 'pred': []},
+        'pairs': {'gt': [], 'pred': []}
+    }
+    
+    # Combine metrics from all videos
+    for video_metrics in all_metrics.values():
+        # Aggregate instrument metrics
+        aggregated_metrics['instruments']['gt'].extend(
+            video_metrics['instrument_metrics']['gt']
+        )
+        aggregated_metrics['instruments']['pred'].extend(
+            video_metrics['instrument_metrics']['pred']
+        )
+        
+        # Aggregate action metrics
+        aggregated_metrics['actions']['gt'].extend(
+            video_metrics['action_metrics']['gt']
+        )
+        aggregated_metrics['actions']['pred'].extend(
+            video_metrics['action_metrics']['pred']
+        )
+        
+        # Aggregate pair metrics
+        aggregated_metrics['pairs']['gt'].extend(
+            video_metrics['pair_metrics']['gt']
+        )
+        aggregated_metrics['pairs']['pred'].extend(
+            video_metrics['pair_metrics']['pred']
+        )
+    
+    return aggregated_metrics
+
+def calculate_combined_metrics(aggregated_metrics):
+    """
+    Calculate overall metrics from aggregated data
+    
+    Args:
+        aggregated_metrics (dict): Aggregated metrics across all videos
+    
+    Returns:
+        dict: Comprehensive metrics summary
+    """
+    metrics_summary = {}
+    
+    # Categories to analyze
+    categories = ['instruments', 'actions', 'pairs']
+    
+    for category in categories:
+        y_true = np.array(aggregated_metrics[category]['gt'])
+        y_pred = np.array(aggregated_metrics[category]['pred'])
+        
+        # Calculate metrics
+        metrics_summary[category] = {
+            'precision': precision_score(y_true, y_pred, average='macro', zero_division=0),
+            'recall': recall_score(y_true, y_pred, average='macro', zero_division=0),
+            'f1': f1_score(y_true, y_pred, average='macro', zero_division=0),
+            'accuracy': accuracy_score(y_true, y_pred),
+            'average_precision': average_precision_score(y_true, y_pred, average='macro')
+        }
+    
+    return metrics_summary
+
 def main():
     try:
         print("\nStarting evaluation...")
@@ -487,50 +735,78 @@ def main():
             dataset_dir=dataset_dir
         )
         
-        # Process video
-        video_id = "VID41"
-        print(f"\nProcessing video: {video_id}")
+        # Process videos
+        video_ids = ["VID41", "VID47", "VID50", "VID51", "VID53"]
+        all_metrics = {}
         
-        # Load ground truth first
-        print("\nLoading ground truth annotations...")
-        if not evaluator.load_ground_truth(video_id):
-            raise Exception("Failed to load ground truth annotations")
-        
-        # Set up frames directory
-        frames_dir = loader.dataset_path / "Videos" / video_id
-        if not frames_dir.exists():
-            raise Exception(f"Frames directory not found: {frames_dir}")
+        for video_id in video_ids:
+            print(f"\nProcessing video: {video_id}")
             
-        # Get sorted frame files
-        frame_files = sorted(frames_dir.glob("*.jpg"), 
-                           key=lambda x: int(x.stem))
-        
-        if not frame_files:
-            raise Exception(f"No frames found in directory: {frames_dir}")
+            # Load ground truth first
+            print("\nLoading ground truth annotations...")
+            if not evaluator.load_ground_truth(video_id):
+                raise Exception(f"Failed to load ground truth annotations for {video_id}")
             
-        print(f"\nFound {len(frame_files)} frames to process")
-        print("\nProcessing frames...")
+            # Set up frames directory
+            frames_dir = loader.dataset_path / "Videos" / video_id
+            if not frames_dir.exists():
+                raise Exception(f"Frames directory not found: {frames_dir}")
+            
+            # Get sorted frame files
+            frame_files = sorted(frames_dir.glob("*.jpg"), 
+                               key=lambda x: int(x.stem))
+            
+            if not frame_files:
+                raise Exception(f"No frames found in directory: {frames_dir}")
+            
+            print(f"\nFound {len(frame_files)} frames to process")
+            print("\nProcessing frames...")
+            
+            # Process each frame
+            with tqdm(total=len(frame_files)) as pbar:
+                for frame_file in frame_files:
+                    frame_num = int(frame_file.stem)
+                    
+                    try:
+                        # Get annotations for current frame
+                        frame_annotations = evaluator.get_frame_annotations(frame_num)
+                        
+                        # Process frame and get predictions
+                        evaluator.evaluate_frame(
+                            img_path=str(frame_file),
+                            frame_annotations=frame_annotations,
+                            save_visualization=False
+                        )
+                        
+                    except Exception as e:
+                        print(f"\nWarning: Error processing frame {frame_num}: {str(e)}")
+                        continue
+                        
+                    pbar.update(1)
+            
+            # Print statistics for each video
+            print("\nGenerating statistics for video:", video_id)
+            evaluator.print_statistics()
+            
+            # Store metrics for this video
+            all_metrics[video_id] = {
+                'instrument_metrics': evaluator.prepare_binary_labels('instruments'),
+                'action_metrics': evaluator.prepare_binary_labels('actions'),
+                'pair_metrics': evaluator.prepare_binary_labels('pairs')
+            }
         
-        # Process each frame
-        with tqdm(total=len(frame_files)) as pbar:
-            for frame_file in frame_files:
-                frame_num = int(frame_file.stem)
-                
-                # Get annotations for current frame
-                frame_annotations = evaluator.get_frame_annotations(frame_num)
-                
-                # Process frame and get predictions
-                predictions = evaluator.evaluate_frame(
-                    img_path=str(frame_file),
-                    frame_annotations=frame_annotations,
-                    save_visualization=False  # Set to True if you want visualizations
-                )
-                
-                pbar.update(1)
+        # Combine metrics across all videos
+        print("\nCalculating combined metrics across all videos...")
+        aggregated_metrics = aggregate_metrics(all_metrics)
+        combined_metrics = calculate_combined_metrics(aggregated_metrics)
         
-        # Print final statistics
-        print("\nGenerating final statistics...")
-        evaluator.print_statistics()
+        # Print combined metrics
+        print("\nCOMBINED METRICS ACROSS ALL VIDEOS:")
+        print("-"*50)
+        for category, metrics in combined_metrics.items():
+            print(f"\n{category.upper()} METRICS:")
+            for metric, value in metrics.items():
+                print(f"{metric.capitalize()}: {value:.4f}")
         
         print("\nEvaluation complete!")
         return True
@@ -547,3 +823,5 @@ if __name__ == "__main__":
         main()
     except KeyboardInterrupt:
         print("\nEvaluation interrupted by user")
+    except Exception as e:
+        print(f"\nUnexpected error: {str(e)}")
