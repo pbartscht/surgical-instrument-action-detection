@@ -167,8 +167,12 @@ class DomainAdaptationTrainer:
         self.save_dir = Path(save_dir)
         self.save_dir.mkdir(parents=True, exist_ok=True)
         
-        # Load and freeze YOLO model
+        # Load YOLO model
         self.yolo_model = YOLO(yolo_path)
+        # Move the model to specified device
+        self.yolo_model.to(device)
+        
+        # Ensure model is in eval mode
         self.yolo_model.model.eval()
         
         # Initialize feature alignment head
@@ -193,17 +197,21 @@ class DomainAdaptationTrainer:
     
     def extract_features(self, images):
         """Extract features from YOLO's C2PSA layer"""
+        # Ensure images are on the correct device
+        images = images.to(self.device)
         x = images
         features = None
         
         with torch.no_grad():
             for i, layer in enumerate(self.yolo_model.model.model):
+                layer = layer.to(self.device)  # Ensure layer is on correct device
                 x = layer(x)
                 if i == 10:  # C2PSA layer
                     features = x
                     break
         
         return features
+
     
     def train_step(self, batch, epoch_progress):
         """
