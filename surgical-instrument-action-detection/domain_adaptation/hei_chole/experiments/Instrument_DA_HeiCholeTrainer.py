@@ -8,8 +8,9 @@ import json
 import os
 from pathlib import Path
 import torchvision.transforms as transforms
+import numpy as np
 
-# Constants from evaluation code
+# Mapping dictionaries remain the same
 CHOLECT50_TO_HEICHOLE_INSTRUMENT_MAPPING = {
     'grasper': 'grasper',
     'bipolar': 'coagulation',
@@ -95,144 +96,294 @@ class HeiCholeDataset(Dataset):
             'frame': sample['frame']
         }
 
-class DomainAdaptationTrainer:
-    def __init__(self, yolo_path, device):
-        self.device = device
+
+
+class FeatureAlignmentHead(nn.Module):
+    """
+    Neural network head for feature alignment and binary classification.
+    Uses a shared feature space for both domain adaptation and classification tasks.
+    """
+    def __init__(self, num_classes):
+        super().__init__()
+        # Shared feature extractor
+        self.feature_reducer = nn.Sequential(
+            nn.Conv2d(512, 256, 1),  # Reduce channel dimension
+            nn.BatchNorm2d(256),
+            nn.SiLU(inplace=True),
+            nn.AdaptiveAvgPool2d(1),  # Global average pooling
+            nn.Flatten()
+        )
         
-        # Load YOLO model
+        # Domain classifier with gradient reversal for adversarial training
+        self.domain_classifier = nn.Sequential(
+            nn.Linear(256, 128),
+            nn.ReLU(),
+            nn.Dropout(0.5),
+            nn.Linear(128, 1),
+            nn.Sigmoid()
+        )
+        
+        # Binary instrument classifier
+        self.instrument_classifier = nn.Sequential(
+            nn.Linear(256, 128),
+            nn.ReLU(),
+            nn.Dropout(0.5),
+            nn.Linear(128, num_classes),
+            nn.Sigmoid()
+        )
+    
+    def forward(self, x, alpha=1.0):
+        features = self.feature_reducer(x)
+        
+        # Gradient reversal scaling for domain adaptation
+        domain_pred = self.domain_classifier(
+            GradientReversal.apply(features, alpha)
+        )
+        class_pred = self.instrument_classifier(features)
+        
+        return domain_pred, class_pred
+
+class GradientReversal(torch.autograd.Function):
+    """
+    Gradient Reversal Layer for adversarial domain adaptation.
+    Forward pass is identity function, backward pass reverses gradients.
+    """
+    @staticmethod
+    def forward(ctx, x, alpha):
+        ctx.alpha = alpha
+        return x.view_as(x)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return -ctx.alpha * grad_output, None
+
+class DomainAdaptationTrainer:
+    """
+    Trainer class for domain adaptation using feature alignment.
+    Only requires binary classification labels from HeiChole dataset.
+    """
+    def __init__(self, yolo_path, device, save_dir):
+        self.device = device
+        self.save_dir = Path(save_dir)
+        self.save_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Load and freeze YOLO model
         self.yolo_model = YOLO(yolo_path)
         self.yolo_model.model.eval()
         
-        # Initialize domain head
-        self.domain_head = DomainHead(num_classes=len(TOOL_MAPPING)).to(device)
+        # Initialize feature alignment head
+        self.alignment_head = FeatureAlignmentHead(
+            num_classes=len(TOOL_MAPPING)
+        ).to(device)
         
-        # Optimizer only for domain head
+        # Optimizer for alignment head only
         self.optimizer = torch.optim.Adam(
-            self.domain_head.parameters(),
-            lr=0.001
+            self.alignment_head.parameters(),
+            lr=0.001,
+            weight_decay=1e-5
         )
         
-        # Load datasets
-        self.setup_datasets()
-    
-    def setup_datasets(self):
-        # Source domain (CholecT50) loader would be set up similarly
-        # For now focusing on target domain (HeiChole)
-        heichole_dataset = HeiCholeDataset(
-            dataset_dir="/data/Bartscht/HeiChole"
-        )
-        
-        self.target_loader = DataLoader(
-            heichole_dataset,
-            batch_size=8,
-            shuffle=True,
-            num_workers=4
+        # Learning rate scheduler
+        self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            self.optimizer, 
+            mode='min', 
+            patience=5,
+            factor=0.5
         )
     
-    def extract_yolo_features(self, images):
-        """Extracts features after C2PSA layer (Layer 10)"""
+    def extract_features(self, images):
+        """Extract features from YOLO's C2PSA layer"""
         x = images
         features = None
         
         with torch.no_grad():
             for i, layer in enumerate(self.yolo_model.model.model):
                 x = layer(x)
-                if i == 10:  # After C2PSA Layer
+                if i == 10:  # C2PSA layer
                     features = x
                     break
         
         return features
     
-    def train_epoch(self, source_loader, target_loader):
-        epoch_losses = []
+    def train_step(self, batch, epoch_progress):
+        """
+        Single training step with feature alignment and classification.
+        Uses gradient reversal for domain adaptation.
+        """
+        self.alignment_head.train()
+        self.optimizer.zero_grad()
         
-        for source_batch, target_batch in zip(source_loader, target_loader):
-            losses = self.train_step(source_batch, target_batch)
-            epoch_losses.append(losses)
-            
-        # Calculate average losses
-        avg_losses = {
-            key: sum(d[key] for d in epoch_losses) / len(epoch_losses)
-            for key in epoch_losses[0].keys()
+        # Get images and labels
+        images = batch['image'].to(self.device)
+        labels = batch['labels'].to(self.device)
+        
+        # Extract features using frozen YOLO
+        features = self.extract_features(images)
+        
+        # Calculate adaptation factor (gradually increase)
+        p = epoch_progress
+        alpha = 2. / (1. + np.exp(-10 * p)) - 1
+        
+        # Forward pass through alignment head
+        domain_pred, class_pred = self.alignment_head(features, alpha)
+        
+        # Classification loss (binary cross-entropy)
+        clf_loss = F.binary_cross_entropy(
+            class_pred,
+            labels,
+            reduction='mean'
+        )
+        
+        # Domain adaptation loss
+        domain_target = torch.ones_like(domain_pred)  # Target domain = 1
+        domain_loss = F.binary_cross_entropy(
+            domain_pred,
+            domain_target,
+            reduction='mean'
+        )
+        
+        # Combined loss
+        total_loss = clf_loss + 0.1 * domain_loss
+        
+        # Backward pass and optimization
+        total_loss.backward()
+        self.optimizer.step()
+        
+        return {
+            'total_loss': total_loss.item(),
+            'clf_loss': clf_loss.item(),
+            'domain_loss': domain_loss.item()
         }
-        
-        return avg_losses
     
-    def evaluate(self, loader):
-        """Evaluates current model on target domain"""
-        self.domain_head.eval()
-        predictions = []
+    def validate(self, val_loader):
+        """Validate model performance"""
+        self.alignment_head.eval()
+        total_loss = 0
+        correct = 0
+        total = 0
         
         with torch.no_grad():
-            for batch in loader:
+            for batch in val_loader:
                 images = batch['image'].to(self.device)
-                features = self.extract_yolo_features(images)
-                domain_out, class_out = self.domain_head(features)
+                labels = batch['labels'].to(self.device)
                 
-                # Store predictions for analysis
-                predictions.extend([{
-                    'video': v,
-                    'frame': f,
-                    'predictions': p.cpu().numpy(),
-                    'domain_score': d.cpu().numpy()
-                } for v, f, p, d in zip(
-                    batch['video'],
-                    batch['frame'],
-                    class_out,
-                    domain_out
-                )])
+                features = self.extract_features(images)
+                _, predictions = self.alignment_head(features)
+                
+                loss = F.binary_cross_entropy(predictions, labels)
+                total_loss += loss.item()
+                
+                # Calculate accuracy
+                pred_classes = (predictions > 0.5).float()
+                correct += (pred_classes == labels).float().sum()
+                total += labels.numel()
         
-        return predictions
+        return {
+            'val_loss': total_loss / len(val_loader),
+            'val_accuracy': (correct / total).item()
+        }
+    
+    def save_checkpoint(self, epoch, metrics):
+        """Save model checkpoint"""
+        checkpoint = {
+            'epoch': epoch,
+            'model_state_dict': self.alignment_head.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'metrics': metrics
+        }
+        
+        save_path = self.save_dir / f'alignment_head_epoch_{epoch}.pt'
+        torch.save(checkpoint, save_path)
+        print(f"Checkpoint saved: {save_path}")
 
-class DomainHead(nn.Module):
-    def __init__(self, num_classes):
-        super().__init__()
-        self.shared_conv = nn.Sequential(
-            nn.Conv2d(512, 256, 1),
-            nn.BatchNorm2d(256),
-            nn.SiLU(inplace=True)
-        )
-        
-        # Domain classifier branch
-        self.domain_classifier = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),
-            nn.Flatten(),
-            nn.Linear(256, 1),
-            nn.Sigmoid()
-        )
-        
-        # Instrument classifier branch
-        self.task_classifier = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),
-            nn.Flatten(),
-            nn.Linear(256, num_classes),
-            nn.Sigmoid()
-        )
+def train_domain_adaptation(args):
+    """Main training loop for domain adaptation"""
+    trainer = DomainAdaptationTrainer(
+        yolo_path=args.yolo_path,
+        device=args.device,
+        save_dir=args.save_dir
+    )
     
-    def forward(self, x):
-        shared_features = self.shared_conv(x)
-        domain_output = self.domain_classifier(shared_features)
-        task_output = self.task_classifier(shared_features)
-        return domain_output, task_output
-
-# Example usage
-def main():
-    YOLO_PATH = "/home/Bartscht/YOLO/surgical-instrument-action-detection/models/hierarchical-surgical-workflow/Instrument-classification-detection/weights/instrument_detector/best_v35.pt"
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # Setup data loaders
+    train_dataset = HeiCholeDataset(
+        dataset_dir=args.data_dir,
+        transform=transforms.Compose([
+            transforms.Resize((640, 640)),
+            transforms.ToTensor(),
+            transforms.Normalize([0.485, 0.456, 0.406], 
+                              [0.229, 0.224, 0.225])
+        ])
+    )
     
-    trainer = DomainAdaptationTrainer(YOLO_PATH, device)
+    # Split into train/val
+    train_size = int(0.8 * len(train_dataset))
+    val_size = len(train_dataset) - train_size
+    train_dataset, val_dataset = torch.utils.data.random_split(
+        train_dataset, [train_size, val_size]
+    )
     
-    # Training loop would go here
-    '''
-    for epoch in range(num_epochs):
-        losses = trainer.train_epoch(source_loader, target_loader)
-        print(f"Epoch {epoch}, Losses:", losses)
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=args.num_workers
+    )
+    
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers
+    )
+    
+    # Training loop
+    best_val_loss = float('inf')
+    for epoch in range(args.num_epochs):
+        epoch_losses = []
         
-        # Evaluate periodically
-        if epoch % eval_interval == 0:
-            predictions = trainer.evaluate(trainer.target_loader)
-            # Analyze predictions
-    '''
+        # Training phase
+        for i, batch in enumerate(train_loader):
+            progress = (epoch + i / len(train_loader)) / args.num_epochs
+            losses = trainer.train_step(batch, progress)
+            epoch_losses.append(losses)
+        
+        # Calculate average training metrics
+        avg_losses = {
+            k: sum(d[k] for d in epoch_losses) / len(epoch_losses)
+            for k in epoch_losses[0].keys()
+        }
+        
+        # Validation phase
+        val_metrics = trainer.validate(val_loader)
+        
+        # Update learning rate
+        trainer.scheduler.step(val_metrics['val_loss'])
+        
+        # Save best model
+        if val_metrics['val_loss'] < best_val_loss:
+            best_val_loss = val_metrics['val_loss']
+            trainer.save_checkpoint(epoch, {**avg_losses, **val_metrics})
+        
+        # Print progress
+        print(f"Epoch {epoch+1}/{args.num_epochs}")
+        print(f"Train Loss: {avg_losses['total_loss']:.4f}")
+        print(f"Val Loss: {val_metrics['val_loss']:.4f}")
+        print(f"Val Accuracy: {val_metrics['val_accuracy']:.4f}")
 
 if __name__ == "__main__":
-    main()
+    import argparse
+    
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--yolo_path', type=str, required=True,
+                      help='Path to pretrained YOLO model')
+    parser.add_argument('--data_dir', type=str, required=True,
+                      help='Path to HeiChole dataset')
+    parser.add_argument('--save_dir', type=str, required=True,
+                      help='Directory to save checkpoints')
+    parser.add_argument('--batch_size', type=int, default=8)
+    parser.add_argument('--num_epochs', type=int, default=50)
+    parser.add_argument('--num_workers', type=int, default=4)
+    parser.add_argument('--device', type=str, default='cuda')
+    
+    args = parser.parse_args()
+    train_domain_adaptation(args)
