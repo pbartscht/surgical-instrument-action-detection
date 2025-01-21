@@ -110,7 +110,8 @@ class ModelLoader:
         # YOLO model path (original detection model)
         self.yolo_weights = self.hierarchical_dir / "Instrument-classification-detection" / "weights" / "instrument_detector" / "best_v35.pt"
         # Alignment head path (domain adaptation model)
-        self.alignment_head_weights = self.project_root / "domain_adaptation" / "hei_chole" / "experiments" / "checkpoints" / "alignment_head_epoch_46.pt"        
+        self.alignment_head_weights = self.project_root / "domain_adaptation" / "hei_chole" / "experiments" / "checkpoints" / "alignment_head_epoch_46.pt"  
+        print("checkicheck")      
         self.verb_model_path = self.hierarchical_dir / "verb_recognition/checkpoints/jumping-tree-47/last.ckpt" # Verb model path
         
         # Dataset path for HeiChole
@@ -263,56 +264,71 @@ class HeiCholeEvaluator:
             img_tensor = transforms.ToTensor()(img)
             img_tensor = img_tensor.unsqueeze(0)  # Add batch dimension
             
-            # Get predictions using the InstrumentDetector which combines YOLO and alignment head
-            yolo_results = self.yolo_model(img_tensor)
+            # Get predictions using the InstrumentDetector
+            results = self.yolo_model(img_tensor)
             valid_detections = []
             
-            # Process YOLO detections
-            for detection in yolo_results[0].boxes:
-                instrument_class = int(detection.cls)
-                confidence = float(detection.conf)  # This is now the combined confidence from YOLO and alignment head
-                
-                if confidence >= CONFIDENCE_THRESHOLD:
-                    # Check if it's an ignored instrument
-                    if instrument_class in IGNORED_INSTRUMENTS:
-                        print(f"\n{'='*50}")
-                        print(f"Frame {frame_number}: Skipping ignored instrument {IGNORED_INSTRUMENTS[instrument_class]}")
-                        continue
-                    
-                    # Get original CholecT50 instrument name
+            # Safety check for results
+            if not results:
+                print(f"No detections for frame {frame_number}")
+                return []
+
+            # Process each result
+            for result in results:
+                # Process each box in the result's boxes list
+                for box_info in result.boxes:
                     try:
-                        cholect50_instrument = TOOL_MAPPING[instrument_class]
-                    except KeyError:
-                        print(f"\nWarning: Unknown instrument class {instrument_class}, skipping...")
+                        instrument_class = int(box_info['cls'][0])
+                        confidence = float(box_info['conf'][0])
+                        box_coords = box_info['xyxy']
+                        
+                        if confidence < CONFIDENCE_THRESHOLD:
+                            continue
+                            
+                        if instrument_class in IGNORED_INSTRUMENTS:
+                            print(f"\n{'='*50}")
+                            print(f"Frame {frame_number}: Skipping ignored instrument {IGNORED_INSTRUMENTS[instrument_class]}")
+                            continue
+                        
+                        try:
+                            cholect50_instrument = TOOL_MAPPING[instrument_class]
+                        except KeyError:
+                            print(f"\nWarning: Unknown instrument class {instrument_class}, skipping...")
+                            continue
+                            
+                        mapped_instrument = CHOLECT50_TO_HEICHOLE_INSTRUMENT_MAPPING.get(cholect50_instrument)
+                        
+                        if mapped_instrument:
+                            valid_detections.append({
+                                'class': instrument_class,
+                                'confidence': confidence,
+                                'box': box_coords,
+                                'name': mapped_instrument,
+                                'original_name': cholect50_instrument
+                            })
+                            
+                            # Visualization
+                            if save_visualization:
+                                x1, y1, x2, y2 = map(int, box_coords)
+                                draw.rectangle([x1, y1, x2, y2], outline='red', width=3)
+                                text = f"{mapped_instrument}\nConf: {confidence:.2f}"
+                                draw.text((x1, y1-40), text, fill='blue')
+                    
+                    except Exception as e:
+                        print(f"Error processing box in frame {frame_number}: {str(e)}")
                         continue
-                    
-                    # Map to HeiChole instrument
-                    mapped_instrument = CHOLECT50_TO_HEICHOLE_INSTRUMENT_MAPPING.get(cholect50_instrument)
-                    
-                    print(f"\n{'='*50}")
-                    print(f"Frame {frame_number} Detection:")
-                    print(f"CholecT50 Instrument: {cholect50_instrument}")
-                    print(f"HeiChole Instrument: {mapped_instrument}")
-                    print(f"Combined Confidence: {confidence:.4f}")
-                    
-                    if mapped_instrument:
-                        valid_detections.append({
-                            'class': instrument_class,
-                            'confidence': confidence,
-                            'box': detection.xyxy[0],
-                            'name': mapped_instrument,
-                            'original_name': cholect50_instrument
-                        })
-            
-            # Sort by confidence
-            valid_detections.sort(key=lambda x: x['confidence'], reverse=True)
-            
-            # Process each detection
+                
+            # Process valid detections for verb recognition
             for detection in valid_detections:
                 mapped_instrument = detection['name']
                 original_instrument = detection['original_name']
                 box = detection['box']
                 confidence = detection['confidence']
+                
+                # Get instrument crop for verb prediction
+                x1, y1, x2, y2 = map(int, box)
+                instrument_crop = img.crop((x1, y1, x2, y2))
+                crop_tensor = self.transform(instrument_crop).unsqueeze(0).to(self.device)
                 
                 # Get instrument crop for verb prediction
                 x1, y1, x2, y2 = map(int, box)
