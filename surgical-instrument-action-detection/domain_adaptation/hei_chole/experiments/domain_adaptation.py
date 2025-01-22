@@ -1,120 +1,31 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
-from ultralytics import YOLO
-from PIL import Image
-import json
-import os
-from pathlib import Path
-import torchvision.transforms as transforms
+from torch.utils.tensorboard import SummaryWriter
+from torch.utils.data import DataLoader
+import logging
 import numpy as np
-
-# Mapping dictionaries remain the same
-CHOLECT50_TO_HEICHOLE_INSTRUMENT_MAPPING = {
-    'grasper': 'grasper',
-    'bipolar': 'coagulation',
-    'clipper': 'clipper',
-    'hook': 'coagulation',
-    'scissors': 'scissors',
-    'irrigator': 'suction_irrigation'
-}
-
-TOOL_MAPPING = {
-    0: 'grasper', 1: 'bipolar', 2: 'hook', 
-    3: 'scissors', 4: 'clipper', 5: 'irrigator'
-}
-
-class HeiCholeDataset(Dataset):
-    def __init__(self, dataset_dir, transform=None):
-        self.dataset_dir = Path(dataset_dir)
-        self.transform = transform or transforms.Compose([
-            transforms.Resize((640, 640)),  # YOLO default size
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-        ])
-        
-        self.samples = []
-        self._load_dataset()
-    
-    def _load_dataset(self):
-        videos_dir = self.dataset_dir / "Videos"
-        labels_dir = self.dataset_dir / "Labels"
-        
-        for video_dir in videos_dir.glob("*"):
-            if not video_dir.is_dir():
-                continue
-                
-            video_name = video_dir.name
-            json_file = labels_dir / f"{video_name}.json"
-            
-            if not json_file.exists():
-                continue
-                
-            # Load annotations
-            with open(json_file, 'r') as f:
-                annotations = json.load(f)
-            
-            # Process each frame
-            for frame_file in video_dir.glob("*.png"):
-                frame_number = int(frame_file.stem)
-                frame_data = annotations['frames'].get(str(frame_number), {})
-                
-                # Get binary instrument labels
-                instruments = frame_data.get('instruments', {})
-                labels = torch.zeros(len(CHOLECT50_TO_HEICHOLE_INSTRUMENT_MAPPING))
-                
-                for instr_name, present in instruments.items():
-                    if present > 0:
-                        # Map HeiChole instrument back to CholecT50 format
-                        for idx, cholect_instr in TOOL_MAPPING.items():
-                            if CHOLECT50_TO_HEICHOLE_INSTRUMENT_MAPPING.get(cholect_instr) == instr_name:
-                                labels[idx] = 1
-                                break
-                
-                self.samples.append({
-                    'image_path': str(frame_file),
-                    'labels': labels,
-                    'video': video_name,
-                    'frame': frame_number
-                })
-    
-    def __len__(self):
-        return len(self.samples)
-    
-    def __getitem__(self, idx):
-        sample = self.samples[idx]
-        image = Image.open(sample['image_path'])
-        
-        if self.transform:
-            image = self.transform(image)
-            
-        return {
-            'image': image,
-            'labels': sample['labels'],
-            'video': sample['video'],
-            'frame': sample['frame']
-        }
-
-
+from pathlib import Path
+import time
+from collections import defaultdict
+from sklearn.metrics import average_precision_score, f1_score
+from ultralytics import YOLO
+from dataset import SurgicalDataset, TOOL_MAPPING
+import argparse
+import wandb
 
 class FeatureAlignmentHead(nn.Module):
-    """
-    Neural network head for feature alignment and binary classification.
-    Uses a shared feature space for both domain adaptation and classification tasks.
-    """
     def __init__(self, num_classes):
         super().__init__()
-        # Shared feature extractor
         self.feature_reducer = nn.Sequential(
-            nn.Conv2d(512, 256, 1),  # Reduce channel dimension
+            nn.Conv2d(512, 256, 1),
             nn.BatchNorm2d(256),
             nn.SiLU(inplace=True),
-            nn.AdaptiveAvgPool2d(1),  # Global average pooling
+            nn.AdaptiveAvgPool2d(1),
             nn.Flatten()
         )
         
-        # Domain classifier with gradient reversal for adversarial training
+        # Domain classifier
         self.domain_classifier = nn.Sequential(
             nn.Linear(256, 128),
             nn.ReLU(),
@@ -123,7 +34,7 @@ class FeatureAlignmentHead(nn.Module):
             nn.Sigmoid()
         )
         
-        # Binary instrument classifier
+        # Instrument classifier
         self.instrument_classifier = nn.Sequential(
             nn.Linear(256, 128),
             nn.ReLU(),
@@ -135,19 +46,16 @@ class FeatureAlignmentHead(nn.Module):
     def forward(self, x, alpha=1.0):
         features = self.feature_reducer(x)
         
-        # Gradient reversal scaling for domain adaptation
+        # Apply gradient reversal for domain classification
         domain_pred = self.domain_classifier(
             GradientReversal.apply(features, alpha)
         )
+        # Normal forward pass for instrument classification
         class_pred = self.instrument_classifier(features)
         
         return domain_pred, class_pred
 
 class GradientReversal(torch.autograd.Function):
-    """
-    Gradient Reversal Layer for adversarial domain adaptation.
-    Forward pass is identity function, backward pass reverses gradients.
-    """
     @staticmethod
     def forward(ctx, x, alpha):
         ctx.alpha = alpha
@@ -155,120 +63,144 @@ class GradientReversal(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output):
+        # Reverse gradients during backward pass
         return -ctx.alpha * grad_output, None
 
 class DomainAdaptationTrainer:
-    """
-    Trainer class for domain adaptation using feature alignment.
-    Only requires binary classification labels from HeiChole dataset.
-    """
-    def __init__(self, yolo_path, device, save_dir):
+    def __init__(self, yolo_path, device, save_dir, 
+                 domain_lambda=0.3, 
+                 alpha_schedule=5.0,
+                 feature_layer=10):
         self.device = device
         self.save_dir = Path(save_dir)
         self.save_dir.mkdir(parents=True, exist_ok=True)
         
-        # Load YOLO model
-        self.yolo_model = YOLO(yolo_path)
-        # Move the model to specified device
-        self.yolo_model.to(device)
+        # Training parameters
+        self.domain_lambda = domain_lambda  # Weight for domain loss
+        self.alpha_schedule = alpha_schedule  # Controls adaptation speed
+        self.feature_layer = feature_layer  # Which YOLO layer to get features from
+        self.current_epoch = 0
         
-        # Ensure model is in eval mode
+        # Load and freeze YOLO model
+        self.yolo_model = YOLO(yolo_path)
+        self.yolo_model.to(device)
         self.yolo_model.model.eval()
         
-        # Initialize feature alignment head
+        # Initialize alignment head
         self.alignment_head = FeatureAlignmentHead(
             num_classes=len(TOOL_MAPPING)
         ).to(device)
         
-        # Optimizer for alignment head only
+        # Optimizer setup
         self.optimizer = torch.optim.Adam(
             self.alignment_head.parameters(),
             lr=0.001,
-            weight_decay=1e-5
+            weight_decay=1e-4
         )
         
-        # Learning rate scheduler
+        # LR scheduler
         self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             self.optimizer, 
-            mode='min', 
+            mode='min',
             patience=5,
             factor=0.5
         )
+        
+        # Setup logging
+        self.writer = SummaryWriter(log_dir=str(self.save_dir / 'runs'))
+        setup_logging(self.save_dir)
+        
+        # Feature statistics tracking
+        self.feature_stats = {
+            'mean': [], 'std': [], 'grad_norm': []
+        }
     
     def extract_features(self, images):
-        """Extract features from YOLO's C2PSA layer"""
-        # Ensure images are on the correct device
+        """Extract features from specific YOLO layer"""
         images = images.to(self.device)
         x = images
         features = None
         
         with torch.no_grad():
             for i, layer in enumerate(self.yolo_model.model.model):
-                layer = layer.to(self.device)  # Ensure layer is on correct device
+                layer = layer.to(self.device)
                 x = layer(x)
-                if i == 10:  # C2PSA layer
+                if i == self.feature_layer:
                     features = x
+                    self.log_feature_stats(features, 'extract')
                     break
         
         return features
-
+    
+    def log_feature_stats(self, features, phase):
+        """Log feature statistics for monitoring"""
+        with torch.no_grad():
+            mean = features.mean().item()
+            std = features.std().item()
+            grad_norm = features.grad.norm().item() if features.grad is not None else 0.0
+            
+            logging.info(f"{phase} Features - Mean: {mean:.4f}, Std: {std:.4f}, Grad: {grad_norm:.4f}")
+            
+            step = len(self.feature_stats['mean'])
+            self.writer.add_scalar(f'Features/{phase}/mean', mean, step)
+            self.writer.add_scalar(f'Features/{phase}/std', std, step)
+            self.writer.add_scalar(f'Features/{phase}/grad_norm', grad_norm, step)
     
     def train_step(self, batch, epoch_progress):
-        """
-        Single training step with feature alignment and classification.
-        Uses gradient reversal for domain adaptation.
-        """
+        """Single training step with domain adaptation"""
         self.alignment_head.train()
         self.optimizer.zero_grad()
         
-        # Get images and labels
+        # Get batch data
         images = batch['image'].to(self.device)
         labels = batch['labels'].to(self.device)
+        domain_labels = batch['domain'].to(self.device)
         
-        # Extract features using frozen YOLO
+        # Extract and monitor features
         features = self.extract_features(images)
+        self.log_feature_stats(features, 'pre_alignment')
         
-        # Calculate adaptation factor (gradually increase)
+        # Calculate adaptation factor
         p = epoch_progress
-        alpha = 2. / (1. + np.exp(-10 * p)) - 1
+        alpha = 2. / (1. + np.exp(-self.alpha_schedule * p)) - 1
         
-        # Forward pass through alignment head
+        # Forward pass
         domain_pred, class_pred = self.alignment_head(features, alpha)
         
-        # Classification loss (binary cross-entropy)
+        # Calculate losses
         clf_loss = F.binary_cross_entropy(
             class_pred,
             labels,
             reduction='mean'
         )
         
-        # Domain adaptation loss
-        domain_target = torch.ones_like(domain_pred)  # Target domain = 1
+        # Domain loss with label smoothing
+        smooth_domain = domain_labels.unsqueeze(1) * 0.9 + 0.1
         domain_loss = F.binary_cross_entropy(
             domain_pred,
-            domain_target,
+            smooth_domain,
             reduction='mean'
         )
         
         # Combined loss
-        total_loss = clf_loss + 0.1 * domain_loss
+        total_loss = clf_loss + self.domain_lambda * domain_loss
         
-        # Backward pass and optimization
+        # Backward pass with gradient clipping
         total_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.alignment_head.parameters(), 1.0)
         self.optimizer.step()
         
         return {
             'total_loss': total_loss.item(),
             'clf_loss': clf_loss.item(),
-            'domain_loss': domain_loss.item()
+            'domain_loss': domain_loss.item(),
+            'alpha': alpha
         }
     
     def validate(self, val_loader):
-        """Validate model performance"""
+        """Validation step with comprehensive metrics"""
         self.alignment_head.eval()
-        total_loss = 0
-        correct = 0
-        total = 0
+        metrics = defaultdict(list)
         
         with torch.no_grad():
             for batch in val_loader:
@@ -278,21 +210,39 @@ class DomainAdaptationTrainer:
                 features = self.extract_features(images)
                 _, predictions = self.alignment_head(features)
                 
-                loss = F.binary_cross_entropy(predictions, labels)
-                total_loss += loss.item()
-                
-                # Calculate accuracy
-                pred_classes = (predictions > 0.5).float()
-                correct += (pred_classes == labels).float().sum()
-                total += labels.numel()
+                # Calculate per-class metrics
+                for i in range(len(TOOL_MAPPING)):
+                    pred_i = predictions[:, i]
+                    label_i = labels[:, i]
+                    
+                    metrics[f'ap_{i}'].append(
+                        average_precision_score(
+                            label_i.cpu().numpy(),
+                            pred_i.cpu().numpy()
+                        )
+                    )
+                    metrics[f'f1_{i}'].append(
+                        f1_score(
+                            label_i.cpu().numpy() > 0.5,
+                            pred_i.cpu().numpy() > 0.5,
+                            zero_division=0
+                        )
+                    )
         
-        return {
-            'val_loss': total_loss / len(val_loader),
-            'val_accuracy': (correct / total).item()
-        }
+        # Calculate mean metrics
+        final_metrics = {}
+        for key, values in metrics.items():
+            final_metrics[key] = np.mean(values)
+            
+        # Log results
+        for key, value in final_metrics.items():
+            logging.info(f"Validation {key}: {value:.4f}")
+            self.writer.add_scalar(f'Val/Metrics/{key}', value, self.current_epoch)
+        
+        return final_metrics
     
     def save_checkpoint(self, epoch, metrics):
-        """Save model checkpoint"""
+        """Save model checkpoint and return path"""
         checkpoint = {
             'epoch': epoch,
             'model_state_dict': self.alignment_head.state_dict(),
@@ -302,96 +252,198 @@ class DomainAdaptationTrainer:
         
         save_path = self.save_dir / f'alignment_head_epoch_{epoch}.pt'
         torch.save(checkpoint, save_path)
-        print(f"Checkpoint saved: {save_path}")
+        logging.info(f"Checkpoint saved: {save_path}")
+        
+        return save_path  # Return the path for wandb logging
 
-def train_domain_adaptation(args):
-    """Main training loop for domain adaptation"""
+def setup_logging(save_dir):
+    """Setup logging configuration"""
+    log_file = Path(save_dir) / f'training_{time.strftime("%Y%m%d_%H%M%S")}.log'
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s %(levelname)s: %(message)s',
+        handlers=[
+            logging.FileHandler(log_file),
+            logging.StreamHandler()
+        ]
+    )
+
+def train(args):
+    """Main training function with WandB integration"""
+    # Initialize wandb
+    run = wandb.init(
+        project="surgical-domain-adaptation",
+        config=vars(args),
+        name=f"domain-adapt_{time.strftime('%Y%m%d_%H%M%S')}"
+    )
+    
+    # Update save directory to use checkpoints folder with wandb run name
+    save_dir = Path(args.save_dir)
+    if not save_dir.is_absolute():
+        save_dir = Path(__file__).parent / 'checkpoints' / run.name
+    save_dir.mkdir(parents=True, exist_ok=True)
+    
     trainer = DomainAdaptationTrainer(
         yolo_path=args.yolo_path,
         device=args.device,
-        save_dir=args.save_dir
+        save_dir=save_dir,
+        domain_lambda=args.domain_lambda,
+        alpha_schedule=args.alpha_schedule
     )
     
-    # Setup data loaders
-    train_dataset = HeiCholeDataset(
-        dataset_dir=args.data_dir,
-        transform=transforms.Compose([
-            transforms.Resize((640, 640)),
-            transforms.ToTensor(),
-            transforms.Normalize([0.485, 0.456, 0.406], 
-                              [0.229, 0.224, 0.225])
-        ])
+    # Setup data loaders (same as before)
+    source_dataset = SurgicalDataset(
+        dataset_dir=args.source_dir,
+        dataset_type='source'
+    )
+    target_train_dataset = SurgicalDataset(
+        dataset_dir=Path(args.target_dir) / 'train',
+        dataset_type='target'
+    )
+    target_val_dataset = SurgicalDataset(
+        dataset_dir=Path(args.target_dir) / 'val',
+        dataset_type='target'
     )
     
-    # Split into train/val
-    train_size = int(0.8 * len(train_dataset))
-    val_size = len(train_dataset) - train_size
-    train_dataset, val_dataset = torch.utils.data.random_split(
-        train_dataset, [train_size, val_size]
-    )
-    
-    train_loader = DataLoader(
-        train_dataset,
+    source_loader = DataLoader(
+        source_dataset,
         batch_size=args.batch_size,
         shuffle=True,
         num_workers=args.num_workers
     )
-    
+    target_loader = DataLoader(
+        target_train_dataset,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=args.num_workers
+    )
     val_loader = DataLoader(
-        val_dataset,
+        target_val_dataset,
         batch_size=args.batch_size,
         shuffle=False,
         num_workers=args.num_workers
     )
     
-    # Training loop
-    best_val_loss = float('inf')
+    best_val_metric = float('inf')
+    
+    # Training loop with wandb logging
     for epoch in range(args.num_epochs):
+        trainer.current_epoch = epoch
         epoch_losses = []
         
-        # Training phase
-        for i, batch in enumerate(train_loader):
-            progress = (epoch + i / len(train_loader)) / args.num_epochs
-            losses = trainer.train_step(batch, progress)
+        # Training steps
+        for i, (source_batch, target_batch) in enumerate(zip(source_loader, target_loader)):
+            progress = (epoch + i / len(source_loader)) / args.num_epochs
+            
+            combined_batch = {
+                'image': torch.cat([source_batch['image'], target_batch['image']]),
+                'labels': torch.cat([source_batch['labels'], target_batch['labels']]),
+                'domain': torch.cat([
+                    torch.zeros(len(source_batch['image'])),
+                    torch.ones(len(target_batch['image']))
+                ])
+            }
+            
+            losses = trainer.train_step(combined_batch, progress)
             epoch_losses.append(losses)
+            
+            # Log to wandb more frequently
+            if i % args.log_interval == 0:
+                wandb.log({
+                    'train/total_loss': losses['total_loss'],
+                    'train/clf_loss': losses['clf_loss'],
+                    'train/domain_loss': losses['domain_loss'],
+                    'train/alpha': losses['alpha'],
+                    'train/learning_rate': trainer.optimizer.param_groups[0]['lr'],
+                    'epoch': epoch,
+                    'step': i
+                })
+                
+                logging.info(
+                    f"Epoch [{epoch}/{args.num_epochs}], "
+                    f"Step [{i}/{len(source_loader)}], "
+                    f"Loss: {losses['total_loss']:.4f}, "
+                    f"CLF Loss: {losses['clf_loss']:.4f}, "
+                    f"Domain Loss: {losses['domain_loss']:.4f}, "
+                    f"Alpha: {losses['alpha']:.4f}"
+                )
         
-        # Calculate average training metrics
+        # Calculate and log average epoch metrics
         avg_losses = {
-            k: sum(d[k] for d in epoch_losses) / len(epoch_losses)
+            k: np.mean([d[k] for d in epoch_losses])
             for k in epoch_losses[0].keys()
         }
+        
+        wandb.log({
+            'epoch/avg_total_loss': avg_losses['total_loss'],
+            'epoch/avg_clf_loss': avg_losses['clf_loss'],
+            'epoch/avg_domain_loss': avg_losses['domain_loss'],
+            'epoch/avg_alpha': avg_losses['alpha'],
+            'epoch': epoch
+        })
         
         # Validation phase
         val_metrics = trainer.validate(val_loader)
         
+        # Log validation metrics
+        wandb.log({
+            'val/ap': val_metrics['ap_0'],
+            **{f'val/{k}': v for k, v in val_metrics.items()},
+            'epoch': epoch
+        })
+        
         # Update learning rate
-        trainer.scheduler.step(val_metrics['val_loss'])
+        trainer.scheduler.step(val_metrics['ap_0'])
         
-        # Save best model
-        if val_metrics['val_loss'] < best_val_loss:
-            best_val_loss = val_metrics['val_loss']
-            trainer.save_checkpoint(epoch, {**avg_losses, **val_metrics})
+        # Save best model and log to wandb
+        if val_metrics['ap_0'] > best_val_metric:
+            best_val_metric = val_metrics['ap_0']
+            checkpoint_path = trainer.save_checkpoint(epoch, {**avg_losses, **val_metrics})
+            wandb.save(str(checkpoint_path))  # Log checkpoint file to wandb
+            
+            wandb.log({
+                'best_val_ap': best_val_metric,
+                'epoch': epoch
+            })
         
-        # Print progress
-        print(f"Epoch {epoch+1}/{args.num_epochs}")
-        print(f"Train Loss: {avg_losses['total_loss']:.4f}")
-        print(f"Val Loss: {val_metrics['val_loss']:.4f}")
-        print(f"Val Accuracy: {val_metrics['val_accuracy']:.4f}")
+        # Log epoch summary
+        logging.info(
+            f"\nEpoch {epoch} Summary:\n"
+            f"Average Training Loss: {avg_losses['total_loss']:.4f}\n"
+            f"Validation AP: {val_metrics['ap_0']:.4f}\n"
+            f"Best Validation AP: {best_val_metric:.4f}\n"
+        )
+    
+    # Close wandb run
+    wandb.finish()
 
 if __name__ == "__main__":
-    import argparse
-    
     parser = argparse.ArgumentParser()
+    # Add existing arguments
     parser.add_argument('--yolo_path', type=str, required=True,
                       help='Path to pretrained YOLO model')
-    parser.add_argument('--data_dir', type=str, required=True,
-                      help='Path to HeiChole dataset')
-    parser.add_argument('--save_dir', type=str, required=True,
-                      help='Directory to save checkpoints')
-    parser.add_argument('--batch_size', type=int, default=8)
-    parser.add_argument('--num_epochs', type=int, default=50)
+    parser.add_argument('--source_dir', type=str, required=True,
+                      help='Path to CholecT50 dataset')
+    parser.add_argument('--target_dir', type=str, required=True,
+                      help='Path to HeiChole domain_adaptation directory')
+    parser.add_argument('--save_dir', type=str, default=f'run_{time.strftime("%Y%m%d_%H%M%S")}',
+                      help='Directory name for results (will be created under checkpoints/)')
+    parser.add_argument('--batch_size', type=int, default=16)
+    parser.add_argument('--num_epochs', type=int, default=100)
     parser.add_argument('--num_workers', type=int, default=4)
     parser.add_argument('--device', type=str, default='cuda')
+    parser.add_argument('--domain_lambda', type=float, default=0.3,
+                      help='Weight for domain adaptation loss')
+    parser.add_argument('--alpha_schedule', type=float, default=5.0,
+                      help='Speed of domain adaptation')
+    parser.add_argument('--log_interval', type=int, default=10,
+                      help='How often to log training progress')
+    
+    # Add new wandb-specific arguments
+    parser.add_argument('--wandb_project', type=str, default='surgical-domain-adaptation',
+                      help='WandB project name')
+    parser.add_argument('--wandb_entity', type=str, default=None,
+                      help='WandB entity/username')
     
     args = parser.parse_args()
-    train_domain_adaptation(args)
+    train(args)
