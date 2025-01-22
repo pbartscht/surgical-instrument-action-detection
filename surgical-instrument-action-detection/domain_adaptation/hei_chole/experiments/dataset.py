@@ -27,6 +27,8 @@ TOOL_MAPPING = {
     5: 'irrigator'
 }
 
+
+
 class SurgicalDataset(Dataset):
     def __init__(self, dataset_dir, dataset_type='source', transform=None):
         self.dataset_dir = Path(dataset_dir)
