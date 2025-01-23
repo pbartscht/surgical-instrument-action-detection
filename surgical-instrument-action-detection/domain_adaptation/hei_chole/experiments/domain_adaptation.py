@@ -10,9 +10,28 @@ import time
 from collections import defaultdict
 from sklearn.metrics import average_precision_score, f1_score
 from ultralytics import YOLO
-from dataset import SurgicalDataset, TOOL_MAPPING
+from label_loader import SurgicalDataset, TOOL_MAPPING
 import argparse
 import wandb
+
+CHOLECT50_TO_HEICHOLE_INSTRUMENT_MAPPING = {
+    'grasper': 'grasper',
+    'bipolar': 'coagulation',
+    'clipper': 'clipper',
+    'hook': 'coagulation',
+    'scissors': 'scissors',
+    'irrigator': 'suction_irrigation'
+}
+
+TOOL_MAPPING = {
+    0: 'grasper', 
+    1: 'bipolar', 
+    2: 'hook',
+    3: 'scissors', 
+    4: 'clipper', 
+    5: 'irrigator'
+}
+
 
 class FeatureAlignmentHead(nn.Module):
     def __init__(self, num_classes):
@@ -147,58 +166,100 @@ class DomainAdaptationTrainer:
             self.writer.add_scalar(f'Features/{phase}/grad_norm', grad_norm, step)
     
     def train_step(self, batch, epoch_progress):
-        """Single training step with domain adaptation"""
+        """Supervised Domain Adaptation Training Step"""
         self.alignment_head.train()
         self.optimizer.zero_grad()
         
-        # Get batch data
+        # Get batch data and ensure everything is on the device
         images = batch['image'].to(self.device)
-        labels = batch['labels'].to(self.device)
-        domain_labels = batch['domain'].to(self.device)
+        labels = batch['labels'].float().to(self.device)  # Ensure float
+        domain_labels = batch['domain'].float().to(self.device)  # Ensure float
         
-        # Extract and monitor features
+        # Trenne Source und Target Samples
+        source_mask = domain_labels == 0
+        target_mask = domain_labels == 1
+        
+        # Feature Extraction
         features = self.extract_features(images)
-        self.log_feature_stats(features, 'pre_alignment')
         
-        # Calculate adaptation factor
-        p = epoch_progress
-        alpha = 2. / (1. + np.exp(-self.alpha_schedule * p)) - 1
+        # Alpha für GRL
+        alpha = min(2. / (1. + np.exp(-self.alpha_schedule * epoch_progress)) - 1, 0.8)
         
         # Forward pass
         domain_pred, class_pred = self.alignment_head(features, alpha)
         
-        # Calculate losses
-        clf_loss = F.binary_cross_entropy(
-            class_pred,
-            labels,
-            reduction='mean'
-        )
+        # Ensure predictions are in valid range [0,1]
+        class_pred = torch.clamp(class_pred, 0, 1)
+        domain_pred = torch.clamp(domain_pred, 0, 1)
         
-        # Domain loss with label smoothing
-        smooth_domain = domain_labels.unsqueeze(1) * 0.9 + 0.1
+        # Classification Loss für Source Domain
+        if source_mask.any():
+            source_clf_loss = F.binary_cross_entropy(
+                class_pred[source_mask],
+                labels[source_mask],
+                reduction='mean'
+            )
+        else:
+            source_clf_loss = torch.tensor(0.0).to(self.device)
+        
+        # Spezieller Classification Loss für Target Domain mit Mapping
+        if target_mask.any():
+            target_clf_loss = self.compute_target_loss(
+                class_pred[target_mask],
+                labels[target_mask]
+            )
+        else:
+            target_clf_loss = torch.tensor(0.0).to(self.device)
+        
+        # Kombinierter Classification Loss
+        clf_loss = source_clf_loss + target_clf_loss
+        
+        # Domain Classification Loss
         domain_loss = F.binary_cross_entropy(
             domain_pred,
-            smooth_domain,
+            domain_labels.unsqueeze(1),
             reduction='mean'
         )
         
-        # Combined loss
+        # Gesamtverlust
         total_loss = clf_loss + self.domain_lambda * domain_loss
         
-        # Backward pass with gradient clipping
+        # Backward und Optimize
         total_loss.backward()
         torch.nn.utils.clip_grad_norm_(self.alignment_head.parameters(), 1.0)
         self.optimizer.step()
         
         return {
             'total_loss': total_loss.item(),
-            'clf_loss': clf_loss.item(),
+            'source_clf_loss': source_clf_loss.item(),
+            'target_clf_loss': target_clf_loss.item(),
             'domain_loss': domain_loss.item(),
             'alpha': alpha
         }
     
+    def compute_target_loss(self, pred, target):
+        """Spezieller Loss für Target Domain mit Instrument-Mapping"""
+        # Ensure inputs are in valid range
+        pred = torch.clamp(pred, 0, 1)
+        target = torch.clamp(target, 0, 1)
+        
+        # Mapping-Matrix erstellen
+        mapping_matrix = torch.zeros(len(TOOL_MAPPING), len(set(CHOLECT50_TO_HEICHOLE_INSTRUMENT_MAPPING.values())))
+        for source_idx, source_tool in TOOL_MAPPING.items():
+            target_tool = CHOLECT50_TO_HEICHOLE_INSTRUMENT_MAPPING[source_tool]
+            target_idx = list(set(CHOLECT50_TO_HEICHOLE_INSTRUMENT_MAPPING.values())).index(target_tool)
+            mapping_matrix[source_idx, target_idx] = 1
+        mapping_matrix = mapping_matrix.to(self.device)
+        
+        # Transformiere Predictions gemäß Mapping
+        mapped_pred = torch.clamp(torch.matmul(pred, mapping_matrix), 0, 1)
+        mapped_target = torch.clamp(torch.matmul(target, mapping_matrix), 0, 1)
+        
+        # Berechne Loss
+        return F.binary_cross_entropy(mapped_pred, mapped_target, reduction='mean')
+    
     def validate(self, val_loader):
-        """Validation step with comprehensive metrics"""
+        """Validierung mit Instrument-Mapping"""
         self.alignment_head.eval()
         metrics = defaultdict(list)
         
@@ -206,40 +267,32 @@ class DomainAdaptationTrainer:
             for batch in val_loader:
                 images = batch['image'].to(self.device)
                 labels = batch['labels'].to(self.device)
+                domain = batch['domain'].to(self.device)
                 
                 features = self.extract_features(images)
                 _, predictions = self.alignment_head(features)
                 
-                # Calculate per-class metrics
-                for i in range(len(TOOL_MAPPING)):
-                    pred_i = predictions[:, i]
-                    label_i = labels[:, i]
+                # Separate Metriken für Source und Target
+                for domain_type, mask in [('source', domain == 0), ('target', domain == 1)]:
+                    if not mask.any():
+                        continue
+                        
+                    domain_pred = predictions[mask]
+                    domain_labels = labels[mask]
                     
-                    metrics[f'ap_{i}'].append(
-                        average_precision_score(
-                            label_i.cpu().numpy(),
-                            pred_i.cpu().numpy()
+                    if domain_type == 'target':
+                        # Verwende Mapping für Target Domain
+                        domain_pred = self.apply_instrument_mapping(domain_pred)
+                        domain_labels = self.apply_instrument_mapping(domain_labels)
+                    
+                    # Berechne Metriken
+                    for i, tool_name in enumerate(TOOL_MAPPING):
+                        metrics[f'{domain_type}_ap_{tool_name}'].append(
+                            average_precision_score(
+                                domain_labels[:, i].cpu().numpy(),
+                                domain_pred[:, i].cpu().numpy()
+                            )
                         )
-                    )
-                    metrics[f'f1_{i}'].append(
-                        f1_score(
-                            label_i.cpu().numpy() > 0.5,
-                            pred_i.cpu().numpy() > 0.5,
-                            zero_division=0
-                        )
-                    )
-        
-        # Calculate mean metrics
-        final_metrics = {}
-        for key, values in metrics.items():
-            final_metrics[key] = np.mean(values)
-            
-        # Log results
-        for key, value in final_metrics.items():
-            logging.info(f"Validation {key}: {value:.4f}")
-            self.writer.add_scalar(f'Val/Metrics/{key}', value, self.current_epoch)
-        
-        return final_metrics
     
     def save_checkpoint(self, epoch, metrics):
         """Save model checkpoint and return path"""
