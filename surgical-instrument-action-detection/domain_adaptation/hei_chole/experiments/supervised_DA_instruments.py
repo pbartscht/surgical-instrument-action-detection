@@ -20,16 +20,15 @@ class GradientReversalLayer(torch.autograd.Function):
 class DomainAdapter(nn.Module):
     def __init__(self, yolo_path="/data/Bartscht/YOLO/best_v35.pt", yolo_classes=6, target_classes=5):
         super().__init__()
-        # Initialize YOLO model and force eval mode
+        # YOLO Initialisierung bleibt gleich
         self.yolo = YOLO(yolo_path)
         self.yolo_model = self.yolo.model.model
-        # Freeze YOLO parameters
         for param in self.yolo_model.parameters():
             param.requires_grad = False
         self.yolo_model.eval()
         self.feature_layer = 10
         
-        # Mapping Matrix für die Konvertierung von YOLO zu HeiChole Klassen
+        # Mapping Matrix bleibt gleich
         self.register_buffer('mapping_matrix', torch.zeros(yolo_classes, target_classes))
         self.mapping_matrix[0, 0] = 1  # grasper -> grasper
         self.mapping_matrix[1, 2] = 1  # bipolar -> coagulation
@@ -38,33 +37,92 @@ class DomainAdapter(nn.Module):
         self.mapping_matrix[4, 1] = 1  # clipper -> clipper
         self.mapping_matrix[5, 4] = 1  # irrigator -> suction_irrigation
         
+        # Feature Reducer bleibt gleich
         self.feature_reducer = nn.Sequential(
-            nn.Conv2d(512, 256, 1),
+            nn.Conv2d(512, 384, 1),
+            nn.BatchNorm2d(384),
+            nn.SiLU(),
+            nn.Conv2d(384, 384, 3, padding=1),
+            nn.BatchNorm2d(384),
+            nn.SiLU(),
+            nn.Conv2d(384, 384, 3, padding=1, groups=4),
+            nn.BatchNorm2d(384),
+            nn.SiLU(),
+            nn.Conv2d(384, 256, 1),
             nn.BatchNorm2d(256),
-            nn.SiLU(inplace=True),
+            nn.SiLU(),
+            nn.Conv2d(256, 256, 3, padding=1),
+            nn.BatchNorm2d(256),
+            nn.SiLU(),
             nn.AdaptiveAvgPool2d(1),
-            nn.Flatten()
+            nn.Flatten(),
+            nn.Linear(256, 256),
+            nn.LayerNorm(256),
+            nn.SiLU(),
+            nn.Dropout(0.3)
         )
-        
+
+        # Verbesserter Domain Classifier
         self.domain_classifier = nn.Sequential(
-            nn.Linear(256, 128),
+            # Initial Feature Processing
+            nn.Linear(256, 384),
+            nn.LayerNorm(384),
+            nn.GELU(),
+            nn.Dropout(0.3),
+            
+            # Domain-Specific Feature Extraction
+            nn.Sequential(
+                nn.Linear(384, 384),
+                nn.LayerNorm(384),
+                nn.ReLU(),
+                nn.Linear(384, 384),
+                nn.LayerNorm(384)
+            ),  # Mit Residual Connection
+            
+            # Attention Mechanism
+            nn.Sequential(
+                nn.Linear(384, 96),  # Reduction
+                nn.ReLU(),
+                nn.Linear(96, 384),  # Expansion
+                nn.Sigmoid()
+            ),
+            
+            # Final Classification
+            nn.Linear(384, 128),
             nn.ReLU(),
             nn.Dropout(0.5),
             nn.Linear(128, 1),
             nn.Sigmoid()
         )
         
-        # Instrument classifier mit konfigurierbarer Klassenzahl
+        # Instrument Classifier bleibt wie in deinem Code
         self.instrument_classifier = nn.Sequential(
-            nn.Linear(256, 128),
-            nn.ReLU(),
-            nn.Dropout(0.5),
-            nn.Linear(128, yolo_classes),  # Verwendet yolo_classes Parameter
+            nn.Linear(256, 512),
+            nn.LayerNorm(512),
+            nn.GELU(),
+            nn.Dropout(0.3),
+            nn.Sequential(
+                nn.Linear(512, 128),
+                nn.ReLU(),
+                nn.Linear(128, 512),
+                nn.Sigmoid(),
+            ),
+            nn.Linear(512, 384),
+            nn.LayerNorm(384),
+            nn.GELU(),
+            nn.Dropout(0.3),
+            nn.Sequential(
+                nn.Linear(384, 384),
+                nn.LayerNorm(384),
+                nn.ReLU(),
+                nn.Linear(384, 384),
+                nn.LayerNorm(384),
+            ),
+            nn.Linear(384, yolo_classes),
             nn.Sigmoid()
         )
 
     def extract_features(self, x):
-        # Ensure YOLO stays in eval mode
         self.yolo_model.eval()
         features = None
         with torch.no_grad():
@@ -75,30 +133,51 @@ class DomainAdapter(nn.Module):
                     break
         return self.feature_reducer(features)
 
+    def forward_domain_classifier(self, x, alpha):
+        for i, layer in enumerate(self.domain_classifier):
+            if i == 1:  # Residual Block
+                identity = x
+                x = layer(x) + identity
+            elif i == 2:  # Attention Block
+                attention = layer(x)
+                x = x * attention
+            else:
+                x = layer(x)
+        return x
+
+    def forward_instrument_classifier(self, x):
+        for i, layer in enumerate(self.instrument_classifier):
+            if i == 4:  # Context Integration Block
+                identity = x
+                x = layer(x) + identity
+            else:
+                x = layer(x)
+        return x
+
+    def forward(self, x, alpha=1.0):
+        features = self.extract_features(x)
+        
+        # Domain Classification mit Gradient Reversal und verbessertem Forward
+        domain_features = GradientReversalLayer.apply(features, alpha)
+        domain_pred = self.forward_domain_classifier(domain_features, alpha)
+        
+        # Instrument Classification mit verbessertem Forward
+        yolo_pred = self.forward_instrument_classifier(features)
+        
+        # Mapping auf HeiChole Klassen
+        heichole_pred = torch.matmul(yolo_pred, self.mapping_matrix)
+        
+        return domain_pred, yolo_pred, heichole_pred
+
     def train(self, mode=True):
-        # Override train method to keep YOLO in eval mode
         super().train(mode)
         self.yolo_model.eval()
         return self
 
     def eval(self):
-        # Override eval method
         super().eval()
         self.yolo_model.eval()
         return self
-    
-    def forward(self, x, alpha=1.0):
-        features = self.extract_features(x)
-        
-        # Domain Classification mit Gradient Reversal
-        domain_pred = self.domain_classifier(
-            GradientReversalLayer.apply(features, alpha)
-        )
-        
-        # Instrument Classification
-        instrument_pred = self.instrument_classifier(features)
-        
-        return domain_pred, instrument_pred
     
 def get_alpha(epoch, num_epochs=30):
     p = epoch / num_epochs
@@ -121,31 +200,20 @@ def train_epoch(model, dataloader, optimizer, device, epoch, domain_lambda=0.3):
         domains = batch['domain'].float().clamp(0, 1).to(device)
         
         alpha = get_alpha(epoch)
-        
         optimizer.zero_grad()
         
-        # Features extrahieren
-        features = model.extract_features(images)
+        # Forward Pass mit neuer Struktur
+        domain_pred, yolo_pred, heichole_pred = model(images, alpha)
         
-        # Domain Classification
-        domain_pred = model.domain_classifier(
-            GradientReversalLayer.apply(features, alpha)
-        ).clamp(1e-7, 1)
+        # Losses berechnen
+        instrument_loss = F.binary_cross_entropy(heichole_pred.clamp(1e-7, 1), labels)
+        domain_loss = F.binary_cross_entropy(domain_pred.squeeze().clamp(1e-7, 1), domains)
         
-        # Instrument Classification (6 Klassen) und Mapping (5 Klassen)
-        yolo_instrument_pred = model.instrument_classifier(features).clamp(1e-7, 1)
-        
-        # Mapping mit anschließendem Clamp für numerische Stabilität
-        instrument_pred = torch.matmul(yolo_instrument_pred, model.mapping_matrix).clamp(0, 1)
-        
-        # Loss auf gemappten Vorhersagen (5 Klassen vs 5 Klassen)
-        instrument_loss = F.binary_cross_entropy(instrument_pred, labels)
-        domain_loss = F.binary_cross_entropy(domain_pred.squeeze(), domains)
+        # Gesamtverlust
         loss = instrument_loss + domain_lambda * domain_loss
         
         loss.backward()
         optimizer.step()
-    
         
         total_loss += loss.item()
         total_instrument_loss += instrument_loss.item()
@@ -156,7 +224,9 @@ def train_epoch(model, dataloader, optimizer, device, epoch, domain_lambda=0.3):
                 "batch_total_loss": loss.item(),
                 "batch_instrument_loss": instrument_loss.item(),
                 "batch_domain_loss": domain_loss.item(),
-                "alpha": alpha
+                "alpha": alpha,
+                "yolo_pred_mean": yolo_pred.mean().item(),  # Zusätzliche Metriken
+                "heichole_pred_mean": heichole_pred.mean().item()
             })
             
             print(f'Epoch: {epoch} [{batch_idx}/{len(dataloader)}]')
@@ -194,28 +264,24 @@ def validate_epoch(model, val_loader, device, epoch):
             
             alpha = get_alpha(epoch)
             
-            # Features extrahieren
-            features = model.extract_features(images)
+            # Forward Pass mit neuer Struktur
+            domain_pred, yolo_pred, heichole_pred = model(images, alpha)
             
-            # Domain Classification
-            domain_pred = model.domain_classifier(
-                GradientReversalLayer.apply(features, alpha)
-            ).clamp(1e-7, 1)
-            
-            # Instrument Classification (6 Klassen) und Mapping (5 Klassen)
-            yolo_instrument_pred = model.instrument_classifier(features).clamp(1e-7, 1)
-            
-            # Mapping mit anschließendem Clamp
-            instrument_pred = torch.matmul(yolo_instrument_pred, model.mapping_matrix).clamp(0, 1)
-            
-            # Loss Berechnung auf gemappten Vorhersagen
-            instrument_loss = F.binary_cross_entropy(instrument_pred, labels)
-            domain_loss = F.binary_cross_entropy(domain_pred.squeeze(), domains)
+            # Losses berechnen
+            instrument_loss = F.binary_cross_entropy(heichole_pred.clamp(1e-7, 1), labels)
+            domain_loss = F.binary_cross_entropy(domain_pred.squeeze().clamp(1e-7, 1), domains)
             val_loss = instrument_loss + 0.3 * domain_loss
             
             total_val_loss += val_loss.item()
             total_instrument_loss += instrument_loss.item()
             total_domain_loss += domain_loss.item()
+            
+            if batch_idx % 10 == 0:  # Zusätzliches Logging während der Validierung
+                wandb.log({
+                    "val_batch_loss": val_loss.item(),
+                    "val_yolo_pred_mean": yolo_pred.mean().item(),
+                    "val_heichole_pred_mean": heichole_pred.mean().item()
+                })
     
     avg_val_loss = total_val_loss / len(val_loader)
     avg_instrument_loss = total_instrument_loss / len(val_loader)
@@ -230,33 +296,27 @@ def validate_epoch(model, val_loader, device, epoch):
     
     return avg_val_loss
 
-
-
 def save_adapter(model, save_dir):
     try:
-        # Konvertiere zu Path und erstelle Directory
         save_dir = Path(save_dir)
         print(f"Versuche Verzeichnis zu erstellen: {save_dir.absolute()}")
         save_dir.mkdir(parents=True, exist_ok=True)
         
-        # Überprüfe ob das Verzeichnis existiert
         if not save_dir.exists():
             raise RuntimeError(f"Konnte Verzeichnis nicht erstellen: {save_dir}")
-            
-        # Baue state dict
+        
+        # Erweitere state dict um Domain Classifier
         state_dict = {
             'feature_reducer': model.feature_reducer.state_dict(),
-            'instrument_classifier': model.instrument_classifier.state_dict()
+            'instrument_classifier': model.instrument_classifier.state_dict(),
+            'domain_classifier': model.domain_classifier.state_dict()  # Neu hinzugefügt
         }
         
-        # Definiere den kompletten Pfad für die Datei
         save_path = save_dir / 'adapter_weights.pt'
         print(f"Versuche zu speichern unter: {save_path.absolute()}")
         
-        # Speichere die Datei
         torch.save(state_dict, save_path)
         
-        # Überprüfe ob die Datei erstellt wurde
         if save_path.exists():
             print(f"Erfolgreich gespeichert! Dateigröße: {save_path.stat().st_size / 1024:.2f} KB")
         else:
@@ -267,48 +327,136 @@ def save_adapter(model, save_dir):
         raise
 
 def main():
-    wandb.init(project="surgical-domain-adaptation")
+    # Wandb Konfiguration
+    config = {
+        "learning_rate": 0.001,
+        "num_epochs": 30,
+        "batch_size": 32,  # Sollte mit dataloader übereinstimmen
+        "domain_lambda": 0.3,
+        "patience": 5,
+        "yolo_classes": 6,
+        "target_classes": 5,
+        "model_path": "/data/Bartscht/YOLO/best_v35.pt"
+    }
+    
+    wandb.init(
+        project="surgical-domain-adaptation",
+        config=config
+    )
     
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Using device: {device}")
     
-    # Train und Val Loader mit der gleichen Funktion
+    # Dataloader
     train_loader = balanced_dataloader(split='train')
     val_loader = balanced_dataloader(split='val')
     
+    # Model Initialization
     model = DomainAdapter(
-        yolo_path="/data/Bartscht/YOLO/best_v35.pt",
-        yolo_classes=6,  # Anzahl der YOLO Klassen (TOOL_MAPPING)
-        target_classes=5  # Anzahl der HeiChole Klassen nach Mapping
+        yolo_path=config["model_path"],
+        yolo_classes=config["yolo_classes"],
+        target_classes=config["target_classes"]
     ).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
     
+    # Optimizer mit Scheduler
+    optimizer = torch.optim.Adam(model.parameters(), lr=config["learning_rate"])
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, 
+        mode='min', 
+        factor=0.5, 
+        patience=3, 
+        verbose=True
+    )
+    
+    # Training Setup
     best_val_loss = float('inf')
-    patience = 5
     patience_counter = 0
-
     save_dir = Path("adapter_weights")
     print(f"Base save directory: {save_dir.absolute()}")
     
-    num_epochs = 30
-    for epoch in range(num_epochs):
-        train_loss = train_epoch(model, train_loader, optimizer, device, epoch)
+    # Versuch die Checkpoints zu laden falls vorhanden
+    checkpoint_path = save_dir / 'latest_checkpoint.pt'
+    start_epoch = 0
+    if checkpoint_path.exists():
+        try:
+            checkpoint = torch.load(checkpoint_path)
+            model.load_state_dict(checkpoint['model_state_dict'])
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            start_epoch = checkpoint['epoch']
+            best_val_loss = checkpoint['best_val_loss']
+            print(f"Resuming from epoch {start_epoch}")
+        except Exception as e:
+            print(f"Error loading checkpoint: {e}")
+    
+    # Training Loop
+    for epoch in range(start_epoch, config["num_epochs"]):
+        print(f"\nEpoch {epoch+1}/{config['num_epochs']}")
+        
+        # Training
+        train_loss = train_epoch(
+            model, 
+            train_loader, 
+            optimizer, 
+            device, 
+            epoch, 
+            domain_lambda=config["domain_lambda"]
+        )
+        
+        # Validation
         val_loss = validate_epoch(model, val_loader, device, epoch)
+        
+        # Learning Rate Scheduling
+        scheduler.step(val_loss)
+        current_lr = optimizer.param_groups[0]['lr']
+        wandb.log({"learning_rate": current_lr})
         
         # Model Saving & Early Stopping
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             patience_counter = 0
+            
+            # Speichere bestes Modell
             save_adapter(model, save_dir)
-            wandb.log({"best_val_loss": val_loss})
+            wandb.log({
+                "best_val_loss": val_loss,
+                "best_model_epoch": epoch
+            })
+            
+            # Speichere Checkpoint
+            checkpoint = {
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'best_val_loss': best_val_loss
+            }
+            torch.save(checkpoint, save_dir / 'latest_checkpoint.pt')
         else:
             patience_counter += 1
-            
-        if patience_counter >= patience:
+        
+        # Early Stopping
+        if patience_counter >= config["patience"]:
             print(f"Early stopping triggered nach Epoch {epoch}")
+            wandb.log({"early_stopping_epoch": epoch})
             break
-            
+        
+        # Periodisches Speichern
         if epoch % 5 == 0:
             save_adapter(model, save_dir / f"adapter_epoch_{epoch}")
+            
+        # Log Training Progress
+        wandb.log({
+            "epoch": epoch,
+            "train_loss": train_loss,
+            "val_loss": val_loss,
+            "patience_counter": patience_counter
+        })
+    
+    # Final Logging und Cleanup
+    wandb.log({
+        "final_val_loss": val_loss,
+        "best_val_loss_overall": best_val_loss,
+        "total_epochs_trained": epoch + 1
+    })
     
     wandb.finish()
 
