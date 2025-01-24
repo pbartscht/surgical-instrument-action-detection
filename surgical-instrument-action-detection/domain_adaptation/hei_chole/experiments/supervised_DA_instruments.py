@@ -118,12 +118,19 @@ def validate_epoch(model, val_loader, device, epoch):
             p = epoch / 100
             alpha = 2. / (1. + np.exp(-10 * p)) - 1
             
-            domain_pred, instrument_pred = model(images, alpha)
+            # Features extrahieren
+            features = model.extract_features(images)  # Korrigiert: x -> images
             
-            # Ensure predictions are also clamped for numerical stability
-            instrument_pred = instrument_pred.clamp(1e-7, 1)
-            domain_pred = domain_pred.clamp(1e-7, 1)
+            # Domain Classification
+            domain_pred = model.domain_classifier(
+                GradientReversalLayer.apply(features, alpha)
+            ).clamp(1e-7, 1)
             
+            # Instrument Classification (6 Klassen) und Mapping (5 Klassen)
+            yolo_instrument_pred = model.instrument_classifier(features).clamp(1e-7, 1)
+            instrument_pred = torch.matmul(yolo_instrument_pred, model.mapping_matrix)
+            
+            # Loss Berechnung auf gemappten Vorhersagen
             instrument_loss = F.binary_cross_entropy(instrument_pred, labels)
             domain_loss = F.binary_cross_entropy(domain_pred.squeeze(), domains)
             val_loss = instrument_loss + 0.3 * domain_loss
@@ -146,7 +153,6 @@ def validate_epoch(model, val_loader, device, epoch):
     return avg_val_loss
 
 def train_epoch(model, dataloader, optimizer, device, epoch, domain_lambda=0.3):
-    # Set trainable components to train mode while keeping YOLO frozen
     model.feature_reducer.train()
     model.domain_classifier.train()
     model.instrument_classifier.train()
@@ -157,32 +163,34 @@ def train_epoch(model, dataloader, optimizer, device, epoch, domain_lambda=0.3):
     
     for batch_idx, batch in enumerate(dataloader):
         images = batch['image'].to(device)
-        # Explicitly clamp labels and domains to [0,1]
-        labels = batch['labels'].float().clamp(0, 1).to(device)
+        labels = batch['labels'].float().clamp(0, 1).to(device)  # 5 Klassen (HeiChole)
         domains = batch['domain'].float().clamp(0, 1).to(device)
-        
-        # Debug info for values
-        if torch.any(batch['labels'] > 1) or torch.any(batch['domain'] > 1):
-            print(f"Batch {batch_idx}: Found values > 1, clamping applied")
-            print(f"Labels range before clamping: [{batch['labels'].min()}, {batch['labels'].max()}]")
-            print(f"Domains range before clamping: [{batch['domain'].min()}, {batch['domain'].max()}]")
         
         p = epoch / 300
         alpha = max(0.1, 0.5 / (1. + np.exp(-3 * p)) - 0.25)
         
         optimizer.zero_grad()
-        domain_pred, instrument_pred = model(images, alpha)
         
-        # Ensure predictions are also clamped for numerical stability
-        instrument_pred = instrument_pred.clamp(1e-7, 1)
-        domain_pred = domain_pred.clamp(1e-7, 1)
+        # Features extrahieren
+        features = model.extract_features(images)
         
+        # Domain Classification
+        domain_pred = model.domain_classifier(
+            GradientReversalLayer.apply(features, alpha)
+        ).clamp(1e-7, 1)
+        
+        # Instrument Classification (6 Klassen) und Mapping (5 Klassen)
+        yolo_instrument_pred = model.instrument_classifier(features).clamp(1e-7, 1)
+        instrument_pred = torch.matmul(yolo_instrument_pred, model.mapping_matrix)
+        
+        # Loss auf gemappten Vorhersagen (5 Klassen vs 5 Klassen)
         instrument_loss = F.binary_cross_entropy(instrument_pred, labels)
         domain_loss = F.binary_cross_entropy(domain_pred.squeeze(), domains)
         loss = instrument_loss + domain_lambda * domain_loss
         
         loss.backward()
         optimizer.step()
+    
         
         total_loss += loss.item()
         total_instrument_loss += instrument_loss.item()
