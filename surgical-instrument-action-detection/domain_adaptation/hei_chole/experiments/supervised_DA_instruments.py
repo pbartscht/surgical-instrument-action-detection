@@ -76,6 +76,19 @@ class DomainAdapter(nn.Module):
         super().eval()
         self.yolo_model.eval()
         return self
+    
+    def forward(self, x, alpha=1.0):
+        features = self.extract_features(x)
+        
+        # Domain Classification mit Gradient Reversal
+        domain_pred = self.domain_classifier(
+            GradientReversalLayer.apply(features, alpha)
+        )
+        
+        # Instrument Classification
+        instrument_pred = self.instrument_classifier(features)
+        
+        return domain_pred, instrument_pred
 
 def validate_epoch(model, val_loader, device, epoch):
     # Set trainable components to eval mode while keeping YOLO frozen
