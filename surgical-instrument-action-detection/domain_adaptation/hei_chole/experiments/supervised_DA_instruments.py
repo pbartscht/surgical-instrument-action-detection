@@ -88,8 +88,8 @@ def train_epoch(model, dataloader, optimizer, device, epoch, domain_lambda=0.3):
         labels = batch['labels'].float().to(device)
         domains = batch['domain'].float().to(device)
         
-        p = epoch / 100
-        alpha = 2. / (1. + np.exp(-10 * p)) - 1
+        p = epoch / 300
+        alpha = max(0.1, 0.5 / (1. + np.exp(-3 * p)) - 0.25)  # Minimum von 0.1
         
         optimizer.zero_grad()
         domain_pred, instrument_pred = model(images, alpha)
