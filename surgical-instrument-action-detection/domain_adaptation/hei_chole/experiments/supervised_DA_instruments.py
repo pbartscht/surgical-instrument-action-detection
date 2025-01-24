@@ -20,13 +20,15 @@ class GradientReversalLayer(torch.autograd.Function):
 class DomainAdapter(nn.Module):
     def __init__(self, yolo_path="/data/Bartscht/YOLO/best_v35.pt", num_classes=5):
         super().__init__()
-        # YOLO als Feature Extractor - immer im eval mode
+        # Initialize YOLO model and force eval mode
         self.yolo = YOLO(yolo_path)
         self.yolo_model = self.yolo.model.model
+        # Freeze YOLO parameters
+        for param in self.yolo_model.parameters():
+            param.requires_grad = False
         self.yolo_model.eval()
         self.feature_layer = 10
         
-        # Rest der Komponenten wie gehabt
         self.feature_reducer = nn.Sequential(
             nn.Conv2d(512, 256, 1),
             nn.BatchNorm2d(256),
@@ -52,6 +54,8 @@ class DomainAdapter(nn.Module):
         )
 
     def extract_features(self, x):
+        # Ensure YOLO stays in eval mode
+        self.yolo_model.eval()
         features = None
         with torch.no_grad():
             for i, layer in enumerate(self.yolo_model):
@@ -61,23 +65,66 @@ class DomainAdapter(nn.Module):
                     break
         return self.feature_reducer(features)
 
-    def forward(self, x, alpha=1.0):
-        features = self.extract_features(x)
-        
-        # Domain Classification mit Gradient Reversal
-        domain_pred = self.domain_classifier(
-            GradientReversalLayer.apply(features, alpha)
-        )
-        
-        # Instrument Classification
-        instrument_pred = self.instrument_classifier(features)
-        
-        return domain_pred, instrument_pred
+    def train(self, mode=True):
+        # Override train method to keep YOLO in eval mode
+        super().train(mode)
+        self.yolo_model.eval()
+        return self
+
+    def eval(self):
+        # Override eval method
+        super().eval()
+        self.yolo_model.eval()
+        return self
+
+def validate_epoch(model, val_loader, device, epoch):
+    # Set trainable components to eval mode while keeping YOLO frozen
+    model.feature_reducer.eval()
+    model.domain_classifier.eval()
+    model.instrument_classifier.eval()
+    
+    total_val_loss = 0
+    total_instrument_loss = 0
+    total_domain_loss = 0
+    
+    with torch.no_grad():
+        for batch_idx, batch in enumerate(val_loader):
+            images = batch['image'].to(device)
+            labels = batch['labels'].float().to(device)
+            domains = batch['domain'].float().to(device)
+            
+            p = epoch / 100
+            alpha = 2. / (1. + np.exp(-10 * p)) - 1
+            
+            # Forward pass will automatically use frozen YOLO features
+            domain_pred, instrument_pred = model(images, alpha)
+            
+            instrument_loss = F.binary_cross_entropy(instrument_pred, labels)
+            domain_loss = F.binary_cross_entropy(domain_pred.squeeze(), domains)
+            val_loss = instrument_loss + 0.3 * domain_loss
+            
+            total_val_loss += val_loss.item()
+            total_instrument_loss += instrument_loss.item()
+            total_domain_loss += domain_loss.item()
+    
+    avg_val_loss = total_val_loss / len(val_loader)
+    avg_instrument_loss = total_instrument_loss / len(val_loader)
+    avg_domain_loss = total_domain_loss / len(val_loader)
+    
+    wandb.log({
+        "val_total_loss": avg_val_loss,
+        "val_instrument_loss": avg_instrument_loss,
+        "val_domain_loss": avg_domain_loss,
+        "val_epoch": epoch
+    })
+    
+    return avg_val_loss
 
 def train_epoch(model, dataloader, optimizer, device, epoch, domain_lambda=0.3):
-    for param in model.parameters():
-        param.requires_grad = True
-    model.yolo_model.eval()  # Sicherstellen dass YOLO im eval bleibt
+    # Set trainable components to train mode while keeping YOLO frozen
+    model.feature_reducer.train()
+    model.domain_classifier.train()
+    model.instrument_classifier.train()
     
     total_loss = 0
     total_instrument_loss = 0
@@ -89,7 +136,7 @@ def train_epoch(model, dataloader, optimizer, device, epoch, domain_lambda=0.3):
         domains = batch['domain'].float().to(device)
         
         p = epoch / 300
-        alpha = max(0.1, 0.5 / (1. + np.exp(-3 * p)) - 0.25)  # Minimum von 0.1
+        alpha = max(0.1, 0.5 / (1. + np.exp(-3 * p)) - 0.25)
         
         optimizer.zero_grad()
         domain_pred, instrument_pred = model(images, alpha)
@@ -101,7 +148,6 @@ def train_epoch(model, dataloader, optimizer, device, epoch, domain_lambda=0.3):
         loss.backward()
         optimizer.step()
         
-        # Akkumuliere Verluste für Durchschnitt
         total_loss += loss.item()
         total_instrument_loss += instrument_loss.item()
         total_domain_loss += domain_loss.item()
@@ -119,7 +165,6 @@ def train_epoch(model, dataloader, optimizer, device, epoch, domain_lambda=0.3):
             print(f'Instrument Loss: {instrument_loss.item():.4f}')
             print(f'Domain Loss: {domain_loss.item():.4f}\n')
     
-    # Durchschnittliche Verluste pro Epoch
     avg_loss = total_loss / len(dataloader)
     avg_instrument_loss = total_instrument_loss / len(dataloader)
     avg_domain_loss = total_domain_loss / len(dataloader)
@@ -133,58 +178,39 @@ def train_epoch(model, dataloader, optimizer, device, epoch, domain_lambda=0.3):
     
     return avg_loss
 
-
-
-def validate_epoch(model, val_loader, device, epoch):
-    model.eval()
-    total_val_loss = 0
-    total_instrument_loss = 0
-    total_domain_loss = 0
-    
-    with torch.no_grad():
-        for batch_idx, batch in enumerate(val_loader):
-            images = batch['image'].to(device)
-            labels = batch['labels'].float().to(device)
-            domains = batch['domain'].float().to(device)
-            
-            # Gleiche Alpha-Berechnung wie beim Training
-            p = epoch / 100
-            alpha = 2. / (1. + np.exp(-10 * p)) - 1
-            
-            domain_pred, instrument_pred = model(images, alpha)
-            
-            instrument_loss = F.binary_cross_entropy(instrument_pred, labels)
-            domain_loss = F.binary_cross_entropy(domain_pred.squeeze(), domains)
-            val_loss = instrument_loss + 0.3 * domain_loss
-            
-            total_val_loss += val_loss.item()
-            total_instrument_loss += instrument_loss.item()
-            total_domain_loss += domain_loss.item()
-    
-    # Durchschnittliche Verluste
-    avg_val_loss = total_val_loss / len(val_loader)
-    avg_instrument_loss = total_instrument_loss / len(val_loader)
-    avg_domain_loss = total_domain_loss / len(val_loader)
-    
-    wandb.log({
-        "val_total_loss": avg_val_loss,
-        "val_instrument_loss": avg_instrument_loss,
-        "val_domain_loss": avg_domain_loss,
-        "val_epoch": epoch
-    })
-    
-    return avg_val_loss
-
-
 def save_adapter(model, save_dir):
-    save_dir = Path(save_dir)
-    save_dir.mkdir(parents=True, exist_ok=True)
-    
-    state_dict = {
-        'feature_reducer': model.feature_reducer.state_dict(),
-        'instrument_classifier': model.instrument_classifier.state_dict()
-    }
-    torch.save(state_dict, save_dir / 'adapter_weights.pt')
+    try:
+        # Konvertiere zu Path und erstelle Directory
+        save_dir = Path(save_dir)
+        print(f"Versuche Verzeichnis zu erstellen: {save_dir.absolute()}")
+        save_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Überprüfe ob das Verzeichnis existiert
+        if not save_dir.exists():
+            raise RuntimeError(f"Konnte Verzeichnis nicht erstellen: {save_dir}")
+            
+        # Baue state dict
+        state_dict = {
+            'feature_reducer': model.feature_reducer.state_dict(),
+            'instrument_classifier': model.instrument_classifier.state_dict()
+        }
+        
+        # Definiere den kompletten Pfad für die Datei
+        save_path = save_dir / 'adapter_weights.pt'
+        print(f"Versuche zu speichern unter: {save_path.absolute()}")
+        
+        # Speichere die Datei
+        torch.save(state_dict, save_path)
+        
+        # Überprüfe ob die Datei erstellt wurde
+        if save_path.exists():
+            print(f"Erfolgreich gespeichert! Dateigröße: {save_path.stat().st_size / 1024:.2f} KB")
+        else:
+            raise RuntimeError(f"Datei wurde nicht erstellt: {save_path}")
+            
+    except Exception as e:
+        print(f"Fehler beim Speichern: {str(e)}")
+        raise
 
 def main():
     wandb.init(project="surgical-domain-adaptation")
@@ -201,8 +227,9 @@ def main():
     best_val_loss = float('inf')
     patience = 5
     patience_counter = 0
-    save_dir = Path("adapter_checkpoints")
-    save_dir.mkdir(parents=True, exist_ok=True)
+
+    save_dir = Path("adapter_weights")
+    print(f"Base save directory: {save_dir.absolute()}")
     
     num_epochs = 30
     for epoch in range(num_epochs):
@@ -213,7 +240,7 @@ def main():
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             patience_counter = 0
-            save_adapter(model, save_dir / "best_adapter")
+            save_adapter(model, save_dir)
             wandb.log({"best_val_loss": val_loss})
         else:
             patience_counter += 1
