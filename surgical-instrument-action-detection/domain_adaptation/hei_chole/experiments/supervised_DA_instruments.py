@@ -91,7 +91,6 @@ class DomainAdapter(nn.Module):
         return domain_pred, instrument_pred
 
 def validate_epoch(model, val_loader, device, epoch):
-    # Set trainable components to eval mode while keeping YOLO frozen
     model.feature_reducer.eval()
     model.domain_classifier.eval()
     model.instrument_classifier.eval()
@@ -103,14 +102,17 @@ def validate_epoch(model, val_loader, device, epoch):
     with torch.no_grad():
         for batch_idx, batch in enumerate(val_loader):
             images = batch['image'].to(device)
-            labels = batch['labels'].float().to(device)
-            domains = batch['domain'].float().to(device)
+            labels = batch['labels'].float().clamp(0, 1).to(device)
+            domains = batch['domain'].float().clamp(0, 1).to(device)
             
             p = epoch / 100
             alpha = 2. / (1. + np.exp(-10 * p)) - 1
             
-            # Forward pass will automatically use frozen YOLO features
             domain_pred, instrument_pred = model(images, alpha)
+            
+            # Ensure predictions are also clamped for numerical stability
+            instrument_pred = instrument_pred.clamp(1e-7, 1)
+            domain_pred = domain_pred.clamp(1e-7, 1)
             
             instrument_loss = F.binary_cross_entropy(instrument_pred, labels)
             domain_loss = F.binary_cross_entropy(domain_pred.squeeze(), domains)
@@ -145,14 +147,25 @@ def train_epoch(model, dataloader, optimizer, device, epoch, domain_lambda=0.3):
     
     for batch_idx, batch in enumerate(dataloader):
         images = batch['image'].to(device)
-        labels = batch['labels'].float().to(device)
-        domains = batch['domain'].float().to(device)
+        # Explicitly clamp labels and domains to [0,1]
+        labels = batch['labels'].float().clamp(0, 1).to(device)
+        domains = batch['domain'].float().clamp(0, 1).to(device)
+        
+        # Debug info for values
+        if torch.any(batch['labels'] > 1) or torch.any(batch['domain'] > 1):
+            print(f"Batch {batch_idx}: Found values > 1, clamping applied")
+            print(f"Labels range before clamping: [{batch['labels'].min()}, {batch['labels'].max()}]")
+            print(f"Domains range before clamping: [{batch['domain'].min()}, {batch['domain'].max()}]")
         
         p = epoch / 300
         alpha = max(0.1, 0.5 / (1. + np.exp(-3 * p)) - 0.25)
         
         optimizer.zero_grad()
         domain_pred, instrument_pred = model(images, alpha)
+        
+        # Ensure predictions are also clamped for numerical stability
+        instrument_pred = instrument_pred.clamp(1e-7, 1)
+        domain_pred = domain_pred.clamp(1e-7, 1)
         
         instrument_loss = F.binary_cross_entropy(instrument_pred, labels)
         domain_loss = F.binary_cross_entropy(domain_pred.squeeze(), domains)
