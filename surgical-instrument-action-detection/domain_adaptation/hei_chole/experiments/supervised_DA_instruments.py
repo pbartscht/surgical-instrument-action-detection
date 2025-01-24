@@ -119,7 +119,7 @@ def validate_epoch(model, val_loader, device, epoch):
             alpha = 2. / (1. + np.exp(-10 * p)) - 1
             
             # Features extrahieren
-            features = model.extract_features(images)  # Korrigiert: x -> images
+            features = model.extract_features(images)
             
             # Domain Classification
             domain_pred = model.domain_classifier(
@@ -128,7 +128,9 @@ def validate_epoch(model, val_loader, device, epoch):
             
             # Instrument Classification (6 Klassen) und Mapping (5 Klassen)
             yolo_instrument_pred = model.instrument_classifier(features).clamp(1e-7, 1)
-            instrument_pred = torch.matmul(yolo_instrument_pred, model.mapping_matrix)
+            
+            # Mapping mit anschließendem Clamp
+            instrument_pred = torch.matmul(yolo_instrument_pred, model.mapping_matrix).clamp(0, 1)
             
             # Loss Berechnung auf gemappten Vorhersagen
             instrument_loss = F.binary_cross_entropy(instrument_pred, labels)
@@ -163,7 +165,7 @@ def train_epoch(model, dataloader, optimizer, device, epoch, domain_lambda=0.3):
     
     for batch_idx, batch in enumerate(dataloader):
         images = batch['image'].to(device)
-        labels = batch['labels'].float().clamp(0, 1).to(device)  # 5 Klassen (HeiChole)
+        labels = batch['labels'].float().clamp(0, 1).to(device)
         domains = batch['domain'].float().clamp(0, 1).to(device)
         
         p = epoch / 300
@@ -181,7 +183,9 @@ def train_epoch(model, dataloader, optimizer, device, epoch, domain_lambda=0.3):
         
         # Instrument Classification (6 Klassen) und Mapping (5 Klassen)
         yolo_instrument_pred = model.instrument_classifier(features).clamp(1e-7, 1)
-        instrument_pred = torch.matmul(yolo_instrument_pred, model.mapping_matrix)
+        
+        # Mapping mit anschließendem Clamp für numerische Stabilität
+        instrument_pred = torch.matmul(yolo_instrument_pred, model.mapping_matrix).clamp(0, 1)
         
         # Loss auf gemappten Vorhersagen (5 Klassen vs 5 Klassen)
         instrument_loss = F.binary_cross_entropy(instrument_pred, labels)
