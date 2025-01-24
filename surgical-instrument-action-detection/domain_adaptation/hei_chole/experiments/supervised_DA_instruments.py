@@ -18,7 +18,7 @@ class GradientReversalLayer(torch.autograd.Function):
         return -ctx.alpha * grad_output, None
 
 class DomainAdapter(nn.Module):
-    def __init__(self, yolo_path="/data/Bartscht/YOLO/best_v35.pt", num_classes=5):
+    def __init__(self, yolo_path="/data/Bartscht/YOLO/best_v35.pt", yolo_classes=6, target_classes=5):
         super().__init__()
         # Initialize YOLO model and force eval mode
         self.yolo = YOLO(yolo_path)
@@ -28,6 +28,15 @@ class DomainAdapter(nn.Module):
             param.requires_grad = False
         self.yolo_model.eval()
         self.feature_layer = 10
+        
+        # Mapping Matrix für die Konvertierung von YOLO zu HeiChole Klassen
+        self.register_buffer('mapping_matrix', torch.zeros(yolo_classes, target_classes))
+        self.mapping_matrix[0, 0] = 1  # grasper -> grasper
+        self.mapping_matrix[1, 2] = 1  # bipolar -> coagulation
+        self.mapping_matrix[2, 2] = 1  # hook -> coagulation
+        self.mapping_matrix[3, 3] = 1  # scissors -> scissors
+        self.mapping_matrix[4, 1] = 1  # clipper -> clipper
+        self.mapping_matrix[5, 4] = 1  # irrigator -> suction_irrigation
         
         self.feature_reducer = nn.Sequential(
             nn.Conv2d(512, 256, 1),
@@ -45,11 +54,12 @@ class DomainAdapter(nn.Module):
             nn.Sigmoid()
         )
         
+        # Instrument classifier mit konfigurierbarer Klassenzahl
         self.instrument_classifier = nn.Sequential(
             nn.Linear(256, 128),
             nn.ReLU(),
             nn.Dropout(0.5),
-            nn.Linear(128, num_classes),
+            nn.Linear(128, yolo_classes),  # Verwendet yolo_classes Parameter
             nn.Sigmoid()
         )
 
@@ -247,7 +257,11 @@ def main():
     train_loader = balanced_dataloader(split='train')
     val_loader = balanced_dataloader(split='val')
     
-    model = DomainAdapter().to(device)
+    model = DomainAdapter(
+        yolo_path="/data/Bartscht/YOLO/best_v35.pt",
+        yolo_classes=6,  # Anzahl der YOLO Klassen (TOOL_MAPPING)
+        target_classes=5  # Anzahl der HeiChole Klassen nach Mapping
+    ).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
     
     best_val_loss = float('inf')
