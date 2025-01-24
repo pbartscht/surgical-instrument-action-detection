@@ -99,60 +99,12 @@ class DomainAdapter(nn.Module):
         instrument_pred = self.instrument_classifier(features)
         
         return domain_pred, instrument_pred
-
-def validate_epoch(model, val_loader, device, epoch):
-    model.feature_reducer.eval()
-    model.domain_classifier.eval()
-    model.instrument_classifier.eval()
     
-    total_val_loss = 0
-    total_instrument_loss = 0
-    total_domain_loss = 0
-    
-    with torch.no_grad():
-        for batch_idx, batch in enumerate(val_loader):
-            images = batch['image'].to(device)
-            labels = batch['labels'].float().clamp(0, 1).to(device)
-            domains = batch['domain'].float().clamp(0, 1).to(device)
-            
-            p = epoch / 100
-            alpha = 2. / (1. + np.exp(-10 * p)) - 1
-            
-            # Features extrahieren
-            features = model.extract_features(images)
-            
-            # Domain Classification
-            domain_pred = model.domain_classifier(
-                GradientReversalLayer.apply(features, alpha)
-            ).clamp(1e-7, 1)
-            
-            # Instrument Classification (6 Klassen) und Mapping (5 Klassen)
-            yolo_instrument_pred = model.instrument_classifier(features).clamp(1e-7, 1)
-            
-            # Mapping mit anschließendem Clamp
-            instrument_pred = torch.matmul(yolo_instrument_pred, model.mapping_matrix).clamp(0, 1)
-            
-            # Loss Berechnung auf gemappten Vorhersagen
-            instrument_loss = F.binary_cross_entropy(instrument_pred, labels)
-            domain_loss = F.binary_cross_entropy(domain_pred.squeeze(), domains)
-            val_loss = instrument_loss + 0.3 * domain_loss
-            
-            total_val_loss += val_loss.item()
-            total_instrument_loss += instrument_loss.item()
-            total_domain_loss += domain_loss.item()
-    
-    avg_val_loss = total_val_loss / len(val_loader)
-    avg_instrument_loss = total_instrument_loss / len(val_loader)
-    avg_domain_loss = total_domain_loss / len(val_loader)
-    
-    wandb.log({
-        "val_total_loss": avg_val_loss,
-        "val_instrument_loss": avg_instrument_loss,
-        "val_domain_loss": avg_domain_loss,
-        "val_epoch": epoch
-    })
-    
-    return avg_val_loss
+def get_alpha(epoch, num_epochs=30):
+    p = epoch / num_epochs
+    # Linear von 0.1 bis 1.0
+    alpha = min(1.0, 0.1 + 0.9 * p)
+    return alpha
 
 def train_epoch(model, dataloader, optimizer, device, epoch, domain_lambda=0.3):
     model.feature_reducer.train()
@@ -168,8 +120,7 @@ def train_epoch(model, dataloader, optimizer, device, epoch, domain_lambda=0.3):
         labels = batch['labels'].float().clamp(0, 1).to(device)
         domains = batch['domain'].float().clamp(0, 1).to(device)
         
-        p = epoch / 300
-        alpha = max(0.1, 0.5 / (1. + np.exp(-3 * p)) - 0.25)
+        alpha = get_alpha(epoch)
         
         optimizer.zero_grad()
         
@@ -225,6 +176,61 @@ def train_epoch(model, dataloader, optimizer, device, epoch, domain_lambda=0.3):
     })
     
     return avg_loss
+
+def validate_epoch(model, val_loader, device, epoch):
+    model.feature_reducer.eval()
+    model.domain_classifier.eval()
+    model.instrument_classifier.eval()
+    
+    total_val_loss = 0
+    total_instrument_loss = 0
+    total_domain_loss = 0
+    
+    with torch.no_grad():
+        for batch_idx, batch in enumerate(val_loader):
+            images = batch['image'].to(device)
+            labels = batch['labels'].float().clamp(0, 1).to(device)
+            domains = batch['domain'].float().clamp(0, 1).to(device)
+            
+            alpha = get_alpha(epoch)
+            
+            # Features extrahieren
+            features = model.extract_features(images)
+            
+            # Domain Classification
+            domain_pred = model.domain_classifier(
+                GradientReversalLayer.apply(features, alpha)
+            ).clamp(1e-7, 1)
+            
+            # Instrument Classification (6 Klassen) und Mapping (5 Klassen)
+            yolo_instrument_pred = model.instrument_classifier(features).clamp(1e-7, 1)
+            
+            # Mapping mit anschließendem Clamp
+            instrument_pred = torch.matmul(yolo_instrument_pred, model.mapping_matrix).clamp(0, 1)
+            
+            # Loss Berechnung auf gemappten Vorhersagen
+            instrument_loss = F.binary_cross_entropy(instrument_pred, labels)
+            domain_loss = F.binary_cross_entropy(domain_pred.squeeze(), domains)
+            val_loss = instrument_loss + 0.3 * domain_loss
+            
+            total_val_loss += val_loss.item()
+            total_instrument_loss += instrument_loss.item()
+            total_domain_loss += domain_loss.item()
+    
+    avg_val_loss = total_val_loss / len(val_loader)
+    avg_instrument_loss = total_instrument_loss / len(val_loader)
+    avg_domain_loss = total_domain_loss / len(val_loader)
+    
+    wandb.log({
+        "val_total_loss": avg_val_loss,
+        "val_instrument_loss": avg_instrument_loss,
+        "val_domain_loss": avg_domain_loss,
+        "val_epoch": epoch
+    })
+    
+    return avg_val_loss
+
+
 
 def save_adapter(model, save_dir):
     try:
