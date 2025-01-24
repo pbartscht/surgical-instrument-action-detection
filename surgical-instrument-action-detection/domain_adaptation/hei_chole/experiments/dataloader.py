@@ -5,6 +5,7 @@ from pathlib import Path
 from label_loader import SurgicalDataset, TOOL_MAPPING, HEICHOLE_CLASSES
 import logging
 
+
 class BalancedBatchSampler(Sampler):
     """Sampler that ensures equal representation of both domains in each batch"""
     def __init__(self, dataset, batch_size=32):
@@ -97,16 +98,21 @@ class CombinedDataset(Dataset):
         
         return base_sample
 
-def test_dataloader():
+def balanced_dataloader(split='train', batch_size=32):
+    """
+    Erstellt einen balancierten DataLoader für Training, Validation oder Test
+    
+    Args:
+        split (str): 'train', 'val' oder 'test'
+        batch_size (int): Batch Size
+    """
     CONFIG = {
         'source_dir': Path("/data/Bartscht/CholecT50"),
-        'target_dir': Path("/data/Bartscht/HeiChole/domain_adaptation/train"),
-        'batch_size': 32
+        'target_dir': Path(f"/data/Bartscht/HeiChole/domain_adaptation/{split}"),
+        'batch_size': batch_size
     }
     
     combined_dataset = CombinedDataset(CONFIG['source_dir'], CONFIG['target_dir'])
-    
-    # Balanced Sampler verwenden
     balanced_sampler = BalancedBatchSampler(combined_dataset, CONFIG['batch_size'])
     
     dataloader = DataLoader(
@@ -115,29 +121,19 @@ def test_dataloader():
         num_workers=4
     )
     
-    # Test mehrere Batches
-    print("\nTeste Batch-Balance über mehrere Batches:")
-    total_source = 0
-    total_target = 0
-    
-    for batch_idx, batch in enumerate(dataloader):
-        if batch_idx >= 5:  # Teste erste 5 Batches
+    # Debug Info nur für Training ausgeben
+    if split == 'train':
+        for batch in dataloader:
+            print("\nErster Batch Shapes:")
+            for key, value in batch.items():
+                if torch.is_tensor(value):
+                    print(f"{key}: {value.shape}")
+                else:
+                    print(f"{key}: {type(value)} mit Länge {len(value)}")
             break
-            
-        domain_counts = torch.bincount(batch['domain'])
-        total_source += domain_counts[0].item()
-        total_target += domain_counts[1].item()
-        
-        print(f"\nBatch {batch_idx}:")
-        print(f"Source (CholecT50): {domain_counts[0].item()} samples")
-        print(f"Target (HeiChole): {domain_counts[1].item()} samples")
-    
-    print(f"\nGesamtverteilung über {batch_idx + 1} Batches:")
-    print(f"Source (CholecT50): {total_source//(batch_idx + 1)} samples pro Batch")
-    print(f"Target (HeiChole): {total_target//(batch_idx + 1)} samples pro Batch")
     
     return dataloader
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
-    dataloader = test_dataloader()
+    dataloader = balanced_dataloader()
