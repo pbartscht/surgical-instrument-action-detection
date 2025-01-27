@@ -109,8 +109,8 @@ class ModelLoader:
         # Verb model path
         self.verb_model_path = self.hierarchical_dir / "verb_recognition/checkpoints/jumping-tree-47/last.ckpt"
         
-        # Dataset path for HeiChole
-        self.dataset_path = Path("/data/Bartscht/HeiChole")
+        # Dataset path for HeiChole, wichtig hier ändern!! 
+        self.dataset_path = Path("/data/Bartscht/HeiChole/domain_adaptation/test")
         
         print(f"YOLO weights path: {self.yolo_weights}")
         print(f"Verb model path: {self.verb_model_path}")
