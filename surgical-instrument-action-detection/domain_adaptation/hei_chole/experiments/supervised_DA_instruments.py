@@ -331,7 +331,7 @@ def main():
     config = {
         "learning_rate": 0.001,
         "num_epochs": 30,
-        "batch_size": 32,  # Sollte mit dataloader übereinstimmen
+        "batch_size": 32,
         "domain_lambda": 0.3,
         "patience": 5,
         "yolo_classes": 6,
