@@ -37,88 +37,39 @@ class DomainAdapter(nn.Module):
         self.mapping_matrix[4, 1] = 1  # clipper -> clipper
         self.mapping_matrix[5, 4] = 1  # irrigator -> suction_irrigation
         
-        # Feature Reducer bleibt gleich
+        # Vereinfachter Feature Reducer
         self.feature_reducer = nn.Sequential(
-            nn.Conv2d(512, 384, 1),
-            nn.BatchNorm2d(384),
-            nn.SiLU(),
-            nn.Conv2d(384, 384, 3, padding=1),
-            nn.BatchNorm2d(384),
-            nn.SiLU(),
-            nn.Conv2d(384, 384, 3, padding=1, groups=4),
-            nn.BatchNorm2d(384),
-            nn.SiLU(),
-            nn.Conv2d(384, 256, 1),
+            nn.Conv2d(512, 256, 1),
             nn.BatchNorm2d(256),
-            nn.SiLU(),
+            nn.ReLU(),
             nn.Conv2d(256, 256, 3, padding=1),
             nn.BatchNorm2d(256),
-            nn.SiLU(),
+            nn.ReLU(),
             nn.AdaptiveAvgPool2d(1),
             nn.Flatten(),
             nn.Linear(256, 256),
-            nn.LayerNorm(256),
-            nn.SiLU(),
-            nn.Dropout(0.3)
+            nn.BatchNorm1d(256),
+            nn.ReLU(),
+            nn.Dropout(0.5)  # Erhöhter Dropout
         )
 
-        # Verbesserter Domain Classifier
+        # Vereinfachter Domain Classifier
         self.domain_classifier = nn.Sequential(
-            # Initial Feature Processing
-            nn.Linear(256, 384),
-            nn.LayerNorm(384),
-            nn.GELU(),
-            nn.Dropout(0.3),
-            
-            # Domain-Specific Feature Extraction
-            nn.Sequential(
-                nn.Linear(384, 384),
-                nn.LayerNorm(384),
-                nn.ReLU(),
-                nn.Linear(384, 384),
-                nn.LayerNorm(384)
-            ),  # Mit Residual Connection
-            
-            # Attention Mechanism
-            nn.Sequential(
-                nn.Linear(384, 96),  # Reduction
-                nn.ReLU(),
-                nn.Linear(96, 384),  # Expansion
-                nn.Sigmoid()
-            ),
-            
-            # Final Classification
-            nn.Linear(384, 128),
+            nn.Linear(256, 128),
+            nn.BatchNorm1d(128),
             nn.ReLU(),
             nn.Dropout(0.5),
             nn.Linear(128, 1),
             nn.Sigmoid()
         )
         
-        # Instrument Classifier bleibt wie in deinem Code
+        # Vereinfachter Instrument Classifier
         self.instrument_classifier = nn.Sequential(
-            nn.Linear(256, 512),
-            nn.LayerNorm(512),
-            nn.GELU(),
-            nn.Dropout(0.3),
-            nn.Sequential(
-                nn.Linear(512, 128),
-                nn.ReLU(),
-                nn.Linear(128, 512),
-                nn.Sigmoid(),
-            ),
-            nn.Linear(512, 384),
-            nn.LayerNorm(384),
-            nn.GELU(),
-            nn.Dropout(0.3),
-            nn.Sequential(
-                nn.Linear(384, 384),
-                nn.LayerNorm(384),
-                nn.ReLU(),
-                nn.Linear(384, 384),
-                nn.LayerNorm(384),
-            ),
-            nn.Linear(384, yolo_classes),
+            nn.Linear(256, 256),
+            nn.BatchNorm1d(256),
+            nn.ReLU(),
+            nn.Dropout(0.5),
+            nn.Linear(256, yolo_classes),
             nn.Sigmoid()
         )
 
@@ -180,10 +131,9 @@ class DomainAdapter(nn.Module):
         return self
     
 def get_alpha(epoch, num_epochs=30):
+    """Implementierung eines Warm-up Schedules für GRL"""
     p = epoch / num_epochs
-    # Linear von 0.1 bis 1.0
-    alpha = min(1.0, 0.1 + 0.9 * p)
-    return alpha
+    return 2. / (1. + np.exp(-10 * p)) - 1
 
 def train_epoch(model, dataloader, optimizer, device, epoch, domain_lambda=0.3):
     model.feature_reducer.train()
