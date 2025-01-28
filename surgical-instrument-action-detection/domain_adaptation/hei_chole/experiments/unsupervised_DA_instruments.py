@@ -6,6 +6,7 @@ from ultralytics import YOLO
 import numpy as np
 import wandb
 from pathlib import Path
+from torch.optim.lr_scheduler import ReduceLROnPlateau
 
 class GradientReversalLayer(torch.autograd.Function):
     @staticmethod
