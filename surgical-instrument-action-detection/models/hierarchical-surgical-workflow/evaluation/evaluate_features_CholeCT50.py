@@ -1,5 +1,4 @@
 import os
-import sys
 from pathlib import Path
 import torch
 import torch.nn as nn
@@ -15,166 +14,164 @@ import seaborn as sns
 class InstrumentFeatureExtractor(nn.Module):
     def __init__(self, yolo_path):
         super().__init__()
-        # YOLO Model initialisieren
         self.yolo = YOLO(yolo_path)
         self.yolo_model = self.yolo.model.model
-        self.feature_layer = 8  
+        self.feature_layer = 10
         
-        # YOLO Training deaktivieren
         for param in self.yolo_model.parameters():
             param.requires_grad = False
         self.yolo_model.eval()
-        
-    def forward(self, x):
-        features = None
+    
+    def extract_features(self, x):
+        """
+        Extrahiert nur die Features aus Layer 10
+        """
+        feature_map = None
         with torch.no_grad():
             for i, layer in enumerate(self.yolo_model):
                 x = layer(x)
                 if i == self.feature_layer:
-                    features = x.clone()
+                    feature_map = x.clone()
                     break
-        return features
+        
+        # Features flatten zu einem Vektor
+        batch_size, channels, height, width = feature_map.shape
+        flattened_features = feature_map.view(batch_size, -1)
+        
+        return flattened_features
     
-def visualize_feature_space(features_array, metadata, save_dir):
-    """
-    Visualisiert den Feature Space mittels t-SNE
-    """
+    def get_detections(self, x):
+        """
+        Führt nur die YOLO Detektionen durch
+        """
+        return self.yolo(x)
+
+def extract_and_visualize_features(video_path, yolo_path):
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Using device: {device}")
+    
+    feature_extractor = InstrumentFeatureExtractor(yolo_path).to(device)
+    
+    # Zwei separate Transforms: einer für YOLO (resized) und einer für Feature Extraction
+    yolo_transform = transforms.Compose([
+        transforms.Resize((640, 640)),  # YOLO erwartet 640x640
+        transforms.ToTensor(),
+    ])
+    
+    feature_transform = transforms.Compose([
+        transforms.ToTensor(),
+    ])
+    
+    all_features = []
+    all_labels = []
+    frame_indices = []  # Speichert den Frame-Index für jedes Feature
+    
+    print("\nExtrahiere Features aus Video...")
+    
+    frame_files = sorted([f for f in os.listdir(video_path) if f.endswith('.png')])
+    
+    for frame_idx, frame_file in enumerate(tqdm(frame_files)):
+        img_path = video_path / frame_file
+        img = Image.open(img_path).convert('RGB')
+        
+        # Bild für YOLO vorbereiten
+        yolo_input = yolo_transform(img).unsqueeze(0).to(device)
+        
+        # Bild für Feature Extraction vorbereiten
+        feature_input = feature_transform(img).unsqueeze(0).to(device)
+        
+        # Erst YOLO Detektionen durchführen
+        detections = feature_extractor.get_detections(yolo_input)
+        
+        # Dann Features extrahieren
+        if len(detections[0].boxes) > 0:  # Wenn Instrumente erkannt wurden
+            features = feature_extractor.extract_features(feature_input)
+            features_np = features.cpu().numpy()
+            
+            # Für jedes erkannte Instrument im Frame den Feature-Vektor wiederholen
+            frame_labels = [
+                detections[0].names[int(box.cls)].lower() 
+                for box in detections[0].boxes
+            ]
+            
+            # Features für jedes Label im Frame wiederholen
+            for _ in range(len(frame_labels)):
+                all_features.append(features_np)
+                frame_indices.append(frame_idx)
+            
+            all_labels.extend(frame_labels)
+    
+    if not all_features:
+        print("Keine Features extrahiert! Überprüfen Sie, ob Instrumente erkannt wurden.")
+        return None, None
+        
+    # Features zu Array zusammenfügen
+    features_array = np.concatenate(all_features, axis=0)
+    
+    print(f"\nExtrahierte Features Shape: {features_array.shape}")
+    print(f"Anzahl Labels: {len(all_labels)}")
+    
+    # Features und Labels speichern
+    save_dir = Path('feature_spaces')
+    save_dir.mkdir(exist_ok=True)
+    
+    np.savez(
+        save_dir / 'raw_instrument_features_Cholect50_VID92_layer10.npz',
+        features=features_array,
+        labels=all_labels,
+        frame_indices=frame_indices
+    )
+    
+    # Visualisierung
+    visualize_feature_space(features_array, all_labels)
+    
+    return features_array, all_labels
+
+def visualize_feature_space(features, labels):
     print("\nBeginne Feature Space Visualisierung...")
     
-    # Features vorbereiten
-    # Reshape features zu 2D Array (n_samples, n_features)
-    n_samples = features_array.shape[0]
-    flattened_features = features_array.reshape(n_samples, -1)
-    
-    # t-SNE Dimensionsreduktion
     print("Führe t-SNE Dimensionsreduktion durch...")
     tsne = TSNE(n_components=2, random_state=42, perplexity=30)
-    features_2d = tsne.fit_transform(flattened_features)
+    features_2d = tsne.fit_transform(features)
     
-    # Plot erstellen
     plt.figure(figsize=(12, 8))
     
-    # Verschiedene Videos mit unterschiedlichen Farben
-    unique_videos = list(set(metadata['video_names']))
-    colors = sns.color_palette('husl', n_colors=len(unique_videos))
+    unique_instruments = list(set(labels))
+    colors = sns.color_palette('husl', n_colors=len(unique_instruments))
     
-    # Plot für jedes Video
-    for idx, video in enumerate(unique_videos):
-        mask = [v == video for v in metadata['video_names']]
+    for idx, instrument in enumerate(unique_instruments):
+        mask = [label == instrument for label in labels]
         plt.scatter(
             features_2d[mask, 0],
             features_2d[mask, 1],
             c=[colors[idx]],
-            label=video,
+            label=instrument,
             alpha=0.6,
             s=50
         )
     
-    plt.title('Feature Space Visualization (pre-Domain Adaptation)')
+    plt.title('Raw Feature Space (Layer 10) nach Instrumententyp')
     plt.xlabel('t-SNE Component 1')
     plt.ylabel('t-SNE Component 2')
     plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
     plt.tight_layout()
     
-    # Plot speichern
-    plt.savefig(save_dir / 'feature_space_visualization.png', dpi=300, bbox_inches='tight')
-    plt.close()
-    
-    print(f"Visualisierung gespeichert in: {save_dir}/feature_space_visualization.png")
-    
-    # Zusätzliche Feature-Statistiken berechnen
-    print("\nFeature-Statistiken:")
-    feature_means = np.mean(flattened_features, axis=0)
-    feature_stds = np.std(flattened_features, axis=0)
-    print(f"Durchschnittliche Feature-Aktivierung: {np.mean(feature_means):.4f}")
-    print(f"Durchschnittliche Feature-Standardabweichung: {np.mean(feature_stds):.4f}")
-    
-    # Cluster-Analyse
-    from sklearn.metrics import silhouette_score
-    try:
-        silhouette_avg = silhouette_score(features_2d, metadata['video_names'])
-        print(f"Silhouette Score: {silhouette_avg:.4f}")
-    except:
-        print("Silhouette Score konnte nicht berechnet werden")
-
-def extract_cholect50_features():
-    # Pfade setzen
-    current_dir = Path(__file__).resolve().parent
-    hierarchical_dir = current_dir.parent
-    yolo_path = hierarchical_dir / "Instrument-classification-detection/weights/instrument_detector/best_v35.pt"
-    dataset_path = Path("/data/Bartscht/CholecT50")
-    
-    # Device setup
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Using device: {device}")
-    
-    # Feature Extractor initialisieren
-    feature_extractor = InstrumentFeatureExtractor(yolo_path).to(device)
-    
-    # Bildtransformationen
-    transform = transforms.Compose([
-        transforms.ToTensor(),
-    ])
-    
-    # Listen für Features und Metadata initialisieren
-    all_features = []
-    all_video_names = []
-    all_frame_numbers = []
-    
-    print("\nExtrahiere Features aus CholecT50...")
-    
-    # Verarbeite die spezifizierten Videos
-    for video in ["VID92", "VID96", "VID103", "VID110", "VID111"]:
-        print(f"\nVerarbeite Video {video}...")
-        video_folder = dataset_path / "videos" / video
-        
-        if not video_folder.exists():
-            print(f"Warnung: Video-Ordner {video} nicht gefunden")
-            continue
-            
-        frame_files = sorted([f for f in os.listdir(video_folder) if f.endswith('.png')])
-        
-        for frame_file in tqdm(frame_files, desc=f"Extrahiere Features aus {video}"):
-            # Bild laden und vorbereiten
-            img_path = video_folder / frame_file
-            img = Image.open(img_path).convert('RGB')
-            img_tensor = transform(img).unsqueeze(0).to(device)
-            
-            # Features extrahieren
-            features = feature_extractor(img_tensor)
-            
-            # Features für spätere Verarbeitung speichern
-            all_features.append(features.cpu().numpy())
-            all_video_names.append(video)
-            all_frame_numbers.append(int(frame_file.split('.')[0]))
-    
-    # Features zu einem Array zusammenfügen
-    features_array = np.concatenate(all_features, axis=0)
-    
-    # Metadata erstellen
-    metadata = {
-        'video_names': all_video_names,
-        'frame_numbers': all_frame_numbers
-    }
-    
-    # Features und Metadata speichern
     save_dir = Path('feature_spaces')
     save_dir.mkdir(exist_ok=True)
+    plt.savefig(save_dir / 'raw_feature_space.png', dpi=300, bbox_inches='tight')
+    plt.close()
     
-    np.savez(
-        save_dir / 'cholect50_instrument_features.npz',
-        features=features_array,
-        video_names=all_video_names,
-        frame_numbers=all_frame_numbers
-    )
+    print(f"Visualisierung gespeichert in: {save_dir}/raw_feature_space.png")
     
-    print(f"\nFeatures wurden gespeichert in: {save_dir}/cholect50_instrument_features.npz")
-    print(f"Feature Shape: {features_array.shape}")
-    
-    # Feature Space visualisieren
-    visualize_feature_space(features_array, metadata, save_dir)
-    
-    return features_array, metadata
+    print("\nFeature-Statistiken:")
+    print(f"Feature Dimensionalität: {features.shape[1]}")
+    print("Anzahl Features pro Instrument:")
+    for instrument in unique_instruments:
+        count = sum(1 for label in labels if label == instrument)
+        print(f"- {instrument}: {count}")
 
 if __name__ == "__main__":
-    features, metadata = extract_cholect50_features()
+    video_path = Path("/data/Bartscht/CholecT50/videos/VID92")
+    yolo_path = Path("/data/Bartscht/YOLO/best_v35.pt")
+    
+    features, labels = extract_and_visualize_features(video_path, yolo_path)
