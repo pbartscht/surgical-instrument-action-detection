@@ -10,13 +10,15 @@ from PIL import Image
 from sklearn.manifold import TSNE
 import matplotlib.pyplot as plt
 import seaborn as sns
+import torch.nn as nn
+from ultralytics.nn.modules.conv import Concat
 
 class InstrumentFeatureExtractor(nn.Module):
     def __init__(self, yolo_path):
         super().__init__()
         self.yolo = YOLO(yolo_path)
         self.yolo_model = self.yolo.model.model
-        self.feature_layer = 10
+        self.feature_layer = 19
         
         for param in self.yolo_model.parameters():
             param.requires_grad = False
@@ -24,17 +26,30 @@ class InstrumentFeatureExtractor(nn.Module):
     
     def extract_features(self, x):
         """
-        Extrahiert nur die Features aus Layer 10
+        Extrahiert Features aus einem höheren Layer mit Concat-Operationen
         """
         feature_map = None
+        intermediate_outputs = []
+        
         with torch.no_grad():
             for i, layer in enumerate(self.yolo_model):
-                x = layer(x)
+                if isinstance(layer, nn.modules.upsampling.Upsample):
+                    x = layer(x)
+                elif isinstance(layer, Concat):  # Hier die korrigierte Typprüfung
+                    x = torch.cat(intermediate_outputs[-2:], dim=1)
+                    intermediate_outputs = []
+                else:
+                    x = layer(x)
+                    
                 if i == self.feature_layer:
                     feature_map = x.clone()
                     break
+                    
+                intermediate_outputs.append(x)
         
-        # Features flatten zu einem Vektor
+        if feature_map is None:
+            raise ValueError(f"Layer {self.feature_layer} wurde nicht erreicht")
+        
         batch_size, channels, height, width = feature_map.shape
         flattened_features = feature_map.view(batch_size, -1)
         
@@ -116,7 +131,7 @@ def extract_and_visualize_features(video_path, yolo_path):
     save_dir.mkdir(exist_ok=True)
     
     np.savez(
-        save_dir / 'raw_instrument_features_Cholect50_VID92_layer10.npz',
+        save_dir / 'raw_instrument_features_Cholect50_VID92_layer19.npz',
         features=features_array,
         labels=all_labels,
         frame_indices=frame_indices
@@ -150,7 +165,7 @@ def visualize_feature_space(features, labels):
             s=50
         )
     
-    plt.title('Raw Feature Space (Layer 10) nach Instrumententyp')
+    plt.title('Raw Feature Space (Layer 19) nach Instrumententyp')
     plt.xlabel('t-SNE Component 1')
     plt.ylabel('t-SNE Component 2')
     plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
@@ -158,10 +173,10 @@ def visualize_feature_space(features, labels):
     
     save_dir = Path('feature_spaces')
     save_dir.mkdir(exist_ok=True)
-    plt.savefig(save_dir / 'raw_feature_space.png', dpi=300, bbox_inches='tight')
+    plt.savefig(save_dir / 'raw_feature_space_19.png', dpi=300, bbox_inches='tight')
     plt.close()
     
-    print(f"Visualisierung gespeichert in: {save_dir}/raw_feature_space.png")
+    print(f"Visualisierung gespeichert in: {save_dir}/raw_feature_space_19.png")
     
     print("\nFeature-Statistiken:")
     print(f"Feature Dimensionalität: {features.shape[1]}")
