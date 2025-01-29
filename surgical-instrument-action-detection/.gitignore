@@ -57,3 +57,6 @@ temp/
 *.hdf5
 checkpoints/
 weights/
+
+
+*.npz
