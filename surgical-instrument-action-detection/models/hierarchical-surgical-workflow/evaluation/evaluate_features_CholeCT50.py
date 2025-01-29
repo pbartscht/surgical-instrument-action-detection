@@ -18,7 +18,7 @@ class InstrumentFeatureExtractor(nn.Module):
         super().__init__()
         self.yolo = YOLO(yolo_path)
         self.yolo_model = self.yolo.model.model
-        self.feature_layer = 19
+        self.feature_layer = 16
         
         for param in self.yolo_model.parameters():
             param.requires_grad = False
@@ -26,32 +26,60 @@ class InstrumentFeatureExtractor(nn.Module):
     
     def extract_features(self, x):
         """
-        Extrahiert Features aus einem höheren Layer mit Concat-Operationen
+        Extrahiert Features mit korrektem Handling verschiedener Feature Map Größen
         """
         feature_map = None
         intermediate_outputs = []
         
+        print("\n=== Starting Feature Extraction ===")
+        print(f"Initial input shape: {x.shape}")
+        
         with torch.no_grad():
             for i, layer in enumerate(self.yolo_model):
+                print(f"\nProcessing Layer {i} ({type(layer).__name__}):")
+                print(f"Input shape: {x.shape}")
+                
                 if isinstance(layer, nn.modules.upsampling.Upsample):
                     x = layer(x)
-                elif isinstance(layer, Concat):  # Hier die korrigierte Typprüfung
-                    x = torch.cat(intermediate_outputs[-2:], dim=1)
-                    intermediate_outputs = []
+                    print(f"After Upsample: {x.shape}")
+                    intermediate_outputs.append(x)
+                    
+                elif isinstance(layer, Concat):
+                    print("Concat operation:")
+                    tensors_to_cat = intermediate_outputs[-2:]
+                    for idx, tensor in enumerate(tensors_to_cat):
+                        print(f"  Tensor {idx} shape: {tensor.shape}")
+                    
+                    # Resize den zweiten Tensor auf die Größe des ersten
+                    target_size = tensors_to_cat[0].shape[-2:]  # Nimm die räumlichen Dimensionen des ersten Tensors
+                    tensors_to_cat[1] = nn.functional.interpolate(
+                        tensors_to_cat[1],
+                        size=target_size,
+                        mode='bilinear',
+                        align_corners=False
+                    )
+                    print(f"  After resize: {tensors_to_cat[1].shape}")
+                    
+                    x = torch.cat(tensors_to_cat, dim=1)
+                    print(f"  After concat: {x.shape}")
+                    intermediate_outputs = [x]
+                    
                 else:
                     x = layer(x)
-                    
+                    intermediate_outputs.append(x)
+                
                 if i == self.feature_layer:
+                    print(f"\nReached target layer {i}")
+                    print(f"Feature map shape: {x.shape}")
                     feature_map = x.clone()
                     break
-                    
-                intermediate_outputs.append(x)
         
         if feature_map is None:
             raise ValueError(f"Layer {self.feature_layer} wurde nicht erreicht")
         
         batch_size, channels, height, width = feature_map.shape
         flattened_features = feature_map.view(batch_size, -1)
+        print(f"\nFinal flattened feature shape: {flattened_features.shape}")
         
         return flattened_features
     
@@ -131,7 +159,7 @@ def extract_and_visualize_features(video_path, yolo_path):
     save_dir.mkdir(exist_ok=True)
     
     np.savez(
-        save_dir / 'raw_instrument_features_Cholect50_VID92_layer19.npz',
+        save_dir / 'raw_instrument_features_Cholect50_VID92_layer16.npz',
         features=features_array,
         labels=all_labels,
         frame_indices=frame_indices
@@ -165,7 +193,7 @@ def visualize_feature_space(features, labels):
             s=50
         )
     
-    plt.title('Raw Feature Space (Layer 19) nach Instrumententyp')
+    plt.title('Raw Feature Space (Layer 16) nach Instrumententyp')
     plt.xlabel('t-SNE Component 1')
     plt.ylabel('t-SNE Component 2')
     plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
@@ -173,10 +201,10 @@ def visualize_feature_space(features, labels):
     
     save_dir = Path('feature_spaces')
     save_dir.mkdir(exist_ok=True)
-    plt.savefig(save_dir / 'raw_feature_space_19.png', dpi=300, bbox_inches='tight')
+    plt.savefig(save_dir / 'raw_feature_space_16.png', dpi=300, bbox_inches='tight')
     plt.close()
     
-    print(f"Visualisierung gespeichert in: {save_dir}/raw_feature_space_19.png")
+    print(f"Visualisierung gespeichert in: {save_dir}/raw_feature_space_16.png")
     
     print("\nFeature-Statistiken:")
     print(f"Feature Dimensionalität: {features.shape[1]}")
