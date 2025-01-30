@@ -174,7 +174,7 @@ def visualize_feature_space(features, labels):
     print("\nBeginne Feature Space Visualisierung...")
     
     print("Führe t-SNE Dimensionsreduktion durch...")
-    tsne = TSNE(n_components=2, random_state=42, perplexity=30)
+    tsne = TSNE(n_components=2, random_state=42, perplexity=100)
     features_2d = tsne.fit_transform(features)
     
     plt.figure(figsize=(12, 8))
