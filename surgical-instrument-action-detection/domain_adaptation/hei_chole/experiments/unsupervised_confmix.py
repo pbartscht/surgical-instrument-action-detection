@@ -134,10 +134,7 @@ class ConfMixTrainer:
         self.model.to(self.device)
         
         # Initialize datasets
-        self.cholect50_dataset = YOLODataset(
-            img_path=os.path.join(CHOLECT50_PATH, 'images/train'),
-            label_path=os.path.join(CHOLECT50_PATH, 'labels/train')
-        )
+        data_config = os.path.join(CHOLECT50_PATH, 'data.yaml')
         
         self.mixed_dataset = MixedSamplesDataset(mixed_samples_path)
         
