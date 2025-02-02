@@ -250,7 +250,7 @@ class DomainAdapter(nn.Module):
                 return None, reduced_features
             return None
 
-class DomainAdaptedYOLO(nn.Module):
+class xDomainAdaptedYOLO(nn.Module):
     def __init__(self, yolo_model, feature_reducer):
         super().__init__()
         self.yolo_model = yolo_model.model
@@ -333,7 +333,69 @@ class DomainAdaptedYOLO(nn.Module):
                 features.append(x)
             
             return x
-
+class DomainAdaptedYOLO(nn.Module):
+    def __init__(self, yolo_model, feature_reducer):
+        super().__init__()
+        self.yolo_model = yolo_model.model
+        self.feature_layer = 8
+        
+        # Feature reducer und Channel Matcher
+        self.feature_reducer = feature_reducer
+        self.channel_matcher = nn.Sequential(
+            nn.Conv2d(256, 512, 1, bias=False),
+            nn.BatchNorm2d(512),
+            nn.SiLU()
+        )
+        
+        # Upsampling für Feature Map Anpassungen
+        self.upsample = nn.Upsample(scale_factor=2, mode='nearest')
+        
+        self.eval()
+        for param in self.parameters():
+            param.requires_grad = False
+            
+    def forward(self, x):
+        with torch.no_grad():
+            features = []
+            feature_maps = []  # Speichert Feature Maps für Multi-Scale Detection
+            
+            # Forward bis Layer 8 (C3k2 Block)
+            for i, layer in enumerate(self.yolo_model.model):
+                if isinstance(layer, ultralytics.nn.modules.conv.Concat):
+                    # Korrekte Handhabung der Concat-Operation
+                    tensors_to_cat = [x]
+                    if hasattr(layer, 'd'):
+                        for j in range(layer.d):
+                            if j < len(features):
+                                tensors_to_cat.append(features[-(j+1)])
+                    x = torch.cat(tensors_to_cat, dim=1)  # Konkateniere entlang der Channel-Dimension
+                elif isinstance(layer, ultralytics.nn.modules.block.C3k2):
+                    x = layer(x)
+                    if i <= self.feature_layer:
+                        if i == self.feature_layer:
+                            # Feature Reduction und Channel Matching
+                            x_adapted = self.feature_reducer(x)
+                            x = self.channel_matcher(x_adapted)
+                    feature_maps.append(x.clone())
+                elif isinstance(layer, ultralytics.nn.modules.head.Detect):
+                    # Multi-Scale Detection Handling
+                    detection_features = []
+                    base_size = feature_maps[-1].shape[-1]
+                    
+                    for feat in feature_maps[-3:]:  # Letzte 3 Feature Maps
+                        if feat.shape[-1] != base_size:
+                            feat = self.upsample(feat)
+                        detection_features.append(feat)
+                    
+                    x = layer(detection_features)
+                    break
+                else:
+                    x = layer(x)
+                
+                features.append(x)
+            
+            return x
+              
 class HeiCholeEvaluator:
     def __init__(self, yolo_model, dataset_dir):
         """
@@ -464,6 +526,9 @@ class HeiCholeEvaluator:
         
 class EnhancedHeiCholeEvaluator(HeiCholeEvaluator):
     def __init__(self, yolo_model, domain_adapter, dataset_dir):
+        """
+        Initialize the evaluator with both base YOLO and domain-adapted YOLO.
+        """
         super().__init__(yolo_model, dataset_dir)
         
         # Ensure domain adapter is in eval mode
@@ -471,28 +536,32 @@ class EnhancedHeiCholeEvaluator(HeiCholeEvaluator):
         for param in domain_adapter.parameters():
             param.requires_grad = False
         
-        # Create adapted YOLO model and ensure it's in eval mode
+        # Create adapted YOLO model
         self.adapted_model = DomainAdaptedYOLO(
-            yolo_model,
-            domain_adapter.feature_reducer
+            yolo_model=yolo_model,
+            feature_reducer=domain_adapter.feature_reducer
         ).to(self.device)
         
-        # Double-check everything is in eval mode
+        # Ensure evaluation mode
         self.adapted_model.eval()
         for param in self.adapted_model.parameters():
             param.requires_grad = False
 
     def evaluate_frame_both_models(self, img_path, ground_truth, save_visualization=True):
-        """Evaluates a frame with both baseline and domain-adapted models"""
+        """
+        Run both baseline and adapted models on the same frame and return predictions.
+        """
         frame_number = int(os.path.basename(img_path).split('.')[0])
         video_name = os.path.basename(os.path.dirname(img_path))
         
-        # Get baseline predictions
+        # Get baseline predictions using parent class method
         baseline_predictions = self.evaluate_frame(img_path, ground_truth, save_visualization)
         
-        # Process with adapted model
+        # Get adapted model predictions
         adapted_predictions = []
+        
         try:
+            # Load and preprocess image
             img = Image.open(img_path)
             transform = transforms.Compose([
                 transforms.ToTensor(),
@@ -503,9 +572,8 @@ class EnhancedHeiCholeEvaluator(HeiCholeEvaluator):
             ])
             img_tensor = transform(img).unsqueeze(0).to(self.device)
             
-            # Get predictions from adapted model - ensure no gradients
+            # Run adapted model
             with torch.no_grad():
-                # Forward pass through adapted model
                 adapted_output = self.adapted_model(img_tensor)
                 
                 # Process detections
@@ -517,22 +585,21 @@ class EnhancedHeiCholeEvaluator(HeiCholeEvaluator):
                         if instrument_class in IGNORED_INSTRUMENTS:
                             continue
                             
-                        try:
-                            cholect50_instrument = TOOL_MAPPING[instrument_class]
-                        except KeyError:
+                        cholect50_instrument = TOOL_MAPPING.get(instrument_class)
+                        if not cholect50_instrument:
                             continue
                         
                         mapped_instrument = CHOLECT50_TO_HEICHOLE_INSTRUMENT_MAPPING.get(cholect50_instrument)
-                        
                         if mapped_instrument:
-                            adapted_predictions.append({
+                            prediction = {
                                 'frame_id': f"{video_name}_frame{frame_number}",
                                 'instrument': {
                                     'name': mapped_instrument,
                                     'confidence': confidence,
-                                    'binary_pred': 1 if confidence >= CONFIDENCE_THRESHOLD else 0
+                                    'binary_pred': 1
                                 }
-                            })
+                            }
+                            adapted_predictions.append(prediction)
                     
         except Exception as e:
             print(f"Error processing adapted model for frame {frame_number}: {str(e)}")
@@ -627,21 +694,117 @@ class DebugYOLO(nn.Module):
         super().__init__()
         self.yolo_model = yolo_model.model
         
-    def forward(self, x):
+    def forward(self, x, frame_number=None):
         features = []
-        print("\nStarting debug forward pass:")
+        debug_info = {
+            'layer_outputs': [],
+            'concat_operations': [],
+            'feature_maps': []
+        }
+        
+        print(f"\nStarting debug forward pass for frame {frame_number}:")
+        print(f"Input shape: {x.shape}")
+        
+        # Track all feature maps for multi-scale detection
+        feature_maps = []
+        
         for i, layer in enumerate(self.yolo_model.model):
-            if i <= 9:  # Wir schauen uns bis Layer 9 an
+            layer_info = {
+                'layer_idx': i,
+                'layer_type': str(type(layer).__name__),
+                'input_shape': x.shape
+            }
+            
+            if isinstance(layer, ultralytics.nn.modules.conv.Concat):
+                print(f"\nLayer {i} (Concat):")
+                print(f"Input shape: {x.shape}")
+                print(f"Concat dimension: {layer.d}")
+                print(f"Features to concat from: {[f.shape for f in features[-layer.d:]]}")
+                
+                x = torch.cat([x] + features[-layer.d:], 1)
+                print(f"Output shape after concat: {x.shape}")
+                
+                layer_info['concat_info'] = {
+                    'dimension': layer.d,
+                    'input_features': [f.shape for f in features[-layer.d:]],
+                    'output_shape': x.shape
+                }
+                
+            elif isinstance(layer, ultralytics.nn.modules.block.C3k2):
+                print(f"\nLayer {i} (C3k2):")
+                print(f"Input shape: {x.shape}")
                 x = layer(x)
-                print(f"\nLayer {i}:")
-                print(f"Type: {type(layer)}")
                 print(f"Output shape: {x.shape}")
-                if i == 8:
+                
+                if i == 8:  # Feature reduction layer
                     print("\n=== FEATURE REDUCER WOULD GO HERE ===")
                     print(f"Input to feature reducer: {x.shape}")
-                features.append(x)
-        return x
-    
+                    feature_maps.append(x.clone())
+                    
+            elif isinstance(layer, ultralytics.nn.modules.head.Detect):
+                print(f"\nLayer {i} (Detect):")
+                print(f"Input shape: {x.shape}")
+                print(f"Available feature maps: {[fm.shape for fm in feature_maps]}")
+                
+                detection_features = []
+                base_size = feature_maps[-1].shape[-1]
+                
+                for feat in feature_maps[-3:]:
+                    if feat.shape[-1] != base_size:
+                        feat = F.interpolate(feat, size=(base_size, base_size), mode='nearest')
+                    detection_features.append(feat)
+                
+                print(f"Detection feature shapes: {[df.shape for df in detection_features]}")
+                x = layer(detection_features)
+            
+            else:
+                x = layer(x)
+            
+            layer_info['output_shape'] = x.shape
+            debug_info['layer_outputs'].append(layer_info)
+            features.append(x)
+            
+            # Print detailed shape information for every layer
+            print(f"Layer {i} ({layer_info['layer_type']}):")
+            print(f"  Input shape:  {layer_info['input_shape']}")
+            print(f"  Output shape: {layer_info['output_shape']}")
+            print("-" * 50)
+        
+        return x, debug_info
+
+def debug_frame(model, frame_path, frame_number):
+    try:
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        
+        img = Image.open(frame_path)
+        transform = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize(
+                mean=[0.485, 0.456, 0.406],
+                std=[0.229, 0.224, 0.225]
+            )
+        ])
+        
+        # Explicitly move tensor to the same device as the model
+        img_tensor = transform(img).unsqueeze(0).to(device)
+        
+        # Ensure the model is on the same device
+        model = model.to(device)
+        
+        print(f"\nDEBUGGING FRAME {frame_number}")
+        print("=" * 50)
+        print(f"Input tensor device: {img_tensor.device}")
+        print(f"Model device: {next(model.parameters()).device}")
+        
+        with torch.no_grad():
+            output, debug_info = model(img_tensor, frame_number)
+        
+        return debug_info
+        
+    except Exception as e:
+        print(f"Error during debug of frame {frame_number}: {str(e)}")
+        return None
+
 def main():
     """Compare baseline and domain-adapted models on HeiChole dataset"""
     try:
@@ -657,13 +820,37 @@ def main():
         print("\nStarting Debug Analysis...")
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         debug_model = DebugYOLO(yolo_model).to(device)
-        with torch.no_grad():
-            test_input = torch.randn(1, 3, 512, 512).to(device)
-            output = debug_model(test_input)
-        print("\nDebug Analysis Complete")
+        #with torch.no_grad():
+         #   test_input = torch.randn(1, 3, 512, 512).to(device)
+          #  output = debug_model(test_input)
+        #print("\nDebug Analysis Complete")
 
         dataset_dir = str(loader.dataset_path)
         
+        frames_to_debug = [
+            {'frame': '030300', 'status': 'unknown'},
+            {'frame': '030325', 'status': 'unknown'},  # Nehmen Sie einen erfolgreichen Nachbarframe
+            {'frame': '030350', 'status': 'unknown'},
+            {'frame': '030375', 'status': 'unknown'}
+        ]
+        
+        # Debug jeden Frame
+        for frame_info in frames_to_debug:
+            frame_number = frame_info['frame']
+            frame_path = os.path.join(dataset_dir, "Videos", "VID08", f"{frame_number}.png")
+            debug_info = debug_frame(debug_model, frame_path, frame_number)
+            
+            print(f"\nDebug results for frame {frame_number} ({frame_info['status']}):")
+            print("=" * 50)
+            if debug_info:
+                # Analysieren Sie die Layer-Outputs
+                for layer in debug_info['layer_outputs']:
+                    if isinstance(layer['layer_type'], ultralytics.nn.modules.conv.Concat):
+                        print(f"Concat Layer {layer['layer_idx']}:")
+                        print(f"Input shapes: {layer['concat_info']['input_features']}")
+                        print(f"Output shape: {layer['concat_info']['output_shape']}")
+
+
         # Load domain adapter in eval mode
         domain_adapter = DomainAdapter(str(loader.yolo_weights))
         adapter_weights = torch.load(
