@@ -339,61 +339,14 @@ class DomainAdaptedYOLO(nn.Module):
         self.yolo_model = yolo_model.model
         self.feature_layer = 8
         
-        # Feature reducer und Channel Matcher
-        self.feature_reducer = feature_reducer
-        self.channel_matcher = nn.Sequential(
-            nn.Conv2d(256, 512, 1, bias=False),
-            nn.BatchNorm2d(512),
-            nn.SiLU()
-        )
-        
-        # Upsampling für Feature Map Anpassungen
-        self.upsample = nn.Upsample(scale_factor=2, mode='nearest')
-        
-        self.eval()
-        for param in self.parameters():
-            param.requires_grad = False
-            
-    def forward(self, x):
-        with torch.no_grad():
-            features = []
-            feature_maps = []  # Speichert Feature Maps für Multi-Scale Detection
-            
-            # Forward bis Layer 8 (C3k2 Block)
+        def forward(self, x):
             for i, layer in enumerate(self.yolo_model.model):
-                if isinstance(layer, ultralytics.nn.modules.conv.Concat):
-                    # Korrekte Handhabung der Concat-Operation
-                    tensors_to_cat = [x]
-                    if hasattr(layer, 'd'):
-                        for j in range(layer.d):
-                            if j < len(features):
-                                tensors_to_cat.append(features[-(j+1)])
-                    x = torch.cat(tensors_to_cat, dim=1)  # Konkateniere entlang der Channel-Dimension
-                elif isinstance(layer, ultralytics.nn.modules.block.C3k2):
-                    x = layer(x)
-                    if i <= self.feature_layer:
-                        if i == self.feature_layer:
-                            # Feature Reduction und Channel Matching
-                            x_adapted = self.feature_reducer(x)
-                            x = self.channel_matcher(x_adapted)
-                    feature_maps.append(x.clone())
-                elif isinstance(layer, ultralytics.nn.modules.head.Detect):
-                    # Multi-Scale Detection Handling
-                    detection_features = []
-                    base_size = feature_maps[-1].shape[-1]
-                    
-                    for feat in feature_maps[-3:]:  # Letzte 3 Feature Maps
-                        if feat.shape[-1] != base_size:
-                            feat = self.upsample(feat)
-                        detection_features.append(feat)
-                    
-                    x = layer(detection_features)
-                    break
-                else:
-                    x = layer(x)
+                x = layer(x)
                 
-                features.append(x)
-            
+                if i == self.feature_layer:
+                    # Domäneninvariante Feature-Transformation
+                    x = self.feature_reducer(x)
+                
             return x
               
 class HeiCholeEvaluator:

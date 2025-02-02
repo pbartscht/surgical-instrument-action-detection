@@ -47,23 +47,31 @@ class SpatialDomainAdapter(nn.Module):
             param.requires_grad = False
         self.yolo_model.eval()
         
-        # Spatial Feature Reducer (behält räumliche Dimensionen)
+        # Optimierter Feature Reducer (bleibt bei 512 Kanälen)
         self.feature_reducer = nn.Sequential(
-            nn.Conv2d(512, 256, 1),
-            nn.BatchNorm2d(256),
+            # 1x1 Convolution zur subtilen Feature-Transformation
+            nn.Conv2d(512, 512, kernel_size=1),
+            nn.BatchNorm2d(512),
             nn.ReLU(),
-            ResidualBlock(256, 256),
-            nn.Conv2d(256, 256, 3, padding=1, groups=4),
-            nn.BatchNorm2d(256),
+            
+            # Residual Block für Informationserhalt
+            ResidualBlock(512, 512),
+            
+            # Gruppierte Convolution für effiziente Feature-Extraktion
+            nn.Conv2d(512, 512, 
+                      kernel_size=3, 
+                      padding=1, 
+                      groups=32),  # Gruppierte Convolution
+            nn.BatchNorm2d(512),
             nn.ReLU()
         )
 
-        # Spatial Domain Classifier
+        # Spatial Domain Classifier (angepasst für 512 Kanäle)
         self.domain_classifier = nn.Sequential(
-            nn.Conv2d(256, 128, 1),
-            nn.BatchNorm2d(128),
+            nn.Conv2d(512, 256, 1),
+            nn.BatchNorm2d(256),
             nn.ReLU(),
-            nn.Conv2d(128, 1, 1),
+            nn.Conv2d(256, 1, 1),
             nn.Sigmoid()
         )
 
