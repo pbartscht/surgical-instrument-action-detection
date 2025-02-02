@@ -5,6 +5,7 @@ import torch
 import numpy as np
 from collections import defaultdict
 from ultralytics import YOLO
+import ultralytics.nn.modules.conv
 import torch
 import torch.nn as nn
 from PIL import Image, ImageDraw
@@ -217,8 +218,8 @@ class DomainAdapter(nn.Module):
         # Disable YOLO training
         for param in self.yolo_model.parameters():
             param.requires_grad = False
-        
-        # Feature Reducer
+            
+        # Feature Reducer that maintains spatial dimensions
         self.feature_reducer = nn.Sequential(
             nn.Conv2d(512, 256, 1),
             nn.BatchNorm2d(256),
@@ -226,10 +227,7 @@ class DomainAdapter(nn.Module):
             ResidualBlock(256, 256),
             nn.Conv2d(256, 256, 3, padding=1, groups=4),
             nn.BatchNorm2d(256),
-            nn.ReLU(),
-            # Note: AdaptiveAvgPool2d and Flatten are only used during training
-            nn.AdaptiveAvgPool2d(1),
-            nn.Flatten()
+            nn.ReLU()
         )
         
         # Ensure evaluation mode
@@ -259,65 +257,80 @@ class DomainAdaptedYOLO(nn.Module):
         self.feature_layer = 8
         
         # Split YOLO layers
-        self.pre_feature_layers = nn.ModuleList([
-            layer for i, layer in enumerate(self.yolo_model.model) 
-            if i <= self.feature_layer
-        ])
-        self.post_feature_layers = nn.ModuleList([
-            layer for i, layer in enumerate(self.yolo_model.model) 
-            if i > self.feature_layer
-        ])
+        self.pre_feature_layers = nn.ModuleList()
+        self.post_feature_layers = nn.ModuleList()
+        self.concat_dims = {}  # Speichere die erwarteten Dimensionen für Concat-Layer
         
-        # Modified feature reducer for inference (removing pooling/flatten)
-        self.feature_reducer = self._modify_feature_reducer(feature_reducer)
+        # Carefully split the model to maintain skip connections
+        for i, layer in enumerate(self.yolo_model.model):
+            if i <= self.feature_layer:
+                self.pre_feature_layers.append(layer)
+            else:
+                if isinstance(layer, ultralytics.nn.modules.conv.Concat):
+                    # Speichere die erwarteten Dimensionen
+                    self.concat_dims[len(self.post_feature_layers)] = layer.d
+                self.post_feature_layers.append(layer)
+        
+        # Feature reducer (512 -> 256)
+        self.feature_reducer = feature_reducer
+        
+        # Channel matcher (256 -> 512)
+        self.channel_matcher = nn.Sequential(
+            nn.Conv2d(256, 512, 1, bias=False),
+            nn.BatchNorm2d(512),
+            nn.SiLU()
+        )
+        
+        # Additional layers to handle dimension changes
+        self.dim_adjusters = nn.ModuleDict({
+            'concat_1': nn.Conv2d(512, 768, 1),  # Für erste Konkatenation
+            'concat_2': nn.Conv2d(512, 768, 1),  # Für zweite Konkatenation
+        })
         
         # Ensure evaluation mode
         self._freeze_all_layers()
     
-    def _modify_feature_reducer(self, original_reducer):
-        """Creates inference version of feature reducer without pooling/flatten"""
-        # Create new sequential without final pooling/flatten
-        layers = []
-        for layer in original_reducer:
-            if not isinstance(layer, (nn.AdaptiveAvgPool2d, nn.Flatten)):
-                layers.append(layer)
-        
-        # Add final conv to match YOLO's expected channels
-        layers.append(nn.Conv2d(256, 512, 1))  # Restore channel dimension to 512
-        
-        # Create new sequential model
-        inference_reducer = nn.Sequential(*layers)
-        
-        # Copy weights from original layers
-        with torch.no_grad():
-            for i, layer in enumerate(layers[:-1]):  # Exclude final conv
-                if hasattr(layer, 'weight'):
-                    layer.weight.copy_(original_reducer[i].weight)
-                if hasattr(layer, 'bias'):
-                    layer.bias.copy_(original_reducer[i].bias)
-        
-        return inference_reducer
-    
     def _freeze_all_layers(self):
-        """Ensure all layers are frozen and in eval mode"""
         self.eval()
         for param in self.parameters():
             param.requires_grad = False
             
     def forward(self, x):
         with torch.no_grad():
-            # Pre-feature extraction
-            features = x
-            for layer in self.pre_feature_layers:
-                features = layer(features)
+            # Store intermediates for skip connections
+            features = []
             
-            # Apply modified feature reducer (maintains spatial dimensions)
-            reduced_features = self.feature_reducer(features)
+            # Pre-feature extraction
+            for layer in self.pre_feature_layers:
+                if isinstance(layer, (nn.modules.upsampling.Upsample, 
+                                   ultralytics.nn.modules.conv.Concat)):
+                    if isinstance(layer, ultralytics.nn.modules.conv.Concat):
+                        x = torch.cat([x] + features[-layer.d:], 1)
+                    else:
+                        x = layer(x)
+                else:
+                    x = layer(x)
+                features.append(x)
+            
+            # Apply domain adaptation
+            x = self.feature_reducer(x)
+            x = self.channel_matcher(x)
+            features[-1] = x
             
             # Post-feature processing
-            x = reduced_features
-            for layer in self.post_feature_layers:
-                x = layer(x)
+            for i, layer in enumerate(self.post_feature_layers):
+                if isinstance(layer, ultralytics.nn.modules.conv.Concat):
+                    # Passe Dimensionen an, wenn nötig
+                    if i in self.concat_dims:
+                        adj_key = f'concat_{len(features)}'
+                        if adj_key in self.dim_adjusters:
+                            x = self.dim_adjusters[adj_key](x)
+                    x = torch.cat([x] + features[-layer.d:], 1)
+                elif isinstance(layer, nn.modules.upsampling.Upsample):
+                    x = layer(x)
+                else:
+                    x = layer(x)
+                features.append(x)
             
             return x
 
@@ -609,6 +622,26 @@ def print_metrics_report(metrics, total_frames):
     print(f"Mean Precision: {means['mean_precision']:.4f}")
     print(f"Mean Recall:    {means['mean_recall']:.4f}")
 
+class DebugYOLO(nn.Module):
+    def __init__(self, yolo_model):
+        super().__init__()
+        self.yolo_model = yolo_model.model
+        
+    def forward(self, x):
+        features = []
+        print("\nStarting debug forward pass:")
+        for i, layer in enumerate(self.yolo_model.model):
+            if i <= 9:  # Wir schauen uns bis Layer 9 an
+                x = layer(x)
+                print(f"\nLayer {i}:")
+                print(f"Type: {type(layer)}")
+                print(f"Output shape: {x.shape}")
+                if i == 8:
+                    print("\n=== FEATURE REDUCER WOULD GO HERE ===")
+                    print(f"Input to feature reducer: {x.shape}")
+                features.append(x)
+        return x
+    
 def main():
     """Compare baseline and domain-adapted models on HeiChole dataset"""
     try:
@@ -620,13 +653,21 @@ def main():
         yolo_model.model.eval()  # Ensure YOLO is in eval mode
         for param in yolo_model.model.parameters():
             param.requires_grad = False
-            
+
+        print("\nStarting Debug Analysis...")
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        debug_model = DebugYOLO(yolo_model).to(device)
+        with torch.no_grad():
+            test_input = torch.randn(1, 3, 512, 512).to(device)
+            output = debug_model(test_input)
+        print("\nDebug Analysis Complete")
+
         dataset_dir = str(loader.dataset_path)
         
         # Load domain adapter in eval mode
         domain_adapter = DomainAdapter(str(loader.yolo_weights))
         adapter_weights = torch.load(
-            "/home/Bartscht/YOLO/surgical-instrument-action-detection/domain_adaptation/hei_chole/experiments/domain_adapter_weights/model_epoch_2.pt"
+            "/home/Bartscht/YOLO/surgical-instrument-action-detection/domain_adaptation/hei_chole/experiments/spatial_domain_adapter_weights_spatial_domain_adaptation/spatial_model_epoch_15.pt"
         )
         
         # Load weights and ensure eval mode
