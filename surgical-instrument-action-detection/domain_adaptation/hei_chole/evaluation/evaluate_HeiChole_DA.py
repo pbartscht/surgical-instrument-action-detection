@@ -16,6 +16,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import json
+import traceback
 
 # Evaluation Constants
 CONFIDENCE_THRESHOLD = 0.1
@@ -208,37 +209,29 @@ class ResidualBlock(nn.Module):
 class DomainAdapter(nn.Module):
     def __init__(self, yolo_path):
         super().__init__()
-        # YOLO Initialization
         model = YOLO(yolo_path)
         model.model.eval()
-        model.predict(source=None, stream=True)  # Force inference mode
+        model.predict(source=None, stream=True)
         self.yolo_model = model.model.model
-        self.feature_layer = 8
+        self.feature_layer = 16  # Angepasst auf Layer 16
         
-        # Disable YOLO training
         for param in self.yolo_model.parameters():
             param.requires_grad = False
             
-        # Feature Reducer that maintains spatial dimensions
+        # Feature Reducer für Layer 16 (256 Kanäle)
         self.feature_reducer = nn.Sequential(
-            # 1x1 Convolution zur subtilen Feature-Transformation
-            nn.Conv2d(512, 512, kernel_size=1),
-            nn.BatchNorm2d(512),
+            nn.Conv2d(256, 256, kernel_size=1),
+            nn.BatchNorm2d(256),
             nn.ReLU(),
-            
-            # Residual Block für Informationserhalt
-            ResidualBlock(512, 512),
-            
-            # Gruppierte Convolution für effiziente Feature-Extraktion
-            nn.Conv2d(512, 512, 
-                      kernel_size=3, 
-                      padding=1, 
-                      groups=32),  # Gruppierte Convolution
-            nn.BatchNorm2d(512),
+            ResidualBlock(256, 256),
+            nn.Conv2d(256, 256, 
+                     kernel_size=3, 
+                     padding=1, 
+                     groups=32),
+            nn.BatchNorm2d(256),
             nn.ReLU()
         )
         
-        # Ensure evaluation mode
         self.eval()
         for param in self.parameters():
             param.requires_grad = False
@@ -258,226 +251,289 @@ class DomainAdapter(nn.Module):
                 return None, reduced_features
             return None
 
-       
 class xDomainAdaptedYOLO(nn.Module):
     def __init__(self, yolo_model, feature_reducer):
         super().__init__()
         self.yolo_model = yolo_model.model
-        self.feature_layer = 8
-        
-        # Store feature reducer
+        self.feature_layer = 16
         self.feature_reducer = feature_reducer
         
-        # Split YOLO layers
+        # Split layers
         self.pre_feature_layers = nn.ModuleList()
+        self.feature_layer_16 = None
         self.post_feature_layers = nn.ModuleList()
         
-        # Split the model at feature_layer
         for i, layer in enumerate(self.yolo_model.model):
-            if i <= self.feature_layer:
+            if i < self.feature_layer:
                 self.pre_feature_layers.append(layer)
+            elif i == self.feature_layer:
+                self.feature_layer_16 = layer
             else:
                 self.post_feature_layers.append(layer)
-        
-        # Ensure evaluation mode
+
         self.eval()
         for param in self.parameters():
             param.requires_grad = False
             
     def forward(self, x):
         with torch.no_grad():
-            # Store intermediates for skip connections
             features = []
+            print("\nStarting forward pass in DomainAdaptedYOLO")
+            print(f"Initial input shape: {x.shape}")
             
-            # Pre-feature extraction (up to layer 8)
-            for layer in self.pre_feature_layers:
-                if isinstance(layer, (nn.modules.upsampling.Upsample, 
-                                   ultralytics.nn.modules.conv.Concat)):
-                    if isinstance(layer, ultralytics.nn.modules.conv.Concat):
-                        x = torch.cat([x] + features[-layer.d:], 1)
-                    else:
-                        x = layer(x)
-                else:
-                    x = layer(x)
-                features.append(x)
-            
-            # Apply domain adaptation at layer 8
-            x = self.feature_reducer(x)
-            features[-1] = x  # Update the last feature map
-            
-            # Post-feature processing (after layer 8)
-            for layer in self.post_feature_layers:
+            # Pre-feature layers
+            for i, layer in enumerate(self.pre_feature_layers):
                 if isinstance(layer, ultralytics.nn.modules.conv.Concat):
+                    print(f"\nPre-feature Concat at layer {i}:")
+                    print(f"Current x shape: {x.shape}")
+                    print(f"Features to concat: {[f.shape for f in features[-layer.d:]]}")
                     x = torch.cat([x] + features[-layer.d:], 1)
-                elif isinstance(layer, nn.modules.upsampling.Upsample):
-                    x = layer(x)
+                    print(f"After concat shape: {x.shape}")
                 else:
                     x = layer(x)
                 features.append(x)
+                print(f"Layer {i} output shape: {x.shape}")
             
-            return x
-
-class DebugC3k2(nn.Module):
-    def __init__(self, layer):
-        super().__init__()
-        self.c3k2 = layer
-        
-    def forward(self, x):
-        print(f"\nC3k2 Debug Info:")
-        print(f"Input shape: {x.shape}")
-        
-        # Inspiziere die Conv Layer Gewichte
-        if hasattr(self.c3k2, 'cv1'):
-            w = self.c3k2.cv1.conv.weight
-            print(f"First conv weight shape: {w.shape}")
+            # Layer 16
+            print("\nProcessing Layer 16:")
+            print(f"Input shape: {x.shape}")
+            x = self.feature_layer_16(x)
+            print(f"Layer 16 output shape: {x.shape}")
+            original_features = x.clone()
+            features.append(x)
             
-        if hasattr(self.c3k2, 'cv2'):
-            w = self.c3k2.cv2.conv.weight
-            print(f"Second conv weight shape: {w.shape}")
+            # Feature reduction
+            print("\nApplying feature reducer:")
+            x = self.feature_reducer(x)
+            print(f"Feature reducer output shape: {x.shape}")
             
-        # Track internal transformations
-        if hasattr(self.c3k2, 'cv1'):
-            conv1_out = self.c3k2.cv1(x)
-            print(f"After first conv: {conv1_out.shape}")
+            # Post-processing
+            for i, layer in enumerate(self.post_feature_layers):
+                print(f"\nPost-processing layer {i}:")
+                if isinstance(layer, ultralytics.nn.modules.conv.Concat):
+                    print("Concat operation:")
+                    print(f"Current x shape: {x.shape}")
+                    concat_features = []
+                    for j in range(layer.d):
+                        feat = features[-layer.d + j] if j > 0 else x
+                        print(f"Feature {j} shape: {feat.shape}")
+                        concat_features.append(feat)
+                    x = torch.cat(concat_features, 1)
+                    print(f"After concat shape: {x.shape}")
+                else:
+                    print(f"Before layer shape: {x.shape}")
+                    x = layer(x)
+                    print(f"After layer shape: {x.shape}")
+                features.append(x)
             
-            # Wenn es ein chunk gibt, zeige die Dimensionen
-            chunks = conv1_out.chunk(2, 1)
-            print(f"After chunking: {[c.shape for c in chunks]}")
-        
-        return self.c3k2(x)
+            return x       
 
 class DomainAdaptedYOLO(nn.Module):
     def __init__(self, yolo_model, feature_reducer):
         super().__init__()
         self.yolo_model = yolo_model.model
-        self.feature_layer = 8
-        
-        # Store feature reducer
+        self.feature_layer = 16
         self.feature_reducer = feature_reducer
-        
-        # Split YOLO layers
+
+        # Channel configuration based on YOLO architecture
+        self.channel_config = {
+            19: 768,  # C3k2 block expects 768 input channels
+            22: 1024,  # Final C3k2 block
+            23: {  # Detect layer expects specific channels for each feature level
+                16: 256,  # P3/8-small
+                19: 512,  # P4/16-medium
+                22: 1024  # P5/32-large
+            }
+        }
+        # Store output features for detection
+        self.detection_features = {}
+
+        # Split network into sections
         self.pre_feature_layers = nn.ModuleList()
+        self.feature_layer_16 = None
         self.post_feature_layers = nn.ModuleList()
-        
-        # Channel adapters for maintaining compatibility
-        self.channel_adapters = nn.ModuleDict({
-            # Key adapters for critical layers
-            'adapt_19': nn.Sequential(
-                nn.Conv2d(512, 768, kernel_size=1),
-                nn.BatchNorm2d(768),
-                nn.ReLU()
-            ),
-            'adapt_20': nn.Sequential(
-                nn.Conv2d(512, 1024, kernel_size=1),
-                nn.BatchNorm2d(1024),
-                nn.ReLU()
-            )
-        })
-        
-        # Analyze and split the model
-        self._analyze_and_split_model()
-        
-        # Ensure evaluation mode
+
+        # Track skip connection structure
+        self.skip_connections = self._analyze_skip_connections()
+
+        # Split model into sections
+        for i, layer in enumerate(self.yolo_model.model):
+            if i < self.feature_layer:
+                self.pre_feature_layers.append(layer)
+            elif i == self.feature_layer:
+                self.feature_layer_16 = layer
+            else:
+                self.post_feature_layers.append(layer)
+
         self.eval()
         for param in self.parameters():
             param.requires_grad = False
-            
-    def _analyze_and_split_model(self):
-        """Analyzes the YOLO model architecture and splits it at the feature layer"""
-        print("\nAnalyzing YOLO architecture...")
-        
-        features = []
-        x = torch.randn(1, 3, 512, 512)  # Dummy input for analysis
-        
+
+    def _analyze_skip_connections(self):
+        """Analyze and map all skip connections in the network"""
+        skip_connections = {}
+        features_needed = set()
+
         for i, layer in enumerate(self.yolo_model.model):
-            # Split layers at feature_layer
-            if i <= self.feature_layer:
-                self.pre_feature_layers.append(layer)
-            else:
-                self.post_feature_layers.append(layer)
-                
-            # Analyze layer for debugging
-            if hasattr(layer, 'conv'):
-                print(f"\nLayer {i} Analysis:")
-                print(f"Type: {type(layer).__name__}")
-                print(f"Input channels: {layer.conv.in_channels}")
-                print(f"Output channels: {layer.conv.out_channels}")
-                
-    def _handle_concat_layer(self, x, layer, features, layer_idx):
-        """Handles concatenation layers with proper dimensionality"""
-        if isinstance(layer, ultralytics.nn.modules.conv.Concat):
-            concat_inputs = [x]
-            for idx in range(layer.d):
-                feature = features[-(idx + 1)]
-                concat_inputs.append(feature)
-            
-            # Debug concatenation
-            print(f"\nConcatenation at layer {layer_idx}:")
-            print(f"Input shapes: {[f.shape for f in concat_inputs]}")
-            
-            return torch.cat(concat_inputs, 1)
-        return x
-    
-    def _apply_channel_adaptation(self, x, layer_idx):
-        """Applies channel adaptation where needed"""
-        adapter_key = f'adapt_{layer_idx}'
-        if adapter_key in self.channel_adapters:
-            original_shape = x.shape
-            x = self.channel_adapters[adapter_key](x)
-            print(f"\nApplied channel adaptation at layer {layer_idx}")
-            print(f"Shape changed from {original_shape} to {x.shape}")
-        return x
-    
-    def forward(self, x):
-        with torch.no_grad():
-            # Store intermediate features for skip connections
-            features = []
-            
-            # Pre-feature extraction (up to layer 8)
-            for i, layer in enumerate(self.pre_feature_layers):
-                if isinstance(layer, ultralytics.nn.modules.conv.Concat):
-                    x = self._handle_concat_layer(x, layer, features, i)
-                else:
-                    x = layer(x)
-                features.append(x)
-                
-                print(f"\nLayer {i} (Pre-feature):")
-                print(f"Output shape: {x.shape}")
-            
-            # Apply domain adaptation at layer 8
-            original_features = x
-            adapted_features = self.feature_reducer(x)
-            x = adapted_features
-            features[-1] = adapted_features  # Update the last feature map
-            
-            print("\nFeature Reduction:")
-            print(f"Original shape: {original_features.shape}")
-            print(f"Adapted shape: {adapted_features.shape}")
-            
-            # Post-feature processing (after layer 8)
-            for i, layer in enumerate(self.post_feature_layers, start=self.feature_layer + 1):
-                # Apply channel adaptation if needed
-                x = self._apply_channel_adaptation(x, i)
-                
-                if isinstance(layer, ultralytics.nn.modules.conv.Concat):
-                    x = self._handle_concat_layer(x, layer, features, i)
-                elif isinstance(layer, nn.modules.upsampling.Upsample):
-                    x = layer(x)
-                else:
-                    try:
-                        x = layer(x)
-                    except RuntimeError as e:
-                        print(f"\nError at layer {i}:")
-                        print(f"Input shape: {x.shape}")
-                        if hasattr(layer, 'conv'):
-                            print(f"Layer expects {layer.conv.in_channels} input channels")
-                        raise
-                
-                features.append(x)
-                print(f"\nLayer {i} (Post-feature):")
-                print(f"Output shape: {x.shape}")
-            
+            if isinstance(layer, ultralytics.nn.modules.conv.Concat):
+                sources = list(range(i - layer.d, i))
+                skip_connections[i] = sources
+                features_needed.update(sources)
+
+        return skip_connections
+
+    def _get_target_channels(self, layer_idx):
+        """Determine target number of channels for a given layer"""
+        return self.channel_config.get(layer_idx, None)
+
+    def _adjust_channels(self, x, target_channels):
+        """Adjust number of channels using 1x1 convolution if needed"""
+        if target_channels is None or x.shape[1] == target_channels:
             return x
+
+        adapter = nn.Conv2d(x.shape[1], target_channels, kernel_size=1).to(x.device)
+        return adapter(x)
+
+    def _handle_concat(self, x, features, layer_idx, layer):
+        """Handle concat operations with proper feature management"""
+        print(f"\nConcat at layer {layer_idx}:")
+        print(f"Current feature shape: {x.shape}")
+
+        # Determine target output channels based on network architecture
+        next_layer_idx = layer_idx + 1
+        target_channels = self._get_target_channels(next_layer_idx)
+
+        concat_features = [x]  # Start with current feature map
+
+        # Get source layers for this concat operation
+        if layer_idx in self.skip_connections:
+            source_layers = self.skip_connections[layer_idx]
+
+            for source_idx in source_layers:
+                if source_idx < len(features):
+                    skip_feature = features[source_idx]
+                    print(f"Adding skip connection from layer {source_idx}, shape: {skip_feature.shape}")
+
+                    # Handle spatial dimension mismatches if needed
+                    if skip_feature.shape[-2:] != x.shape[-2:]:
+                        skip_feature = F.interpolate(
+                            skip_feature, 
+                            size=x.shape[-2:],
+                            mode='bilinear',
+                            align_corners=False
+                        )
+
+                    concat_features.append(skip_feature)
+                else:
+                    print(f"Warning: Skip connection source layer {source_idx} not available")
+
+        # Perform concatenation
+        x = torch.cat(concat_features, dim=1)
+        print(f"After concat shape: {x.shape}")
+
+        # Adjust channels if needed for next layer
+        if target_channels is not None:
+            x = self._adjust_channels(x, target_channels)
+            print(f"After channel adjustment: {x.shape}")
+
+        return x
+
+    def forward(self, x):
+        features = []
+        detection_features = {}
+
+        print("\nStarting forward pass")
+        print(f"Input shape: {x.shape}")
+
+        # Pre-feature extraction (before layer 16)
+        for i, layer in enumerate(self.pre_feature_layers):
+            if isinstance(layer, ultralytics.nn.modules.conv.Concat):
+                x = self._handle_concat(x, features, i, layer)
+            else:
+                print(f"\nLayer {i}: {layer.__class__.__name__}")
+                print(f"Input shape: {x.shape}")
+                x = layer(x)
+                print(f"Output shape: {x.shape}")
+            features.append(x)
+
+        # Layer 16 processing
+        print("\nProcessing Layer 16:")
+        print(f"Input shape: {x.shape}")
+        x = self.feature_layer_16(x)
+        print(f"Layer 16 output shape: {x.shape}")
+        original_features = x.clone()
+        features.append(original_features)
+
+        # Apply domain-invariant feature reducer
+        print("\nApplying feature reducer:")
+        x = self.feature_reducer(x)
+        print(f"Feature reducer output shape: {x.shape}")
+
+        # Ensure Layer 16 feature map is ready for detection
+        x = self._adjust_channels(x, target_channels=self.channel_config[23][16])
+        detection_features[16] = x
+
+        # Post-feature processing
+        for i, layer in enumerate(self.post_feature_layers):
+            layer_idx = i + self.feature_layer + 1
+
+            if isinstance(layer, ultralytics.nn.modules.conv.Concat):
+                x = self._handle_concat(x, features, layer_idx, layer)
+            else:
+                print(f"\nLayer {layer_idx}: {layer.__class__.__name__}")
+                print(f"Input shape: {x.shape}")
+                x = layer(x)
+                print(f"Output shape: {x.shape}")
+
+            features.append(x)
+
+            # Store and adjust features for detection
+            if layer_idx == 19:
+                x = self._adjust_channels(x, target_channels=self.channel_config[23][19])
+                detection_features[19] = x
+            elif layer_idx == 22:
+                x = self._adjust_channels(x, target_channels=self.channel_config[23][22])
+                detection_features[22] = x
+
+        # Prepare for Detect layer
+        detect_layer = self.yolo_model.model[-1]
+        if isinstance(detect_layer, ultralytics.nn.modules.head.Detect):
+            return detect_layer([
+                detection_features[16],  # P3/8-small
+                detection_features[19],  # P4/16-medium
+                detection_features[22]   # P5/32-large
+            ])
+
+        return x
+def _prepare_feature_for_detect(self, feature, cv2_layer, cv3_layer):
+    """
+    Prepare feature map to match Detect layer's convolutional layer expectations
+    
+    Args:
+        feature (torch.Tensor): Input feature map
+        cv2_layer (nn.Sequential): Bounding box regression convolution layers
+        cv3_layer (nn.Sequential): Classification convolution layers
+    
+    Returns:
+        torch.Tensor: Prepared feature map
+    """
+    # Get the expected input channel for the first conv layer in cv2
+    expected_channels = cv2_layer[0].conv.in_channels
+    
+    # Adjust channels if needed
+    if feature.shape[1] != expected_channels:
+        channel_adapter = nn.Conv2d(feature.shape[1], expected_channels, kernel_size=1).to(feature.device)
+        feature = channel_adapter(feature)
+    
+    return feature
+
+# Helper function to ensure channel dimensions match
+def adjust_channel_dimensions(x, target_channels):
+    """Adjust number of channels using 1x1 convolutions if needed"""
+    if x.shape[1] != target_channels:
+        adapter = nn.Conv2d(x.shape[1], target_channels, kernel_size=1).to(x.device)
+        return adapter(x)
+    return x
 
 def create_domain_adapted_yolo(yolo_model, feature_reducer_weights_path):
     """
@@ -887,227 +943,118 @@ class DebugYOLO(nn.Module):
         
         return x, debug_info
 
-def debug_frame(model, frame_path, frame_number):
-    try:
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        
-        img = Image.open(frame_path)
-        transform = transforms.Compose([
-            transforms.ToTensor(),
-            transforms.Normalize(
-                mean=[0.485, 0.456, 0.406],
-                std=[0.229, 0.224, 0.225]
-            )
-        ])
-        
-        # Explicitly move tensor to the same device as the model
-        img_tensor = transform(img).unsqueeze(0).to(device)
-        
-        # Ensure the model is on the same device
-        model = model.to(device)
-        
-        print(f"\nDEBUGGING FRAME {frame_number}")
-        print("=" * 50)
-        print(f"Input tensor device: {img_tensor.device}")
-        print(f"Model device: {next(model.parameters()).device}")
-        
-        with torch.no_grad():
-            output, debug_info = model(img_tensor, frame_number)
-        
-        return debug_info
-        
-    except Exception as e:
-        print(f"Error during debug of frame {frame_number}: {str(e)}")
-        return None
+class YOLODebugger(nn.Module):
+   def __init__(self, yolo_model):
+       super().__init__()
+       self.yolo_model = yolo_model.model
 
-def debug_yolo_architecture(yolo_model):
-    """Analyzes the YOLO architecture layer by layer"""
-    print("\nYOLO Architecture Analysis:")
-    print("=" * 50)
-    
-    # Get the device of the model
-    device = next(yolo_model.model.parameters()).device
-    print(f"Model is on device: {device}")
-    
-    # Create test input tensor on the same device as the model
-    x = torch.randn(1, 3, 512, 512).to(device)
-    print(f"Input tensor is on device: {x.device}")
-    
-    features = []
-    
-    for i, layer in enumerate(yolo_model.model.model):
-        # Store original input shape
-        input_shape = x.shape
+   def forward(self, x):
+       features = []
+       skip_connections = []
+       
+       print("\n=== Feature Flow Analysis ===")
+       
+       for i, layer in enumerate(self.yolo_model.model):
+           print(f"\nLayer {i}: {layer.__class__.__name__}")
+           print(f"Input shape: {x.shape}")
+           
+           if isinstance(layer, ultralytics.nn.modules.conv.Concat):
+               print("\nCONCAT OPERATION:")
+               print(f"Current features: {x.shape}")
+               for j, feat in enumerate(features[-layer.d:]):
+                   print(f"Concat feature {j}: {feat.shape}")
+                   origin_idx = len(features) - layer.d + j
+                   print(f"From layer: {origin_idx}")
+               skip_connections.append({
+                   'layer': i,
+                   'sources': [len(features) - layer.d + j for j in range(layer.d)]
+               })
+               x = torch.cat([x] + features[-layer.d:], 1)
+               print(f"After concat: {x.shape}")
+           
+           else:
+               x = layer(x)
+           
+           features.append(x)
+           
+           # Spezielle Analyse für Layer 16-19
+           if 15 <= i <= 19:
+               print(f"\nDETAILED ANALYSIS Layer {i}:")
+               if isinstance(layer, ultralytics.nn.modules.block.C3k2):
+                   print("C3k2 internals:")
+                   if hasattr(layer, 'cv1'):
+                       print(f"cv1 weight shape: {layer.cv1.conv.weight.shape}")
+               print(f"Output Features: {x.shape}")
+       
+       print("\n=== Skip Connection Summary ===")
+       for conn in skip_connections:
+           print(f"\nLayer {conn['layer']} receives from layers: {conn['sources']}")
+       
+       return x
+
+def run_debug_analysis(img_path, yolo_model):
+   debugger = YOLODebugger(yolo_model).cuda()
+   img = Image.open(img_path)
+   transform = transforms.Compose([
+       transforms.ToTensor(),
+       transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+   ])
+   img_tensor = transform(img).unsqueeze(0).cuda()
+   
+   with torch.no_grad():
+       debugger(img_tensor)
+
+
+class DebugDomainYOLO(nn.Module):
+    def __init__(self, yolo_model, feature_reducer):
+        super().__init__()
+        self.yolo_model = yolo_model.model
+        self.feature_layer = 16
+        self.feature_reducer = feature_reducer
+
+    def forward(self, x):
+        features = []
+        print("\nStarting forward pass:")
+        print(f"Input shape: {x.shape}")
         
-        # Layer Info
-        print(f"\nLayer {i}: {layer.__class__.__name__}")
-        print(f"Input shape: {input_shape}")
-        
-        # Special layer analysis
-        if hasattr(layer, 'conv'):
-            w = layer.conv.weight
-            print(f"Conv weight shape: {w.shape}")
-            print(f"Expected input channels: {layer.conv.in_channels}")
-            print(f"Output channels: {layer.conv.out_channels}")
-            print(f"Conv weights device: {w.device}")
-        
-        # Forward pass
-        if isinstance(layer, ultralytics.nn.modules.conv.Concat):
-            print(f"Concat dimension: {layer.d}")
-            print(f"Features to concat: {[f.shape for f in features[-layer.d:]]}")
-            x = torch.cat([x] + features[-layer.d:], 1)
-        else:
-            try:
+        for i, layer in enumerate(self.yolo_model.model):
+            print(f"\nLayer {i}: {layer.__class__.__name__}")
+            print(f"Input shape: {x.shape}")
+            
+            if isinstance(layer, ultralytics.nn.modules.conv.Concat):
+                print("Concat operation details:")
+                print(f"Features to concat: {[f.shape for f in features[-layer.d:]]}")
+                x = torch.cat([x] + features[-layer.d:], 1)
+            else:
                 x = layer(x)
-            except Exception as e:
-                print(f"Error in layer {i}: {str(e)}")
-                print(f"Input tensor device: {x.device}")
-                if hasattr(layer, 'conv'):
-                    print(f"Layer weights device: {layer.conv.weight.device}")
-                raise
             
-        # Store feature
-        features.append(x)
-        print(f"Output shape: {x.shape}")
-        
-        # Layer 8 is our target
-        if i == 8:
-            print("\n=== TARGET LAYER (8) ===")
-            print("This is where we inject our feature reducer")
-            print("=" * 50)
+            features.append(x)
+            print(f"Output shape: {x.shape}")
+            
+            # Nach Layer 16 Feature-Reducer anwenden
+            if i == self.feature_layer:
+                print("\nApplying feature reducer after Layer 16:")
+                original_shape = x.shape
+                x = self.feature_reducer(x)
+                print(f"Shape change: {original_shape} -> {x.shape}")
+                features[-1] = x
+                
+        return x
     
-    return features
-
-def xmain():
-    """Compare baseline and domain-adapted models on HeiChole dataset"""
-    try:
-        # Initialize ModelLoader
-        loader = ModelLoader()
-        
-        # Load YOLO model in inference mode and ensure it's frozen
-        yolo_model = load_yolo_model(str(loader.yolo_weights))
-        yolo_model.model.eval()  # Ensure YOLO is in eval mode
-        for param in yolo_model.model.parameters():
-            param.requires_grad = False
-        
-        print("\nAnalyzing YOLO architecture...")
-        with torch.no_grad():
-            #device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-            debug_yolo_architecture(yolo_model)
-
-        print("\nStarting Debug Analysis...")
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        debug_model = DebugYOLO(yolo_model).to(device)
-        #with torch.no_grad():
-         #   test_input = torch.randn(1, 3, 512, 512).to(device)
-          #  output = debug_model(test_input)
-        #print("\nDebug Analysis Complete")
-
-        dataset_dir = str(loader.dataset_path)
-        
-        frames_to_debug = [
-            {'frame': '030300', 'status': 'unknown'},
-            {'frame': '030325', 'status': 'unknown'},  # Nehmen Sie einen erfolgreichen Nachbarframe
-            {'frame': '030350', 'status': 'unknown'},
-            {'frame': '030375', 'status': 'unknown'}
-        ]
-        
-        # Debug jeden Frame
-        for frame_info in frames_to_debug:
-            frame_number = frame_info['frame']
-            frame_path = os.path.join(dataset_dir, "Videos", "VID08", f"{frame_number}.png")
-            debug_info = debug_frame(debug_model, frame_path, frame_number)
-            
-            print(f"\nDebug results for frame {frame_number} ({frame_info['status']}):")
-            print("=" * 50)
-            if debug_info:
-                # Analysieren Sie die Layer-Outputs
-                for layer in debug_info['layer_outputs']:
-                    if isinstance(layer['layer_type'], ultralytics.nn.modules.conv.Concat):
-                        print(f"Concat Layer {layer['layer_idx']}:")
-                        print(f"Input shapes: {layer['concat_info']['input_features']}")
-                        print(f"Output shape: {layer['concat_info']['output_shape']}")
+# Nutzung:
+def debug_run(img_path, yolo_model, feature_reducer):
+    debug_model = DebugDomainYOLO(yolo_model, feature_reducer).cuda()
+    img = Image.open(img_path)
+    transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    ])
+    img_tensor = transform(img).unsqueeze(0).cuda()
+    
+    with torch.no_grad():
+        debug_model(img_tensor)
 
 
-        # Load domain adapter in eval mode
-        domain_adapter = DomainAdapter(str(loader.yolo_weights))
-        adapter_weights = torch.load(
-            "/home/Bartscht/YOLO/surgical-instrument-action-detection/domain_adaptation/hei_chole/experiments/spatial_domain_adapter_weights_spatial_domain_adaptation/spatial_model_epoch_19.pt"
-        )
-        
-        # Load weights and ensure eval mode
-        with torch.no_grad():
-            domain_adapter.feature_reducer.load_state_dict(adapter_weights['feature_reducer'])
-        domain_adapter.eval()
-        
-        videos_to_analyze = ["VID08", "VID13"]
-        print(f"\nAnalyzing videos: {', '.join(videos_to_analyze)}")
-        
-        # Create enhanced evaluator
-        evaluator = EnhancedHeiCholeEvaluator(
-            yolo_model=yolo_model,
-            domain_adapter=domain_adapter,
-            dataset_dir=dataset_dir
-        )
-        
-        metrics_calculator = BinaryMetricsCalculator(confidence_threshold=CONFIDENCE_THRESHOLD)
-        
-        predictions = {'baseline': {}, 'adapted': {}}
-        ground_truth = {}
-        total_frames = 0
-        
-        # First analyze ground truth distribution
-        print("\n==========================================")
-        print("GROUND TRUTH ANALYSIS")
-        print("==========================================")
-        gt_distribution = analyze_label_distribution(dataset_dir, videos_to_analyze)
-        
-        print("\n==========================================")
-        print("MODEL PREDICTIONS ANALYSIS")
-        print("==========================================")
-        
-        # Process each video
-        for video in videos_to_analyze:
-            # Load ground truth
-            gt = evaluator.load_ground_truth(video)
-            ground_truth.update(gt)
-            
-            video_folder = os.path.join(dataset_dir, "Videos", video)
-            for frame_file in tqdm(os.listdir(video_folder), desc=f"Processing {video}"):
-                if frame_file.endswith('.png'):
-                    total_frames += 1
-                    frame_id = f"{video}_frame{frame_file.split('.')[0]}"
-                    img_path = os.path.join(video_folder, frame_file)
-                    
-                    # Get predictions from both models
-                    frame_predictions = evaluator.evaluate_frame_both_models(
-                        img_path,
-                        gt[int(frame_file.split('.')[0])],
-                        save_visualization=False
-                    )
-                    
-                    if frame_predictions['baseline']:
-                        predictions['baseline'][frame_id] = frame_predictions['baseline']
-                    if frame_predictions['adapted']:
-                        predictions['adapted'][frame_id] = frame_predictions['adapted']
-        
-        print(f"\nProcessed {total_frames} frames in total.")
-        
-        # Calculate and compare metrics
-        print("\n====== MODEL COMPARISON REPORT ======")
-        for model_type in ['baseline', 'adapted']:
-            print(f"\n{model_type.upper()} MODEL RESULTS:")
-            print("=" * 50)
-            metrics = metrics_calculator.calculate_metrics(
-                predictions[model_type],
-                ground_truth
-            )
-            print_metrics_report(metrics, total_frames)
-            
-    except Exception as e:
-        print(f"❌ Error during analysis: {str(e)}")
-        import traceback
-        traceback.print_exc()
 def main():
     """Test domain-adapted YOLO model with feature reducer"""
     try:
@@ -1121,7 +1068,7 @@ def main():
         yolo_model.model.eval()
         
         # Path to feature reducer weights
-        weights_path = "/home/Bartscht/YOLO/surgical-instrument-action-detection/domain_adaptation/hei_chole/experiments/spatial_domain_adapter_weights_spatial_domain_adaptation/spatial_model_epoch_19.pt"
+        weights_path = "/home/Bartscht/YOLO/surgical-instrument-action-detection/domain_adaptation/hei_chole/experiments/spatial_domain_adapter_weights_spatial_domain_adaptation/spatial_model_epoch_2.pt"
         
         print("\n=== Creating Domain-Adapted YOLO ===")
         # Initialize domain adapter with YOLO path
@@ -1143,6 +1090,13 @@ def main():
         adapted_yolo = adapted_yolo.to(device)
         print(f"\nModel moved to device: {device}")
         
+        
+
+        #print("\nStarting debug run...")
+        #test_frame_path = os.path.join(loader.dataset_path, "Videos", "VID08", "030300.png")
+        #run_debug_analysis(test_frame_path, yolo_model)
+        #debug_run(test_frame_path, yolo_model, domain_adapter.feature_reducer)
+
         # Test frames
         test_frames = [
             {'frame': '030300', 'path': "VID08"},
