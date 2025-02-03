@@ -7,7 +7,7 @@ from pathlib import Path
 import wandb
 from tqdm import tqdm
 from dataloader import balanced_dataloader
-
+import ultralytics.nn.modules.conv
 
 class GradientReversalLayer(torch.autograd.Function):
     @staticmethod
@@ -37,36 +37,28 @@ class ResidualBlock(nn.Module):
 class SpatialDomainAdapter(nn.Module):
     def __init__(self, yolo_path="/data/Bartscht/YOLO/best_v35.pt"):
         super().__init__()
-        # YOLO Initialization
+        # YOLO Setup
         self.yolo = YOLO(yolo_path)
         self.yolo_model = self.yolo.model.model
-        self.feature_layer = 16  # Changed from 8 to 16
+        self.feature_layer = 16
         
-        # Disable YOLO training
+        # Freeze YOLO
+        self.yolo_model.eval()
         for param in self.yolo_model.parameters():
             param.requires_grad = False
-        self.yolo_model.eval()
         
-        # Modified Feature Reducer for layer 16's output dimensions
+        # Feature Reducer (Layer 16 hat 256 Kanäle)
         self.feature_reducer = nn.Sequential(
-            # 1x1 Convolution for initial feature transformation
             nn.Conv2d(256, 256, kernel_size=1),
             nn.BatchNorm2d(256),
             nn.ReLU(),
-            
-            # Residual Block maintaining spatial dimensions
             ResidualBlock(256, 256),
-            
-            # Grouped Convolution for efficient feature processing
-            nn.Conv2d(256, 256, 
-                      kernel_size=3, 
-                      padding=1, 
-                      groups=32),
+            nn.Conv2d(256, 256, kernel_size=3, padding=1, groups=32),
             nn.BatchNorm2d(256),
             nn.ReLU()
         )
 
-        # Modified Domain Classifier for 256 channels
+        # Domain Classifier
         self.domain_classifier = nn.Sequential(
             nn.Conv2d(256, 128, 1),
             nn.BatchNorm2d(128),
@@ -76,32 +68,36 @@ class SpatialDomainAdapter(nn.Module):
         )
 
     def set_train_mode(self, mode=True):
-        """Custom method to set training mode"""
         self.feature_reducer.train(mode)
         self.domain_classifier.train(mode)
         return self
 
     def forward(self, x, alpha=1.0, return_features=False):
-        # Extract YOLO features up to layer 16
-        features = None
+    # Feature Extraktion bis Layer 16
+        features = []  # Liste für Zwischenfeatures
         with torch.no_grad():
             for i, layer in enumerate(self.yolo_model):
-                x = layer(x)
+                if isinstance(layer, ultralytics.nn.modules.conv.Concat):
+                    # Concat-Layer korrekt behandeln
+                    x = torch.cat([x] + features[-layer.d:], 1)
+                else:
+                    x = layer(x)
+                
+                features.append(x)
+                
                 if i == self.feature_layer:
-                    features = x.clone()  # Shape: [B, 256, H, W]
+                    extracted_features = x.clone()
                     break
-        
-        # Apply feature reduction while maintaining dimensions
-        reduced_features = self.feature_reducer(features)
-        
-        # Apply domain adaptation
+
+        # Feature Reduction und Domain Adaptation
+        reduced_features = self.feature_reducer(extracted_features)
         domain_features = GradientReversalLayer.apply(reduced_features, alpha)
         domain_pred = self.domain_classifier(domain_features)
-        
+
         if return_features:
             return domain_pred, reduced_features
         return domain_pred
-    
+
 def calculate_spatial_metrics(domain_preds, domains):
     """Berechnet Metriken für räumliche Domain Predictions"""
     # Expand domains to match spatial dimensions
