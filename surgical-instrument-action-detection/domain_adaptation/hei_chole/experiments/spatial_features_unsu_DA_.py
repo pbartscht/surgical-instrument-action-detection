@@ -40,38 +40,38 @@ class SpatialDomainAdapter(nn.Module):
         # YOLO Initialization
         self.yolo = YOLO(yolo_path)
         self.yolo_model = self.yolo.model.model
-        self.feature_layer = 8
+        self.feature_layer = 16  # Changed from 8 to 16
         
         # Disable YOLO training
         for param in self.yolo_model.parameters():
             param.requires_grad = False
         self.yolo_model.eval()
         
-        # Optimierter Feature Reducer (bleibt bei 512 Kanälen)
+        # Modified Feature Reducer for layer 16's output dimensions
         self.feature_reducer = nn.Sequential(
-            # 1x1 Convolution zur subtilen Feature-Transformation
-            nn.Conv2d(512, 512, kernel_size=1),
-            nn.BatchNorm2d(512),
+            # 1x1 Convolution for initial feature transformation
+            nn.Conv2d(256, 256, kernel_size=1),
+            nn.BatchNorm2d(256),
             nn.ReLU(),
             
-            # Residual Block für Informationserhalt
-            ResidualBlock(512, 512),
+            # Residual Block maintaining spatial dimensions
+            ResidualBlock(256, 256),
             
-            # Gruppierte Convolution für effiziente Feature-Extraktion
-            nn.Conv2d(512, 512, 
+            # Grouped Convolution for efficient feature processing
+            nn.Conv2d(256, 256, 
                       kernel_size=3, 
                       padding=1, 
-                      groups=32),  # Gruppierte Convolution
-            nn.BatchNorm2d(512),
+                      groups=32),
+            nn.BatchNorm2d(256),
             nn.ReLU()
         )
 
-        # Spatial Domain Classifier (angepasst für 512 Kanäle)
+        # Modified Domain Classifier for 256 channels
         self.domain_classifier = nn.Sequential(
-            nn.Conv2d(512, 256, 1),
-            nn.BatchNorm2d(256),
+            nn.Conv2d(256, 128, 1),
+            nn.BatchNorm2d(128),
             nn.ReLU(),
-            nn.Conv2d(256, 1, 1),
+            nn.Conv2d(128, 1, 1),
             nn.Sigmoid()
         )
 
@@ -82,21 +82,21 @@ class SpatialDomainAdapter(nn.Module):
         return self
 
     def forward(self, x, alpha=1.0, return_features=False):
-        # Extract YOLO features
+        # Extract YOLO features up to layer 16
         features = None
         with torch.no_grad():
             for i, layer in enumerate(self.yolo_model):
                 x = layer(x)
                 if i == self.feature_layer:
-                    features = x.clone()  # Shape: [B, 512, H/16, W/16]
+                    features = x.clone()  # Shape: [B, 256, H, W]
                     break
         
-        # Reduce features while maintaining spatial dimensions
-        reduced_features = self.feature_reducer(features)  # Shape: [B, 256, H/16, W/16]
+        # Apply feature reduction while maintaining dimensions
+        reduced_features = self.feature_reducer(features)
         
         # Apply domain adaptation
         domain_features = GradientReversalLayer.apply(reduced_features, alpha)
-        domain_pred = self.domain_classifier(domain_features)  # Shape: [B, 1, H/16, W/16]
+        domain_pred = self.domain_classifier(domain_features)
         
         if return_features:
             return domain_pred, reduced_features
