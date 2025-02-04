@@ -40,64 +40,61 @@ class SpatialDomainAdapter(nn.Module):
         # YOLO Setup
         self.yolo = YOLO(yolo_path)
         self.yolo_model = self.yolo.model.model
-        self.feature_layer = 16
+        self.feature_layer = 9  # Änderung: jetzt Layer 9 statt 16
         
         # Freeze YOLO
         self.yolo_model.eval()
         for param in self.yolo_model.parameters():
             param.requires_grad = False
-        
-        # Feature Reducer (Layer 16 hat 256 Kanäle)
+            
+        # Feature Reducer - angepasst für 512 Kanäle (Layer 9 Output)
         self.feature_reducer = nn.Sequential(
-            nn.Conv2d(256, 256, kernel_size=1),
-            nn.BatchNorm2d(256),
+            nn.Conv2d(512, 512, kernel_size=1),
+            nn.BatchNorm2d(512),
             nn.ReLU(),
-            ResidualBlock(256, 256),
-            nn.Conv2d(256, 256, kernel_size=3, padding=1, groups=32),
-            nn.BatchNorm2d(256),
+            ResidualBlock(512, 512),
+            nn.Conv2d(512, 512, kernel_size=3, padding=1, groups=32),
+            nn.BatchNorm2d(512),
             nn.ReLU()
         )
 
-        # Domain Classifier
+        # Domain Classifier - angepasst für 512 Kanäle Input
         self.domain_classifier = nn.Sequential(
-            nn.Conv2d(256, 128, 1),
-            nn.BatchNorm2d(128),
+            nn.Conv2d(512, 256, 1),
+            nn.BatchNorm2d(256),
             nn.ReLU(),
-            nn.Conv2d(128, 1, 1),
+            nn.Conv2d(256, 1, 1),
             nn.Sigmoid()
         )
 
     def set_train_mode(self, mode=True):
         self.feature_reducer.train(mode)
         self.domain_classifier.train(mode)
+        self.yolo_model.eval()
         return self
 
     def forward(self, x, alpha=1.0, return_features=False):
-    # Feature Extraktion bis Layer 16
-        features = []  # Liste für Zwischenfeatures
+        # Extrahiere Features bis NACH Layer 9
+        features = None
         with torch.no_grad():
             for i, layer in enumerate(self.yolo_model):
-                if isinstance(layer, ultralytics.nn.modules.conv.Concat):
-                    # Concat-Layer korrekt behandeln
-                    x = torch.cat([x] + features[-layer.d:], 1)
-                else:
-                    x = layer(x)
-                
-                features.append(x)
-                
-                if i == self.feature_layer:
-                    extracted_features = x.clone()
+                if i > self.feature_layer:
                     break
-
-        # Feature Reduction und Domain Adaptation
-        reduced_features = self.feature_reducer(extracted_features)
+                x = layer(x)
+                if i == self.feature_layer:
+                    features = x.clone()
+        
+        # Wende Feature Reducer an
+        reduced_features = self.feature_reducer(features)
+        
+        # Domain Classification mit Gradient Reversal
         domain_features = GradientReversalLayer.apply(reduced_features, alpha)
         domain_pred = self.domain_classifier(domain_features)
-
+        
         if return_features:
             return domain_pred, reduced_features
         return domain_pred
-
+       
 def calculate_spatial_metrics(domain_preds, domains):
     """Berechnet Metriken für räumliche Domain Predictions"""
     # Expand domains to match spatial dimensions
@@ -127,17 +124,17 @@ def calculate_spatial_metrics(domain_preds, domains):
 
 def spatial_consistency_loss(source_features, target_features):
     """Berechnet Feature-Consistency über räumliche Dimensionen"""
-    # Calculate mean source features while preserving spatial dimensions
-    mean_source = source_features.mean(dim=0, keepdim=True)  # [1, C, H, W]
+    # Features sollten die gleiche Größe haben wie der Input zu Layer 17
+    mean_source = source_features.mean(dim=0, keepdim=True)
     
-    # Compute similarity at each spatial location
+    # Ähnlichkeit über Kanaldimension berechnen
     similarity = F.cosine_similarity(
         mean_source.expand(target_features.size(0), -1, -1, -1),
         target_features,
-        dim=1  # Similarity over channel dimension
-    ).mean([1, 2])  # Mean over spatial dimensions
+        dim=1
+    ).mean()
     
-    return similarity.mean()  # Mean over batch
+    return similarity
 
 def train_epoch(model, dataloader, optimizer, device, epoch, config):
     model.set_train_mode(True)
@@ -148,69 +145,48 @@ def train_epoch(model, dataloader, optimizer, device, epoch, config):
         images = batch['image'].to(device)
         domains = batch['domain'].to(device)
         
-        # Sanfter GRL-Effekt
-        alpha = 0.2 * (2. / (1. + np.exp(-5 * epoch / config["num_epochs"])) - 1)
-        
         optimizer.zero_grad()
-        domain_pred, features = model(images, alpha, return_features=True)
         
-        B, C, H, W = domain_pred.shape  # C sollte 1 sein
+        # Forward Pass
+        domain_pred, reduced_features = model(images, alpha=0.2, return_features=True)
+        
+        # Domain Classification Loss
+        B, C, H, W = domain_pred.shape
         expanded_domains = domains.view(B, 1, 1, 1).expand(B, 1, H, W)
-
-        # Räumlicher Domain Classification Loss
-        domain_loss = F.binary_cross_entropy(
-            domain_pred,
-            expanded_domains.float()
-        )
+        domain_loss = F.binary_cross_entropy(domain_pred, expanded_domains.float())
         
-        # Räumliche Feature Consistency
-        source_features = features[domains == 0]
-        target_features = features[domains == 1]
+        # Feature Consistency Loss - sicherstellen dass Features ähnlich bleiben
+        source_features = reduced_features[domains == 0]
+        target_features = reduced_features[domains == 1]
         
         if source_features.size(0) > 0 and target_features.size(0) > 0:
             similarity = spatial_consistency_loss(source_features, target_features)
+            
+            # Total Loss: Balance zwischen Domain Confusion und Feature Erhaltung
             total_loss = domain_loss - config["feature_consistency_weight"] * similarity
             metrics_tracker['feature_sim'].append(similarity.item())
         else:
             total_loss = domain_loss
         
+        # Backprop
         total_loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
         
-        # Tracking
+        # Metrics Tracking
         metrics_tracker['loss'].append(total_loss.item())
         metrics_tracker['domain_metrics'].append(
             calculate_spatial_metrics(domain_pred.detach(), domains)
         )
         
+        # Logging
         if batch_idx % 10 == 0:
             current_lr = optimizer.param_groups[0]['lr']
             avg_loss = np.mean(metrics_tracker['loss'][-50:])
-            avg_acc = np.mean([m['accuracy'] for m in metrics_tracker['domain_metrics'][-50:]])
             pbar.set_description(
-                f'Epoch {epoch+1} - Loss: {avg_loss:.4f}, '
-                f'Acc: {avg_acc:.4f}, LR: {current_lr:.6f}'
+                f'Epoch {epoch+1} - Loss: {avg_loss:.4f}, LR: {current_lr:.6f}'
             )
-            
-            wandb.log({
-                'batch/loss': total_loss.item(),
-                'batch/domain_accuracy': metrics_tracker['domain_metrics'][-1]['accuracy'],
-                'batch/feature_similarity': similarity.item() if 'similarity' in locals() else 0,
-                'batch/alpha': alpha,
-                'batch/learning_rate': current_lr
-            })
     
-    epoch_metrics = {
-        'loss': np.mean(metrics_tracker['loss']),
-        'feature_similarity': np.mean(metrics_tracker['feature_sim']) if metrics_tracker['feature_sim'] else 0,
-        'domain_accuracy': np.mean([m['accuracy'] for m in metrics_tracker['domain_metrics']]),
-        'source_accuracy': np.mean([m['source_acc'] for m in metrics_tracker['domain_metrics']]),
-        'target_accuracy': np.mean([m['target_acc'] for m in metrics_tracker['domain_metrics']]),
-        'domain_confusion': np.mean([m['domain_confusion'] for m in metrics_tracker['domain_metrics']])
-    }
-    
-    return epoch_metrics
+    return metrics_tracker
 
 def validate_epoch(model, dataloader, device, epoch, config):
     model.set_train_mode(False)
@@ -221,32 +197,32 @@ def validate_epoch(model, dataloader, device, epoch, config):
             images = batch['image'].to(device)
             domains = batch['domain'].to(device)
             
-            domain_pred, features = model(images, alpha=0.2, return_features=True)
-            
-            # Korrekte Domain Expansion
-            B, C, H, W = domain_pred.shape
-            expanded_domains = domains.view(B, 1, 1, 1).expand(B, 1, H, W)
+            # Forward Pass mit reduzierten Features
+            domain_pred, reduced_features = model(images, alpha=0.2, return_features=True)
             
             # Domain Classification Loss
+            B, C, H, W = domain_pred.shape
+            expanded_domains = domains.view(B, 1, 1, 1).expand(B, 1, H, W)
             domain_loss = F.binary_cross_entropy(
                 domain_pred,  # Shape: [B, 1, H, W]
                 expanded_domains.float()  # Shape: [B, 1, H, W]
             )
             
-            # Räumliche Feature Consistency
-            source_features = features[domains == 0]
-            target_features = features[domains == 1]
+            # Feature Consistency Check
+            source_features = reduced_features[domains == 0]
+            target_features = reduced_features[domains == 1]
             
             if source_features.size(0) > 0 and target_features.size(0) > 0:
                 similarity = spatial_consistency_loss(source_features, target_features)
                 metrics_tracker['feature_sim'].append(similarity.item())
             
+            # Metrics Tracking
             metrics_tracker['loss'].append(domain_loss.item())
             metrics_tracker['domain_metrics'].append(
                 calculate_spatial_metrics(domain_pred, domains)
             )
     
-    # Validation Metrics
+    # Berechne Validierungs-Metriken
     val_metrics = {
         'loss': np.mean(metrics_tracker['loss']),
         'feature_similarity': np.mean(metrics_tracker['feature_sim']) if metrics_tracker['feature_sim'] else 0,

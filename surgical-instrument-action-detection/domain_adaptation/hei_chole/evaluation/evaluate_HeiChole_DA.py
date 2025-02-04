@@ -738,30 +738,37 @@ class DomainAdaptedYOLO(nn.Module):
     def __init__(self, yolo_model, feature_reducer):
         super().__init__()
         self.yolo_model = yolo_model.model
-        self.feature_layer = 16
         self.feature_reducer = feature_reducer
-
+        
+        # Registriere Forward-Hook nach Layer 16
+        self.layer_16 = None
+        for i, layer in enumerate(self.yolo_model.model):
+            if i == 16:
+                # Register the hook to execute AFTER layer 16 completes
+                layer.register_forward_hook(self._post_layer_16_hook)
+        
+        self.eval()
+        for param in self.parameters():
+            param.requires_grad = False
+    
+    def _post_layer_16_hook(self, module, input_feat, output_feat):
+        """
+        Hook der NACH Layer 16 ausgeführt wird
+        - output_feat enthält den kompletten Output des C3k2 Blocks
+        """
+        print(f"\nFeature Hook aktiviert:")
+        print(f"Input shape: {[f.shape for f in input_feat]}")
+        print(f"Output shape vor Feature Reducer: {output_feat.shape}")
+        
+        # Wende Feature Reducer an
+        modified = self.feature_reducer(output_feat)
+        print(f"Output shape nach Feature Reducer: {modified.shape}")
+        
+        return modified
+    
     def forward(self, x):
-        # Original Features von Layer 16 extrahieren
-        original_features = None
-        with torch.no_grad():
-            for i, layer in enumerate(self.yolo_model.model):
-                if i > self.feature_layer:
-                    break
-                x = layer(x)
-                if i == self.feature_layer:
-                    original_features = x.clone()
-
-        # Domain-invariante Features erzeugen
-        domain_features = self.feature_reducer(original_features)
-
-        # Rest des Models normal weiterlaufen lassen, aber mit domain-invarianten Features
-        x = domain_features
-        with torch.no_grad():
-            for i, layer in enumerate(self.yolo_model.model[self.feature_layer + 1:], self.feature_layer + 1):
-                x = layer(x)
-
-        return x
+        """Normaler Forward-Pass - der Hook modifiziert automatisch die Features"""
+        return self.yolo_model.model(x)
     
 def _prepare_feature_for_detect(self, feature, cv2_layer, cv3_layer):
     """
