@@ -136,61 +136,86 @@ def spatial_consistency_loss(source_features, target_features):
     
     return similarity
 
-def train_epoch(model, dataloader, optimizer, device, epoch, config):
+def train_epoch(model, dataloader, optimizer_reducer, optimizer_classifier, device, epoch, config):
     model.set_train_mode(True)
-    metrics_tracker = {'loss': [], 'feature_sim': [], 'domain_metrics': []}
+    # Neue Metrik-Struktur für den Wettkampf
+    metrics_tracker = {
+        'critic_loss': [],      # Erfolg des Kritikers (Domain Classifier)
+        'artist_loss': [],      # Erfolg des Künstlers (Feature Reducer)
+        'feature_sim': [],      # Bleibt von vorher - Feature Qualität
+        'domain_metrics': []    # Bleibt von vorher - Detaillierte Metriken
+    }
     
     pbar = tqdm(dataloader, desc=f'Train Epoch {epoch+1}/{config["num_epochs"]}')
     for batch_idx, batch in enumerate(pbar):
         images = batch['image'].to(device)
         domains = batch['domain'].to(device)
-        
-        optimizer.zero_grad()
-        
-        # Forward Pass
-        domain_pred, reduced_features = model(images, alpha=0.2, return_features=True)
-        
-        # Domain Classification Loss
-        B, C, H, W = domain_pred.shape
+        B, _, H, W = images.shape
         expanded_domains = domains.view(B, 1, 1, 1).expand(B, 1, H, W)
-        domain_loss = F.binary_cross_entropy(domain_pred, expanded_domains.float())
+
+        # 1. Training des Kritikers (Domain Classifier)
+        optimizer_classifier.zero_grad()
+        domain_pred, reduced_features = model(images, alpha=1.0, return_features=True)
+        critic_loss = F.binary_cross_entropy(domain_pred, expanded_domains.float())
+        critic_loss.backward()
+        optimizer_classifier.step()
         
-        # Feature Consistency Loss - sicherstellen dass Features ähnlich bleiben
+        # 2. Training des Künstlers (Feature Reducer)
+        optimizer_reducer.zero_grad()
+        domain_pred, reduced_features = model(images, alpha=1.0, return_features=True)
+        
+        # Feature Consistency bleibt wie vorher
         source_features = reduced_features[domains == 0]
         target_features = reduced_features[domains == 1]
         
         if source_features.size(0) > 0 and target_features.size(0) > 0:
             similarity = spatial_consistency_loss(source_features, target_features)
-            
-            # Total Loss: Balance zwischen Domain Confusion und Feature Erhaltung
-            total_loss = domain_loss - config["feature_consistency_weight"] * similarity
+            # Künstler will Kritiker täuschen (negatives Loss) und Features erhalten
+            artist_loss = -F.binary_cross_entropy(domain_pred, expanded_domains.float()) + \
+                         config["feature_consistency_weight"] * similarity
             metrics_tracker['feature_sim'].append(similarity.item())
         else:
-            total_loss = domain_loss
+            # Wenn nur eine Domain vorhanden, fokussiere auf Täuschung
+            artist_loss = -F.binary_cross_entropy(domain_pred, expanded_domains.float())
         
-        # Backprop
-        total_loss.backward()
-        optimizer.step()
+        artist_loss.backward()
+        optimizer_reducer.step()
         
         # Metrics Tracking
-        metrics_tracker['loss'].append(total_loss.item())
+        metrics_tracker['critic_loss'].append(critic_loss.item())
+        metrics_tracker['artist_loss'].append(-artist_loss.item())  # Negativ für intuitivere Metrik
         metrics_tracker['domain_metrics'].append(
             calculate_spatial_metrics(domain_pred.detach(), domains)
         )
         
-        # Logging
+        # Logging angepasst für beide Akteure
         if batch_idx % 10 == 0:
-            current_lr = optimizer.param_groups[0]['lr']
-            avg_loss = np.mean(metrics_tracker['loss'][-50:])
+            critic_avg = np.mean(metrics_tracker['critic_loss'][-50:])
+            artist_avg = np.mean(metrics_tracker['artist_loss'][-50:])
             pbar.set_description(
-                f'Epoch {epoch+1} - Loss: {avg_loss:.4f}, LR: {current_lr:.6f}'
+                f'Epoch {epoch+1} - Critic: {critic_avg:.4f}, Artist: {artist_avg:.4f}'
             )
     
-    return metrics_tracker
+    # Return-Format angepasst für beide Akteure
+    return {
+        'critic_loss': np.mean(metrics_tracker['critic_loss']),
+        'artist_loss': np.mean(metrics_tracker['artist_loss']),
+        'feature_similarity': np.mean(metrics_tracker['feature_sim']) if metrics_tracker['feature_sim'] else 0,
+        'domain_accuracy': np.mean([m['accuracy'] for m in metrics_tracker['domain_metrics']]),
+        'source_accuracy': np.mean([m['source_acc'] for m in metrics_tracker['domain_metrics']]),
+        'target_accuracy': np.mean([m['target_acc'] for m in metrics_tracker['domain_metrics']]),
+        'domain_confusion': np.mean([m['domain_confusion'] for m in metrics_tracker['domain_metrics']])
+    }
 
 def validate_epoch(model, dataloader, device, epoch, config):
     model.set_train_mode(False)
-    metrics_tracker = {'loss': [], 'feature_sim': [], 'domain_metrics': []}
+    metrics_tracker = {
+        'loss': [], 
+        'critic_loss': [],  # Hinzugefügt
+        'artist_loss': [],  # Hinzugefügt
+        'feature_sim': [], 
+        'domain_metrics': []
+    }
     
     with torch.no_grad():
         for batch in tqdm(dataloader, desc=f'Val Epoch {epoch+1}'):
@@ -200,31 +225,43 @@ def validate_epoch(model, dataloader, device, epoch, config):
             # Forward Pass mit reduzierten Features
             domain_pred, reduced_features = model(images, alpha=0.2, return_features=True)
             
-            # Domain Classification Loss
+            # Domain Classification Loss für Kritiker
             B, C, H, W = domain_pred.shape
             expanded_domains = domains.view(B, 1, 1, 1).expand(B, 1, H, W)
-            domain_loss = F.binary_cross_entropy(
+            critic_loss = F.binary_cross_entropy(
                 domain_pred,  # Shape: [B, 1, H, W]
                 expanded_domains.float()  # Shape: [B, 1, H, W]
             )
             
-            # Feature Consistency Check
+            # Feature Consistency Check für Künstler
             source_features = reduced_features[domains == 0]
             target_features = reduced_features[domains == 1]
             
             if source_features.size(0) > 0 and target_features.size(0) > 0:
                 similarity = spatial_consistency_loss(source_features, target_features)
                 metrics_tracker['feature_sim'].append(similarity.item())
+                
+                # Künstler Loss - Täuschung des Kritikers und Feature Konsistenz
+                artist_loss = -F.binary_cross_entropy(domain_pred, expanded_domains.float()) + \
+                             config.get("feature_consistency_weight", 0.1) * similarity
+                metrics_tracker['artist_loss'].append(artist_loss.item())
+            else:
+                # Wenn nur eine Domain vorhanden, fokussiere auf Täuschung
+                artist_loss = -F.binary_cross_entropy(domain_pred, expanded_domains.float())
+                metrics_tracker['artist_loss'].append(artist_loss.item())
             
             # Metrics Tracking
-            metrics_tracker['loss'].append(domain_loss.item())
+            metrics_tracker['loss'].append(critic_loss.item())
+            metrics_tracker['critic_loss'].append(critic_loss.item())
             metrics_tracker['domain_metrics'].append(
                 calculate_spatial_metrics(domain_pred, domains)
             )
     
-    # Berechne Validierungs-Metriken
+    # Berechne Validierungs-Metriken mit zusätzlichen Informationen
     val_metrics = {
         'loss': np.mean(metrics_tracker['loss']),
+        'critic_loss': np.mean(metrics_tracker['critic_loss']),
+        'artist_loss': np.mean(metrics_tracker['artist_loss']),
         'feature_similarity': np.mean(metrics_tracker['feature_sim']) if metrics_tracker['feature_sim'] else 0,
         'domain_accuracy': np.mean([m['accuracy'] for m in metrics_tracker['domain_metrics']]),
         'source_accuracy': np.mean([m['source_acc'] for m in metrics_tracker['domain_metrics']]),
@@ -284,14 +321,26 @@ def main():
     # Model Setup
     model = SpatialDomainAdapter(yolo_path=config["model_path"]).to(device)
     
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
+    optimizer_reducer = torch.optim.AdamW(
+    model.feature_reducer.parameters(),
+    lr=config["learning_rate"],
+    weight_decay=0.01
+)
+    optimizer_classifier = torch.optim.AdamW(
+        model.domain_classifier.parameters(),
         lr=config["learning_rate"],
         weight_decay=0.01
     )
-    
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
-        optimizer,
+
+    # Scheduler für beide Optimierer
+    scheduler_reducer = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+        optimizer_reducer,
+        T_0=10,
+        T_mult=2,
+        eta_min=config["min_lr"]
+    )
+    scheduler_classifier = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+        optimizer_classifier,
         T_0=10,
         T_mult=2,
         eta_min=config["min_lr"]
@@ -307,19 +356,29 @@ def main():
     
     try:
         for epoch in range(config["num_epochs"]):
-            # Training
-            train_metrics = train_epoch(model, train_loader, optimizer, device, epoch, config)
+            # Training mit neuen Optimizern
+            train_metrics = train_epoch(
+                model, 
+                train_loader, 
+                optimizer_reducer, 
+                optimizer_classifier, 
+                device, 
+                epoch, 
+                config
+            )
             val_metrics = validate_epoch(model, val_loader, device, epoch, config)
             
-            # Scheduler Step
-            scheduler.step()
+            # Scheduler Step für beide Optimierer
+            scheduler_reducer.step()
+            scheduler_classifier.step()
             
             # Logging
             wandb.log({
                 'epoch': epoch,
                 'train': train_metrics,
                 'val': val_metrics,
-                'learning_rate': optimizer.param_groups[0]['lr']
+                'learning_rate_reducer': optimizer_reducer.param_groups[0]['lr'],
+                'learning_rate_classifier': optimizer_classifier.param_groups[0]['lr']
             })
             
             # Model Saving basierend auf Feature-Similarity
@@ -338,12 +397,15 @@ def main():
             
             # Epoch Summary
             print(f"\nEpoch {epoch+1} Summary:")
-            print(f"Train - Loss: {train_metrics['loss']:.4f}, "
-                  f"Feature Sim: {train_metrics['feature_similarity']:.4f}, "
-                  f"Domain Acc: {train_metrics['domain_accuracy']:.4f}")
+            print(f"Train - Critic Loss: {train_metrics['critic_loss']:.4f}, "
+                f"Artist Loss: {train_metrics['artist_loss']:.4f}, "
+                f"Feature Sim: {train_metrics['feature_similarity']:.4f}, "
+                f"Domain Acc: {train_metrics['domain_accuracy']:.4f}")
             print(f"Val - Loss: {val_metrics['loss']:.4f}, "
-                  f"Feature Sim: {val_metrics['feature_similarity']:.4f}, "
-                  f"Domain Acc: {val_metrics['domain_accuracy']:.4f}")
+                f"Critic Loss: {val_metrics['critic_loss']:.4f}, "
+                f"Artist Loss: {val_metrics['artist_loss']:.4f}, "
+                f"Feature Sim: {val_metrics['feature_similarity']:.4f}, "
+                f"Domain Acc: {val_metrics['domain_accuracy']:.4f}")
     
     except KeyboardInterrupt:
         print("\nTraining wurde manuell unterbrochen. Speichere letztes Modell...")
