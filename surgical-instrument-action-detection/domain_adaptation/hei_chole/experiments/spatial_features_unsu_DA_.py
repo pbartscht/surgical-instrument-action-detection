@@ -40,7 +40,7 @@ class SpatialDomainAdapter(nn.Module):
         # YOLO Setup
         self.yolo = YOLO(yolo_path)
         self.yolo_model = self.yolo.model.model
-        self.feature_layer = 9  # Änderung: jetzt Layer 9 statt 16
+        self.feature_layer = 9 
         
         # Freeze YOLO
         self.yolo_model.eval()
@@ -150,8 +150,8 @@ def train_epoch(model, dataloader, optimizer_reducer, optimizer_classifier, devi
     for batch_idx, batch in enumerate(pbar):
         images = batch['image'].to(device)
         domains = batch['domain'].to(device)
-        B, _, H, W = images.shape
-        expanded_domains = domains.view(B, 1, 1, 1).expand(B, 1, H, W)
+        B, C, H, W = images.shape
+        expanded_domains = domains.view(B, 1, 1, 1).expand(B, 1, H, W).float()
 
         # 1. Training des Kritikers (Domain Classifier)
         optimizer_classifier.zero_grad()
@@ -227,7 +227,7 @@ def validate_epoch(model, dataloader, device, epoch, config):
             
             # Domain Classification Loss für Kritiker
             B, C, H, W = domain_pred.shape
-            expanded_domains = domains.view(B, 1, 1, 1).expand(B, 1, H, W)
+            expanded_domains = domains.view(B, 1, 1, 1).expand(B, 1, H, W).float()
             critic_loss = F.binary_cross_entropy(
                 domain_pred,  # Shape: [B, 1, H, W]
                 expanded_domains.float()  # Shape: [B, 1, H, W]
