@@ -172,7 +172,7 @@ class HeiCholeEvaluator:
         
         try:
             # YOLO predictions
-            import pdb; pdb.set_trace()  # Setzt einen Breakpoint
+            #import pdb; pdb.set_trace()  # Setzt einen Breakpoint
             yolo_results = self.yolo_model(img)
             valid_detections = []
             
