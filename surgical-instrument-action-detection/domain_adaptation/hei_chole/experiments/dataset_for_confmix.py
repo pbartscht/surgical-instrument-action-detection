@@ -9,7 +9,7 @@ import math
 
 # Erweiterte Constants
 YOLO_MODEL_PATH = "/data/Bartscht/YOLO/best_v35.pt"
-HEICHOLE_DATASET_PATH = "/data/Bartscht/HeiChole/domain_adaptation/test"
+HEICHOLE_DATASET_PATH = "/data/Bartscht/HeiChole/domain_adaptation/train"
 CHOLECT50_PATH = "/data/Bartscht/YOLO"
 MIXED_SAMPLES_PATH = "/data/Bartscht/mixed_samples"  
 CONFIDENCE_THRESHOLD = 0.25
@@ -370,6 +370,6 @@ def main():
                 successful_mixes += 1
                 if successful_mixes % 100 == 0:
                     print(f"Created {successful_mixes} mixed samples (Progress: {progress_ratio:.2%})")
-                    
+
 if __name__ == "__main__":
     main()
