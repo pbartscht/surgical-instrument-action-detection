@@ -17,6 +17,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 import json
 import traceback
+from ultralytics.engine.predictor import BasePredictor
+from ultralytics.engine.results import Results, Boxes
+from ultralytics.utils.tal import make_anchors
 
 # Evaluation Constants
 CONFIDENCE_THRESHOLD = 0.1
@@ -247,93 +250,169 @@ class DomainAdapter(nn.Module):
             if return_features:
                 return None, reduced_features
             return None
-
-
+      
 class DomainAdaptedYOLO(nn.Module):
     def __init__(self, yolo_path, feature_reducer):
         super().__init__()
         
-        # Load YOLO model in inference mode
+        # Load YOLO model
         model = YOLO(yolo_path)
-        model.model.eval()  # Set to evaluation mode
-        model.predict(source=None, stream=True)  # Initialize in inference mode
+        model.model.eval()
+        model.predict(source=None, stream=True)
         self.yolo_model = model.model
+        self.detector = self.yolo_model.model[-1]  # Original Detection Head
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         
-        self.feature_reducer = feature_reducer
+        # Move model to correct device
+        self.yolo_model = self.yolo_model.to(self.device)
+        
+        self.feature_reducer = feature_reducer.to(self.device)
         self.feature_layer = 9  # SPPF layer
         
-        # Register hook for feature modification
+        # Dictionary for Skip-Connections
+        self.saved_features = {}
+        
+        # Layer mapping from YAML
+        self.skip_connections = {
+            12: [11, 6],    # [Upsampled features, Backbone P4]
+            15: [14, 4],    # [Upsampled features, Backbone P3]
+            18: [17, 13],   # [Downsampled features, Head P4]
+            21: [20, 10]    # [Downsampled features, Head P5]
+        }
+        
+        # Register hooks
         for i, layer in enumerate(self.yolo_model.model):
             if i == self.feature_layer:
-                layer.register_forward_hook(self._feature_hook)
+                layer.register_forward_hook(self._feature_modification_hook)
+            layer.register_forward_hook(self._make_save_hook(i))
         
-        # Ensure everything is in eval mode
+        # Ensure eval mode
         self.eval()
         for param in self.parameters():
             param.requires_grad = False
             
-    def _feature_hook(self, module, input_feat, output_feat):
-        """Hook für Feature Modification nach Layer 9"""
+    def _feature_modification_hook(self, module, input_feat, output_feat):
+        """Hook for Feature Modification after SPPF"""
         try:
-            print(f"Input shape: {[f.shape for f in input_feat]}")
-            print(f"Output shape vor Feature Reducer: {output_feat.shape}")
+            main_features = input_feat[0]
+            modified = self.feature_reducer(main_features)
             
-            # Apply feature reducer
-            modified = self.feature_reducer(output_feat)
-            print(f"Output shape nach Feature Reducer: {modified.shape}")
+            # Debug info
+            print(f"\nFeature Modification at SPPF:")
+            print(f"Input shape: {main_features.shape}")
+            print(f"Modified shape: {modified.shape}")
+            print(f"Original stats - min: {output_feat.min():.3f}, max: {output_feat.max():.3f}, "
+                  f"mean: {output_feat.mean():.3f}, std: {output_feat.std():.3f}")
+            print(f"Modified stats - min: {modified.min():.3f}, max: {modified.max():.3f}, "
+                  f"mean: {modified.mean():.3f}, std: {modified.std():.3f}")
             
             return modified
             
         except Exception as e:
-            print(f"Error in hook: {str(e)}")
+            print(f"Error in feature modification: {str(e)}")
+            traceback.print_exc()
             return output_feat
+            
+    def _make_save_hook(self, layer_idx):
+        """Creates a Hook to save Features for Skip-Connections"""
+        def hook(module, input_feat, output_feat):
+            try:
+                # Save features for later Skip-Connections
+                self.saved_features[layer_idx] = output_feat
+                
+                # Debug info
+                print(f"\nLayer {layer_idx} ({type(module).__name__}):")
+                print(f"Output shape: {output_feat.shape if torch.is_tensor(output_feat) else type(output_feat)}")
+                
+                # Handle Concat Layers
+                if layer_idx in self.skip_connections:
+                    # Get features to concatenate
+                    features_to_concat = []
+                    for idx in self.skip_connections[layer_idx]:
+                        if idx in self.saved_features:
+                            feat = self.saved_features[idx]
+                            if isinstance(feat, torch.Tensor):
+                                features_to_concat.append(feat)
+                    
+                    if len(features_to_concat) > 0:
+                        # Concatenate along channel dimension
+                        output_feat = torch.cat(features_to_concat, dim=1)
+                        print(f"Concat at layer {layer_idx} - New shape: {output_feat.shape}")
+                
+                return output_feat
+                
+            except Exception as e:
+                print(f"Error in save hook at layer {layer_idx}: {str(e)}")
+                traceback.print_exc()
+                return output_feat
+                
+        return hook
     
     def forward(self, x):
-        """
-        Forward pass - strict inference mode
-        """
+        """Forward pass with Skip-Connections"""
         with torch.no_grad():
             try:
+                # Clear saved features
+                self.saved_features.clear()
+                
                 # Ensure input tensor format
                 if not isinstance(x, torch.Tensor):
                     transform = transforms.Compose([
                         transforms.ToTensor(),
-                        transforms.Normalize(mean=[0.485, 0.456, 0.406], 
-                                          std=[0.229, 0.224, 0.225])
+                        transforms.Normalize(
+                            mean=[0.485, 0.456, 0.406],
+                            std=[0.229, 0.224, 0.225]
+                        )
                     ])
                     x = transform(x).unsqueeze(0)
                 
-                if x.device != next(self.parameters()).device:
-                    x = x.to(next(self.parameters()).device)
+                x = x.to(self.device)
                 
-                # Process through model
-                output = self.yolo_model(x)
+                # Run model and get the output tensor [1, 11, 5376]
+                raw_output = self.yolo_model(x)
                 
-                # Convert predictions to interpretable format
-                detect_layer = self.yolo_model.model[-1]  # Get Detect layer
-                if isinstance(detect_layer, ultralytics.nn.modules.head.Detect):
-                    predictions = []
-                    
-                    # Process each detection
-                    for i, pred in enumerate(output):
-                        boxes = pred.boxes  # Get boxes for this prediction
-                        for box in boxes:
-                            prediction = {
-                                'box': box.xyxy[0].cpu().numpy(),  # Convert box to numpy
-                                'confidence': float(box.conf),  # Confidence score
-                                'class': int(box.cls),  # Class index
-                                'class_name': TOOL_MAPPING.get(int(box.cls), 'unknown')  # Map to class name
-                            }
-                            predictions.append(prediction)
-                    
-                    print(f"Found {len(predictions)} detections")
-                    for pred in predictions:
-                        print(f"Detected {pred['class_name']} with confidence {pred['confidence']:.2f}")
-                    
-                    return predictions
+                print("\nRaw output type:", type(raw_output))
+                print("Raw output length:", len(raw_output) if hasattr(raw_output, '__len__') else "N/A")
+                
+                # Identify the first tensor
+                if isinstance(raw_output, tuple):
+                    first_tensor = raw_output[0]
+                    print("First tensor shape:", first_tensor.shape)
                 else:
-                    print("Warning: Last layer is not Detect layer")
-                    return output
+                    first_tensor = raw_output
+                
+                # Create Results object to match original inference
+                results = Results(
+                    orig_img=x.cpu().numpy().squeeze(),
+                    path='',  # You can set an actual path if needed
+                    names=TOOL_MAPPING  # Use original model's class names
+                )
+                
+                # Use detector's postprocess to get boxes
+                processed_output = self.detector.postprocess(
+                    first_tensor.permute(0, 2, 1),
+                    max_det=300,
+                    nc=self.detector.nc
+                )
+                
+                # Create Boxes object
+                results.boxes = Boxes(processed_output[0], x.shape[-2:])
+                print("\nProcessed Results Details (Confidence > 0.14):")
+                high_conf_detections = []
+                for i, (box, conf, cls) in enumerate(zip(results.boxes.xyxy, results.boxes.conf, results.boxes.cls)):
+                    if conf.item() > 0.14:
+                        print(f"\nDetection {i}:")
+                        print(f"Box coordinates: {box}")
+                        print(f"Confidence: {conf.item()}")
+                        print(f"Class: {cls.item()}")
+                        print(f"Class name: {TOOL_MAPPING[int(cls)]}")
+                        high_conf_detections.append((box, conf, cls))
+            
+                # If no high confidence detections, print a message
+                if not high_conf_detections:
+                    print("No detections with confidence > 0.15")
+                
+                return [results]
                 
             except Exception as e:
                 print(f"Error in forward pass: {str(e)}")
@@ -646,6 +725,10 @@ class DetailedDebugYOLO(nn.Module):
         self.original_model.model.eval()
         self.model = self.original_model.model
         
+        # Move model to correct device
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.model = self.model.to(self.device)
+        
         # Register hooks for layers 9 and 10
         self.layer_outputs = {}
         self.register_debug_hooks()
@@ -658,6 +741,7 @@ class DetailedDebugYOLO(nn.Module):
                     'input': {
                         'type': type(input_feat),
                         'shapes': [f.shape if torch.is_tensor(f) else type(f) for f in input_feat],
+                        'device': [f.device if torch.is_tensor(f) else None for f in input_feat],
                         'stats': [{
                             'min': f.min().item(),
                             'max': f.max().item(),
@@ -669,6 +753,7 @@ class DetailedDebugYOLO(nn.Module):
                         'type': type(output_feat),
                         'shape': output_feat.shape if torch.is_tensor(output_feat) else 
                                 [o.shape for o in output_feat] if isinstance(output_feat, (tuple, list)) else type(output_feat),
+                        'device': output_feat.device if torch.is_tensor(output_feat) else None,
                         'stats': {
                             'min': output_feat.min().item(),
                             'max': output_feat.max().item(),
@@ -684,6 +769,16 @@ class DetailedDebugYOLO(nn.Module):
         for i, layer in enumerate(self.model.model):
             if i in [8, 9, 10, 11]:  # Monitor layers around our target
                 layer.register_forward_hook(make_hook(i))
+                
+    def analyze_model_structure(self):
+        """Analyze the model structure in detail"""
+        print("\nModel Structure Analysis:")
+        for i, layer in enumerate(self.model.model):
+            if i in [8, 9, 10, 11]:
+                print(f"\nLayer {i}: {type(layer).__name__}")
+                print(f"Parameters: {sum(p.numel() for p in layer.parameters())}")
+                for name, param in layer.named_parameters():
+                    print(f"- {name}: shape={param.shape}, device={param.device}")
                 
     def compare_inference_modes(self, img_path):
         """Compare original YOLO inference with our modified version"""
@@ -707,15 +802,18 @@ class DetailedDebugYOLO(nn.Module):
                     print(f"Confidence: {box.conf}")
                     print(f"Class: {box.cls}")
         
-        # Our modified inference
+        # Modified inference flow
         print("\n2. Modified inference flow:")
         transform = transforms.Compose([
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
         ])
-        img_tensor = transform(img).unsqueeze(0)
+        img_tensor = transform(img).unsqueeze(0).to(self.device)  # Move tensor to correct device
         
         with torch.no_grad():
+            # First, analyze model structure
+            self.analyze_model_structure()
+            
             # Forward pass through model
             output = self.model(img_tensor)
             
@@ -725,6 +823,7 @@ class DetailedDebugYOLO(nn.Module):
                 print("Input features:")
                 print(f"- Types: {data['input']['type']}")
                 print(f"- Shapes: {data['input']['shapes']}")
+                print(f"- Devices: {data['input']['device']}")
                 if data['input']['stats'][0]:
                     stats = data['input']['stats'][0]
                     print(f"- Stats: min={stats['min']:.3f}, max={stats['max']:.3f}, "
@@ -733,19 +832,330 @@ class DetailedDebugYOLO(nn.Module):
                 print("\nOutput features:")
                 print(f"- Type: {data['output']['type']}")
                 print(f"- Shape: {data['output']['shape']}")
+                print(f"- Device: {data['output']['device']}")
                 if data['output']['stats']:
                     stats = data['output']['stats']
                     print(f"- Stats: min={stats['min']:.3f}, max={stats['max']:.3f}, "
                           f"mean={stats['mean']:.3f}, std={stats['std']:.3f}")
         
         return results
-
+    
 def debug_original_yolo(model_path, img_path):
     """Debug helper to understand original YOLO inference"""
     debugger = DetailedDebugYOLO(model_path)
     return debugger.compare_inference_modes(img_path)
 
+def test_domain_adapted_yolo(yolo_path, feature_reducer, test_image):
+    """Test function for the domain adapted YOLO"""
+    try:
+        # Initialize model
+        model = DomainAdaptedYOLO(yolo_path, feature_reducer)
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        model = model.to(device)
+        
+        # Load and preprocess test image
+        img = Image.open(test_image)
+        transform = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize(
+                mean=[0.485, 0.456, 0.406],
+                std=[0.229, 0.224, 0.225]
+            )
+        ])
+        img_tensor = transform(img).unsqueeze(0).to(device)
+        
+        # Run inference
+        with torch.no_grad():
+            results = model(img_tensor)
+            
+            # Process results
+            if hasattr(results[0], 'boxes'):
+                boxes = results[0].boxes
+                print(f"Number of detections: {len(boxes)}")
+                for i, box in enumerate(boxes):
+                    print(f"\nDetection {i}:")
+                    print(f"Box coordinates: {box.xyxy}")
+                    print(f"Confidence: {box.conf}")
+                    print(f"Class: {box.cls}")
+            
+        return results
+        
+    except Exception as e:
+        print(f"Error in test: {str(e)}")
+        traceback.print_exc()
+        return None
+
+class xYOLODebugger:
+    def __init__(self, yolo_path):
+        self.model = YOLO(yolo_path)
+        self.model.model.eval()
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        
+    def inspect_model_structure(self):
+        """Inspiziert die Struktur des YOLO Models"""
+        print("\nYOLO Model Structure:")
+        print("=====================")
+        print(f"Type of model: {type(self.model)}")
+        print(f"Type of model.model: {type(self.model.model)}")
+        print(f"Type of model.predictor: {type(self.model.predictor)}")
+        
+        # Untersuche die predict Methode
+        print("\nPredict Method Source:")
+        print("=====================")
+        import inspect
+        print(inspect.getsource(self.model.predict))
+        
+    def trace_prediction_flow(self, img_path):
+        """Verfolgt den Vorhersagefluss von Input bis Results"""
+        print("\nPrediction Flow Analysis:")
+        print("=====================")
+        
+        # 1. Input Verarbeitung
+        img = Image.open(img_path)
+        print(f"\n1. Original Image Type: {type(img)}")
+        
+        # 2. Modell Forward Pass
+        with torch.no_grad():
+            # Standard YOLO Predict
+            results1 = self.model(img)
+            print(f"\n2a. Standard YOLO Results: {type(results1)}")
+            print(f"Results Structure: {results1[0].__dict__.keys()}")
+            
+            # Manueller Forward Pass
+            transform = transforms.Compose([
+                transforms.ToTensor(),
+                transforms.Normalize(mean=[0.485, 0.456, 0.406], 
+                                  std=[0.229, 0.224, 0.225])
+            ])
+            img_tensor = transform(img).unsqueeze(0).to(self.device)
+            outputs = self.model.model(img_tensor)
+            print(f"\n2b. Raw Model Output Type: {type(outputs)}")
+            print(f"Output Shapes: {[output.shape for output in outputs if isinstance(output, torch.Tensor)]}")
+            
+            # 3. Results Erzeugung
+            print("\n3. Results Creation Process:")
+            # Get predictor instance
+            predictor = self.model.predictor
+            if predictor is None:
+                predictor = BasePredictor()
+            
+            # Untersuche postprocess
+            print("\nPostprocess Method:")
+            if hasattr(predictor, 'postprocess'):
+                results2 = predictor.postprocess(outputs, img)
+                print(f"Post-processed Results Type: {type(results2)}")
+                if isinstance(results2, list) and len(results2) > 0:
+                    print(f"First Result Keys: {results2[0].__dict__.keys()}")
+            
+    def analyze_results_creation(self, img_path):
+        """Analysiert wie Results-Objekte erstellt werden"""
+        img = Image.open(img_path)
+        results = self.model(img)
+        result = results[0]  # Nimm erstes Result
+        
+        print("\nResults Object Analysis:")
+        print("=====================")
+        print(f"Result Type: {type(result)}")
+        print(f"Available Attributes: {result.__dict__.keys()}")
+        
+        if hasattr(result, 'boxes'):
+            boxes = result.boxes
+            print("\nBoxes Analysis:")
+            print(f"Boxes Type: {type(boxes)}")
+            print(f"Box Attributes: {boxes.__dict__.keys()}")
+            if len(boxes) > 0:
+                print("\nFirst Box Details:")
+                print(f"Coordinates: {boxes.xyxy[0]}")
+                print(f"Confidence: {boxes.conf[0]}")
+                print(f"Class: {boxes.cls[0]}")
+   
+class YOLODebugger:
+    def __init__(self, yolo_path):
+        self.model = YOLO(yolo_path)  # Hier sollte idealerweise dein DomainAdaptedYOLO verwendet werden!
+        self.model.model.eval()
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.model.model = self.model.model.to(self.device)
+        # Bei DomainAdaptedYOLO sollten die saved_features bereits durch die Hooks befüllt werden.
+        # Der Detection Head (Detect Layer) ist im letzten Layer des Modells enthalten:
+        self.detector = self.model.model.model[-1]  
+        print("\nDetector type:", type(self.detector))
+        
+    def reconstruct_feature_maps(self, output, strides=[8, 16, 32]):
+        """
+        Rekonstruiert Feature-Maps aus dem zusammengefassten Tensor.
+        Diese Methode wird nicht mehr für die Domain Adaptation benötigt, da wir direkt
+        die gespeicherten Features aus den Schichten 16, 19, 22 verwenden.
+        """
+        batch_size, num_anchors, features = output.shape
+        total_pixels = features // len(strides)
+        feature_maps = []
+        start_idx = 0
+        for stride in strides:
+            grid_size = int(np.sqrt(total_pixels / (stride/8)))
+            pixels = grid_size * grid_size
+            end_idx = start_idx + pixels
+            features_stride = output[:, :, start_idx:end_idx]
+            feature_map = features_stride.view(batch_size, num_anchors, grid_size, grid_size)
+            feature_maps.append(feature_map)
+            start_idx = end_idx
+        return feature_maps
+
+    def trace_prediction_flow(self, img_path):
+        """
+        Verfolgt und analysiert den Vorhersagefluss von Input bis Results.
+        Im modified flow nutzen wir die in DomainAdaptedYOLO gespeicherten Features (z.B. Layer 16, 19, 22)
+        und injizieren sie in den vortrainierten Detection Head.
+        """
+        print("\nPrediction Flow Analysis:")
+        print("=====================")
+        
+        img = Image.open(img_path)
+        
+        with torch.no_grad():
+            # 1. Original YOLO inference (Standard-Pipeline)
+            print("\n1. Original YOLO inference:")
+            results1 = self.model(img)
+            self._analyze_results("Original Results", results1)
+            
+            # 2. Modified inference flow: Wir nehmen an, dass unser DomainAdaptedYOLO-Objekt
+            # über den saved_features-Dictionary verfügt, in dem die Features der relevanten Schichten
+            # (z.B. 16, 19 und 22) gespeichert wurden.
+            print("\n2. Modified inference flow:")
+            transform = transforms.Compose([
+                transforms.ToTensor(),
+                transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                     std=[0.229, 0.224, 0.225])
+            ])
+            img_tensor = transform(img).unsqueeze(0).to(self.device)
+            
+            # Lasse den Forward-Pass laufen, sodass die Hooks die saved_features füllen:
+            _ = self.model.model(img_tensor)
+            
+            try:
+                # Sammle die Feature-Maps, die der Detection Head benötigt:
+                # Laut YAML werden Layer 16, 19 und 22 als Inputs für den Detect-Layer verwendet.
+                required_layers = [16, 19, 22]
+                features = []
+                for idx in required_layers:
+                    if idx in self.model.saved_features:
+                        features.append(self.model.saved_features[idx])
+                    else:
+                        raise ValueError(f"Saved feature for layer {idx} nicht gefunden.")
+                # Optional: Überprüfe die Shapes der Features
+                print("\nCollected Features for Detect Layer:")
+                for i, feat in enumerate(features):
+                    print(f"Layer {required_layers[i]} shape: {feat.shape}")
+                
+                # Nun injizieren wir diese Features in den Detection Head.
+                # Der Detection Head verfügt über die Methode _inference, die intern den Postprocessing-Flow ausführt.
+                preds = self.detector._inference(features)
+                
+                print("\nDetector Inference Output:")
+                print(f"Shape: {preds.shape}")
+                print(f"Min: {preds.min().item():.3f}")
+                print(f"Max: {preds.max().item():.3f}")
+                print(f"Mean: {preds.mean().item():.3f}")
+                
+                # Erzeuge ein Results-Objekt, um die finalen Vorhersagen zu visualisieren
+                result = Results(
+                    orig_img=img_tensor.cpu().numpy(),
+                    path=img_path,
+                    names=self.model.model.names
+                )
+                result.boxes = Boxes(preds[0], img_tensor.shape[-2:])
+                
+                print("\nFinal Modified Results:")
+                self._analyze_results("Modified Results", [result])
+            except Exception as e:
+                print(f"\nError during modified inference flow: {str(e)}")
+                traceback.print_exc()
+
+    def _analyze_results(self, title, results):
+        """Analysiert YOLO Results"""
+        if not isinstance(results, list) or not results:
+            return
+        result = results[0]
+        print(f"\n=== {title} ===")
+        print(f"Type: {type(results)}")
+        print(f"Structure: {result}")
+        
+        if hasattr(result, 'boxes') and len(result.boxes) > 0:
+            print(f"\nNumber of detections: {len(result.boxes)}")
+            boxes = result.boxes
+            for i, (box, conf, cls) in enumerate(zip(boxes.xyxy, boxes.conf, boxes.cls)):
+                print(f"\nDetection {i}:")
+                print(f"Box coordinates: {box}")
+                print(f"Confidence: {conf.item()}")
+                print(f"Class: {cls.item()}")
+                if hasattr(result, 'names'):
+                    print(f"Class name: {result.names[int(cls)]}")
+        if hasattr(result, 'speed'):
+            print("\nProcessing Speed:")
+            for key, value in result.speed.items():
+                print(f"{key}: {value}ms")
+
+
 def main():
+    """Test YOLO model debugging"""
+    try:
+        print("\n=== Initializing Models ===")
+        loader = ModelLoader()
+        
+        # Initialize debugger
+        debugger = YOLODebugger(str(loader.yolo_weights))
+        
+        # Test frame analysis
+        test_frame_path = os.path.join(loader.dataset_path, "Videos", "VID08", "030300.png")
+        
+        # Add this block to print DomainAdaptedYOLO output
+        print("\n=== Testing DomainAdaptedYOLO Output ===")
+        # Load domain adapter
+        domain_adapter = DomainAdapter(str(loader.yolo_weights))
+        
+        # Create domain-adapted YOLO
+        adapted_yolo = DomainAdaptedYOLO(
+            yolo_path=str(loader.yolo_weights),
+            feature_reducer=domain_adapter.feature_reducer
+        )
+        
+        # Prepare image
+        img = Image.open(test_frame_path)
+        transform = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize(
+                mean=[0.485, 0.456, 0.406],
+                std=[0.229, 0.224, 0.225]
+            )
+        ])
+        img_tensor = transform(img).unsqueeze(0)
+        
+        # Run inference and print detailed output
+        with torch.no_grad():
+            output = adapted_yolo(img_tensor)
+            print("\nDomainAdaptedYOLO Output:")
+            print(f"Output Type: {type(output)}")
+            
+            # If output is a tensor or has 'boxes' attribute
+            if hasattr(output, 'boxes'):
+                boxes = output.boxes
+                print(f"Number of detections: {len(boxes)}")
+                for i, box in enumerate(boxes):
+                    print(f"\nDetection {i}:")
+                    print(f"Box coordinates: {box.xyxy}")
+                    print(f"Confidence: {box.conf}")
+                    print(f"Class: {box.cls}")
+            elif isinstance(output, torch.Tensor):
+                print(f"Tensor Shape: {output.shape}")
+                print(f"Tensor Stats - Min: {output.min()}, Max: {output.max()}, Mean: {output.mean()}")
+        
+        # Optional: continue with original debugger trace
+        debugger.trace_prediction_flow(test_frame_path)
+        
+    except Exception as e:
+        print(f"\nError during testing: {str(e)}")
+        traceback.print_exc()
+
+def xmain():
     """Test domain-adapted YOLO model with feature reducer"""
     try:
         print("\n=== Initializing Models ===")
@@ -793,7 +1203,9 @@ def main():
             {'frame': '030350', 'path': "VID08"},
             {'frame': '030375', 'path': "VID08"}
         ]
-        
+        #comparer = YOLOOutputComparer(str(loader.yolo_weights))
+        #comparer.set_domain_adapter(domain_adapter, weights_path)
+
         print("\n=== Testing Model on Frames ===")
         for frame_info in test_frames:
             frame_number = frame_info['frame']
@@ -845,6 +1257,22 @@ def main():
     except Exception as e:
         print(f"\nError during testing: {str(e)}")
         traceback.print_exc()
-               
+def yolomain():
+    """Test YOLO model debugging"""
+    try:
+        print("\n=== Initializing Models ===")
+        loader = ModelLoader()
+        
+        # Initialize debugger
+        debugger = YOLODebugger(str(loader.yolo_weights))
+        
+        # Test frame analysis
+        test_frame_path = os.path.join(loader.dataset_path, "Videos", "VID08", "030300.png")
+        debugger.trace_prediction_flow(test_frame_path)
+        
+    except Exception as e:
+        print(f"\nError during testing: {str(e)}")
+        traceback.print_exc()
+
 if __name__ == '__main__':
     main()
