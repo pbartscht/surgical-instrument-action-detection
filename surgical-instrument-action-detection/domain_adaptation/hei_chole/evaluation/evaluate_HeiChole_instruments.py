@@ -66,6 +66,7 @@ class ModelLoader:
         """Defines all important paths for the models"""
         # YOLO model path
         self.yolo_weights = self.hierarchical_dir / "Instrument-classification-detection" / "weights" / "instrument_detector" / "best_v35.pt"
+        #self.yolo_weights = Path("/home/Bartscht/YOLO/surgical-instrument-action-detection/domain_adaptation/hei_chole/experiments/heichole_transfer/transfer_learning/weights/best.pt")
         # Dataset path for HeiChole
         self.dataset_path = Path("/data/Bartscht/HeiChole/domain_adaptation/test")
         
