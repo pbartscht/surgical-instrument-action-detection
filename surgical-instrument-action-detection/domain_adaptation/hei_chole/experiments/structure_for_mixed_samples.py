@@ -83,7 +83,7 @@ def create_dataset_yaml(base_path):
         yaml.dump(yaml_content, f, sort_keys=False)
 
 def main():
-    base_path = "/data/Bartscht/mixed_samples"
+    base_path = "/data/Bartscht/mixed_samples_epoch2"
     
     # 1. Setup Verzeichnisstruktur
     print("Setting up directory structure...")

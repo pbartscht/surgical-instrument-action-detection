@@ -73,21 +73,22 @@ class SpatialDomainAdapter(nn.Module):
         self.yolo_model.eval()
         return self
 
-    def forward(self, x, alpha=1.0, return_features=False):
-        # Extrahiere Features bis NACH Layer 9
-        features = None
+    def forward(self, images, domains, alpha=1.0, return_features=False):
+        # Extrahiere Feature-Map bis zum gewünschten Layer (z. B. Layer 9)
         with torch.no_grad():
+            x = images.clone()
+            features = None
             for i, layer in enumerate(self.yolo_model):
                 if i > self.feature_layer:
                     break
                 x = layer(x)
                 if i == self.feature_layer:
-                    features = x.clone()
+                    features = x.clone()  # speichere die Feature-Map (z. B. Größe 20x20)
         
-        # Wende Feature Reducer an
+        # Setze den weiteren Verarbeitungspfad fort
         reduced_features = self.feature_reducer(features)
         
-        # Domain Classification mit Gradient Reversal
+        # Wende den Gradient-Reversal Layer an
         domain_features = GradientReversalLayer.apply(reduced_features, alpha)
         domain_pred = self.domain_classifier(domain_features)
         
@@ -96,31 +97,51 @@ class SpatialDomainAdapter(nn.Module):
         return domain_pred
        
 def calculate_spatial_metrics(domain_preds, domains):
-    """Berechnet Metriken für räumliche Domain Predictions"""
-    # Expand domains to match spatial dimensions
-    B, _, H, W = domain_preds.shape
-    domains = domains.view(B, 1, 1, 1).expand(-1, 1, H, W)
+    """
+    Berechnet Metriken basierend auf den Domain-Predictions und den 
+    Domänen-Labels, wobei die räumliche Größe der Feature-Map genutzt wird.
     
-    # Calculate metrics across all spatial positions
-    domain_preds = domain_preds.squeeze(1)  # Remove channel dim for calculations
-    domains = domains.squeeze(1)
+    Es werden folgende Metriken berechnet:
+      - accuracy: Gesamte Genauigkeit (über alle Positionen)
+      - source_acc: Genauigkeit für Quell-Domäne (domain==0)
+      - target_acc: Genauigkeit für Ziel-Domäne (domain==1)
+      - domain_confusion: 1 - |2 * accuracy - 1| (maximal bei accuracy = 0.5)
+    """
+    # Verwende die räumliche Größe der Feature-Map
+    B, _, H_feat, W_feat = domain_preds.shape
+    # Erweitere die Domänen-Labels an die Feature-Map-Dimensionen
+    domains_expanded = domains.view(B, 1, 1, 1).expand(B, 1, H_feat, W_feat).float()
     
-    accuracy = (domain_preds > 0.5).float().eq(domains).float().mean(dim=[1,2])
+    # Erzeuge binäre Vorhersagen: 1, wenn > 0.5, sonst 0
+    preds_binary = (domain_preds > 0.5).float()
     
-    source_mask = domains[:, 0, 0] == 0
-    target_mask = domains[:, 0, 0] == 1
+    # Berechne die globale Accuracy
+    accuracy = (preds_binary.eq(domains_expanded)).float().mean()
     
-    source_acc = accuracy[source_mask].mean() if source_mask.any() else torch.tensor(0.)
-    target_acc = accuracy[target_mask].mean() if target_mask.any() else torch.tensor(0.)
+    # Berechne die Genauigkeit für Quell-Domäne (angenommen, domain==0)
+    source_mask = (domains_expanded == 0)
+    if source_mask.sum() > 0:
+        source_acc = (preds_binary[source_mask].eq(domains_expanded[source_mask])).float().mean()
+    else:
+        source_acc = torch.tensor(0.0)
     
-    domain_confusion = 1 - torch.abs(2 * accuracy.mean() - 1)
+    # Berechne die Genauigkeit für Ziel-Domäne (angenommen, domain==1)
+    target_mask = (domains_expanded == 1)
+    if target_mask.sum() > 0:
+        target_acc = (preds_binary[target_mask].eq(domains_expanded[target_mask])).float().mean()
+    else:
+        target_acc = torch.tensor(0.0)
     
-    return {
-        'accuracy': accuracy.mean().item(),
+    # Domain confusion: maximal, wenn accuracy = 0.5 (d.h. 1 - |2 * accuracy - 1|)
+    domain_confusion = 1 - torch.abs(2 * accuracy - 1)
+    
+    metrics = {
+        'accuracy': accuracy.item(),
         'source_acc': source_acc.item(),
         'target_acc': target_acc.item(),
         'domain_confusion': domain_confusion.item()
     }
+    return metrics
 
 def spatial_consistency_loss(source_features, target_features):
     """Berechnet Feature-Consistency über räumliche Dimensionen"""
@@ -142,53 +163,55 @@ def train_epoch(model, dataloader, optimizer_reducer, optimizer_classifier, devi
     metrics_tracker = {
         'critic_loss': [],      # Erfolg des Kritikers (Domain Classifier)
         'artist_loss': [],      # Erfolg des Künstlers (Feature Reducer)
-        'feature_sim': [],      # Bleibt von vorher - Feature Qualität
-        'domain_metrics': []    # Bleibt von vorher - Detaillierte Metriken
+        'feature_sim': [],      # Feature-Konsistenz (z. B. Cosine Similarity)
+        'domain_metrics': []    # Detaillierte Domänen-Metriken (accuracy, source_acc, target_acc, domain_confusion)
     }
     
     pbar = tqdm(dataloader, desc=f'Train Epoch {epoch+1}/{config["num_epochs"]}')
     for batch_idx, batch in enumerate(pbar):
         images = batch['image'].to(device)
-        domains = batch['domain'].to(device)
-        B, C, H, W = images.shape
-        expanded_domains = domains.view(B, 1, 1, 1).expand(B, 1, H, W).float()
+        domains = batch['domain'].to(device)  # domains z. B. als Tensor mit 0/1 für Quelle/Ziel
 
         # 1. Training des Kritikers (Domain Classifier)
         optimizer_classifier.zero_grad()
-        domain_pred, reduced_features = model(images, alpha=1.0, return_features=True)
-        critic_loss = F.binary_cross_entropy(domain_pred, expanded_domains.float())
+        # WICHTIG: Übergabe von images UND domains an model
+        domain_pred, reduced_features = model(images, domains, alpha=1.0, return_features=True)
+        # Nutze die Feature-Map-Dimensionen aus domain_pred (z. B. [B,1,H_feat,W_feat])
+        B, _, H_feat, W_feat = domain_pred.shape
+        expanded_domains = domains.view(B, 1, 1, 1).expand(B, 1, H_feat, W_feat).float()
+        
+        critic_loss = F.binary_cross_entropy(domain_pred, expanded_domains)
         critic_loss.backward()
         optimizer_classifier.step()
         
         # 2. Training des Künstlers (Feature Reducer)
         optimizer_reducer.zero_grad()
-        domain_pred, reduced_features = model(images, alpha=1.0, return_features=True)
-        
-        # Feature Consistency bleibt wie vorher
+        domain_pred, reduced_features = model(images, domains, alpha=1.0, return_features=True)
+        B, _, H_feat, W_feat = domain_pred.shape
+        expanded_domains = domains.view(B, 1, 1, 1).expand(B, 1, H_feat, W_feat).float()
+
+        # Feature Consistency: Aufteilung in Source- und Target-Features
         source_features = reduced_features[domains == 0]
         target_features = reduced_features[domains == 1]
         
         if source_features.size(0) > 0 and target_features.size(0) > 0:
             similarity = spatial_consistency_loss(source_features, target_features)
-            # Künstler will Kritiker täuschen (negatives Loss) und Features erhalten
-            artist_loss = -F.binary_cross_entropy(domain_pred, expanded_domains.float()) + \
-                         config["feature_consistency_weight"] * similarity
+            artist_loss = -F.binary_cross_entropy(domain_pred, expanded_domains) + \
+                          config["feature_consistency_weight"] * similarity
             metrics_tracker['feature_sim'].append(similarity.item())
         else:
-            # Wenn nur eine Domain vorhanden, fokussiere auf Täuschung
-            artist_loss = -F.binary_cross_entropy(domain_pred, expanded_domains.float())
+            artist_loss = -F.binary_cross_entropy(domain_pred, expanded_domains)
         
         artist_loss.backward()
         optimizer_reducer.step()
         
         # Metrics Tracking
         metrics_tracker['critic_loss'].append(critic_loss.item())
-        metrics_tracker['artist_loss'].append(-artist_loss.item())  # Negativ für intuitivere Metrik
+        metrics_tracker['artist_loss'].append(-artist_loss.item())  # Negativ für intuitivere Darstellung
         metrics_tracker['domain_metrics'].append(
             calculate_spatial_metrics(domain_pred.detach(), domains)
         )
         
-        # Logging angepasst für beide Akteure
         if batch_idx % 10 == 0:
             critic_avg = np.mean(metrics_tracker['critic_loss'][-50:])
             artist_avg = np.mean(metrics_tracker['artist_loss'][-50:])
@@ -196,7 +219,6 @@ def train_epoch(model, dataloader, optimizer_reducer, optimizer_classifier, devi
                 f'Epoch {epoch+1} - Critic: {critic_avg:.4f}, Artist: {artist_avg:.4f}'
             )
     
-    # Return-Format angepasst für beide Akteure
     return {
         'critic_loss': np.mean(metrics_tracker['critic_loss']),
         'artist_loss': np.mean(metrics_tracker['artist_loss']),
@@ -207,13 +229,14 @@ def train_epoch(model, dataloader, optimizer_reducer, optimizer_classifier, devi
         'domain_confusion': np.mean([m['domain_confusion'] for m in metrics_tracker['domain_metrics']])
     }
 
+
 def validate_epoch(model, dataloader, device, epoch, config):
     model.set_train_mode(False)
     metrics_tracker = {
         'loss': [], 
-        'critic_loss': [],  # Hinzugefügt
-        'artist_loss': [],  # Hinzugefügt
-        'feature_sim': [], 
+        'critic_loss': [],
+        'artist_loss': [],
+        'feature_sim': [],
         'domain_metrics': []
     }
     
@@ -222,42 +245,32 @@ def validate_epoch(model, dataloader, device, epoch, config):
             images = batch['image'].to(device)
             domains = batch['domain'].to(device)
             
-            # Forward Pass mit reduzierten Features
-            domain_pred, reduced_features = model(images, alpha=0.2, return_features=True)
+            # Forward Pass: Übergabe von images und domains
+            domain_pred, reduced_features = model(images, domains, alpha=0.2, return_features=True)
+            B, _, H_feat, W_feat = domain_pred.shape
+            expanded_domains = domains.view(B, 1, 1, 1).expand(B, 1, H_feat, W_feat).float()
             
-            # Domain Classification Loss für Kritiker
-            B, C, H, W = domain_pred.shape
-            expanded_domains = domains.view(B, 1, 1, 1).expand(B, 1, H, W).float()
-            critic_loss = F.binary_cross_entropy(
-                domain_pred,  # Shape: [B, 1, H, W]
-                expanded_domains.float()  # Shape: [B, 1, H, W]
-            )
+            critic_loss = F.binary_cross_entropy(domain_pred, expanded_domains)
             
-            # Feature Consistency Check für Künstler
             source_features = reduced_features[domains == 0]
             target_features = reduced_features[domains == 1]
             
             if source_features.size(0) > 0 and target_features.size(0) > 0:
                 similarity = spatial_consistency_loss(source_features, target_features)
+                artist_loss = -F.binary_cross_entropy(domain_pred, expanded_domains) + \
+                              config.get("feature_consistency_weight", 0.1) * similarity
                 metrics_tracker['feature_sim'].append(similarity.item())
-                
-                # Künstler Loss - Täuschung des Kritikers und Feature Konsistenz
-                artist_loss = -F.binary_cross_entropy(domain_pred, expanded_domains.float()) + \
-                             config.get("feature_consistency_weight", 0.1) * similarity
                 metrics_tracker['artist_loss'].append(artist_loss.item())
             else:
-                # Wenn nur eine Domain vorhanden, fokussiere auf Täuschung
-                artist_loss = -F.binary_cross_entropy(domain_pred, expanded_domains.float())
+                artist_loss = -F.binary_cross_entropy(domain_pred, expanded_domains)
                 metrics_tracker['artist_loss'].append(artist_loss.item())
             
-            # Metrics Tracking
             metrics_tracker['loss'].append(critic_loss.item())
             metrics_tracker['critic_loss'].append(critic_loss.item())
             metrics_tracker['domain_metrics'].append(
                 calculate_spatial_metrics(domain_pred, domains)
             )
     
-    # Berechne Validierungs-Metriken mit zusätzlichen Informationen
     val_metrics = {
         'loss': np.mean(metrics_tracker['loss']),
         'critic_loss': np.mean(metrics_tracker['critic_loss']),
