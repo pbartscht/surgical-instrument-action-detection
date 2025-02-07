@@ -20,6 +20,7 @@ import traceback
 from ultralytics.engine.predictor import BasePredictor
 from ultralytics.engine.results import Results, Boxes
 from ultralytics.utils.tal import make_anchors
+from datetime import datetime
 
 # Evaluation Constants
 CONFIDENCE_THRESHOLD = 0.1
@@ -463,7 +464,7 @@ class HeiCholeEvaluator:
             print(f"Error loading annotations: {str(e)}")
             raise
 
-    def evaluate_frame(self, img_path, ground_truth, save_visualization=True):
+    def evaluate_frame(self, img_path, ground_truth, save_visualization=False):
         """Evaluates a single frame and maps predictions to HeiChole format"""
         frame_predictions = []
         frame_number = int(os.path.basename(img_path).split('.')[0])
@@ -1094,14 +1095,385 @@ class YOLODebugger:
             for key, value in result.speed.items():
                 print(f"{key}: {value}ms")
 
+class ComparativeHeiCholeEvaluator:
+    def __init__(self, baseline_model, domain_adapted_model, dataset_dir, 
+                 baseline_threshold=0.5, adapted_threshold=0.1):
+        """
+        Initialize evaluator for comparing baseline and domain-adapted models.
+        
+        Args:
+            baseline_model: Original YOLO model
+            domain_adapted_model: Domain-adapted YOLO model
+            dataset_dir: Path to dataset
+            baseline_threshold: Confidence threshold for baseline model (default: 0.5)
+            adapted_threshold: Confidence threshold for adapted model (default: 0.1)
+        """
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.baseline_model = baseline_model
+        self.domain_adapted_model = domain_adapted_model
+        self.dataset_dir = dataset_dir
+        self.baseline_threshold = baseline_threshold
+        self.adapted_threshold = adapted_threshold
+        
+        # Separate metric calculators for each model
+        self.baseline_metrics = BinaryMetricsCalculator(confidence_threshold=baseline_threshold)
+        self.adapted_metrics = BinaryMetricsCalculator(confidence_threshold=adapted_threshold)
+
+    def evaluate_frame_both_models(self, img_path, ground_truth, save_visualization=False):
+        """
+        Evaluate a single frame with both models and return comparative results.
+        """
+        frame_number = int(os.path.basename(img_path).split('.')[0])
+        video_name = os.path.basename(os.path.dirname(img_path))
+        
+        img = Image.open(img_path)
+        
+        # Create two copies for visualization
+        baseline_img = img.copy()
+        adapted_img = img.copy()
+        
+        baseline_draw = ImageDraw.Draw(baseline_img)
+        adapted_draw = ImageDraw.Draw(adapted_img)
+        
+        predictions = {
+            'baseline': [],
+            'adapted': []
+        }
+        
+        try:
+            # Process with baseline model
+            baseline_results = self.baseline_model(img)
+            predictions['baseline'] = self._process_detections(
+                baseline_results[0].boxes,
+                frame_number,
+                video_name,
+                baseline_draw if save_visualization else None,
+                is_adapted=False
+            )
+            
+            # Process with domain-adapted model
+            adapted_results = self.domain_adapted_model(img)
+            predictions['adapted'] = self._process_detections(
+                adapted_results[0].boxes,
+                frame_number,
+                video_name,
+                adapted_draw if save_visualization else None,
+                is_adapted=True
+            )
+            
+            # Save visualizations
+            if save_visualization:
+                viz_dir = os.path.join(self.dataset_dir, "visualizations", "comparison")
+                os.makedirs(viz_dir, exist_ok=True)
+                
+                baseline_img.save(os.path.join(viz_dir, f"{video_name}_frame{frame_number}_baseline.png"))
+                adapted_img.save(os.path.join(viz_dir, f"{video_name}_frame{frame_number}_adapted.png"))
+                
+                # Create side-by-side comparison
+                comparison = Image.new('RGB', (baseline_img.width * 2, baseline_img.height))
+                comparison.paste(baseline_img, (0, 0))
+                comparison.paste(adapted_img, (baseline_img.width, 0))
+                comparison.save(os.path.join(viz_dir, f"{video_name}_frame{frame_number}_comparison.png"))
+            
+            return predictions
+            
+        except Exception as e:
+            print(f"Error processing frame {frame_number}: {str(e)}")
+            return predictions
+
+    def _process_detections(self, boxes, frame_number, video_name, draw=None, is_adapted=False):
+        """
+        Process detections from either model.
+        
+        Args:
+            boxes: Detection boxes from model
+            frame_number: Current frame number
+            video_name: Name of video
+            draw: ImageDraw object for visualization
+            is_adapted: True if processing adapted model output, False for baseline
+        """
+        predictions = []
+        
+        for detection in boxes:
+            instrument_class = int(detection.cls)
+            confidence = float(detection.conf)
+            
+            threshold = self.adapted_threshold if is_adapted else self.baseline_threshold
+            if confidence >= threshold:
+                if instrument_class in IGNORED_INSTRUMENTS:
+                    continue
+                
+                try:
+                    cholect50_instrument = TOOL_MAPPING[instrument_class]
+                except KeyError:
+                    continue
+                
+                mapped_instrument = CHOLECT50_TO_HEICHOLE_INSTRUMENT_MAPPING.get(cholect50_instrument)
+                
+                if mapped_instrument:
+                    if draw:
+                        box = detection.xyxy[0]
+                        x1, y1, x2, y2 = map(int, box)
+                        draw.rectangle([x1, y1, x2, y2], outline='red', width=3)
+                        text = f"{mapped_instrument}\nConf: {confidence:.2f}"
+                        draw.text((x1, y1-20), text, fill='blue')
+                    
+                    predictions.append({
+                        'frame_id': f"{video_name}_frame{frame_number}",
+                        'instrument': {
+                            'name': mapped_instrument,
+                            'confidence': confidence,
+                            'binary_pred': 1 if confidence >= CONFIDENCE_THRESHOLD else 0
+                        }
+                    })
+        
+        return predictions
+
+    def evaluate_dataset(self, videos_to_analyze):
+        """
+        Evaluate entire dataset with both models.
+        """
+        print("\nStarting comparative evaluation...")
+        
+        results = {
+            'baseline': {'predictions': {}, 'metrics': None},
+            'adapted': {'predictions': {}, 'metrics': None}
+        }
+        
+        total_frames = 0
+        ground_truth = {}
+        
+        for video in videos_to_analyze:
+            print(f"\nProcessing video: {video}")
+            
+            # Load ground truth
+            gt = self.load_ground_truth(video)
+            ground_truth.update(gt)
+            
+            # Process frames
+            video_folder = os.path.join(self.dataset_dir, "Videos", video)
+            for frame_file in tqdm(os.listdir(video_folder)):
+                if frame_file.endswith('.png'):
+                    total_frames += 1
+                    frame_id = f"{video}_frame{frame_file.split('.')[0]}"
+                    img_path = os.path.join(video_folder, frame_file)
+                    
+                    # Get predictions from both models
+                    frame_predictions = self.evaluate_frame_both_models(
+                        img_path,
+                        gt[int(frame_file.split('.')[0])],
+                        save_visualization=(total_frames % 100 == 0)  # Save every 100th frame
+                    )
+                    
+                    # Store predictions
+                    if frame_predictions['baseline']:
+                        results['baseline']['predictions'][frame_id] = frame_predictions['baseline']
+                    if frame_predictions['adapted']:
+                        results['adapted']['predictions'][frame_id] = frame_predictions['adapted']
+        
+        # Calculate metrics with different thresholds
+        results['baseline']['metrics'] = self.baseline_metrics.calculate_metrics(
+            results['baseline']['predictions'],
+            ground_truth
+        )
+        results['adapted']['metrics'] = self.adapted_metrics.calculate_metrics(
+            results['adapted']['predictions'],
+            ground_truth
+        )
+        
+        # Log thresholds used
+        print(f"\nConfidence Thresholds Used:")
+        print(f"Baseline Model: {self.baseline_threshold}")
+        print(f"Adapted Model:  {self.adapted_threshold}")
+        
+        return results, total_frames, ground_truth
+
+    def print_comparative_report(self, results, total_frames):
+        """Print detailed comparative report of both models."""
+        print("\n====== COMPARATIVE EVALUATION REPORT ======")
+        print("=" * 70)
+        
+        for model_type in ['baseline', 'adapted']:
+            print(f"\n{model_type.upper()} MODEL RESULTS:")
+            print("-" * 50)
+            metrics = results[model_type]['metrics']
+            
+            print(f"{'Instrument':15s} {'F1-Score':>10s} {'Precision':>10s} {'Recall':>10s} "
+                  f"{'AP':>10s} {'Support':>10s} {'Predictions':>12s}")
+            print("-" * 70)
+            
+            for label, scores in metrics['per_class'].items():
+                pred_count = scores['predictions']
+                percentage = (pred_count / total_frames) * 100 if total_frames > 0 else 0
+                
+                print(f"{label:15s} {scores['f1_score']:10.4f} {scores['precision']:10.4f} "
+                      f"{scores['recall']:10.4f} {scores['ap_score']:10.4f} {scores['support']:10d} "
+                      f"{pred_count:8d} ({percentage:5.1f}%)")
+            
+            print("\nMean Metrics:")
+            means = metrics['mean_metrics']
+            print(f"Mean AP:        {means['mean_ap']:.4f}")
+            print(f"Mean F1-Score:  {means['mean_f1']:.4f}")
+            print(f"Mean Precision: {means['mean_precision']:.4f}")
+            print(f"Mean Recall:    {means['mean_recall']:.4f}")
+        
+        # Print improvement analysis
+        self._print_improvement_analysis(results)
+
+    def _print_improvement_analysis(self, results):
+        """Analyze and print improvements of adapted model over baseline."""
+        print("\n====== IMPROVEMENT ANALYSIS ======")
+        print("=" * 40)
+        
+        baseline_metrics = results['baseline']['metrics']
+        adapted_metrics = results['adapted']['metrics']
+        
+        # Compare per-class metrics
+        print("\nPer-Class Improvements:")
+        print("-" * 30)
+        
+        for label in baseline_metrics['per_class'].keys():
+            baseline = baseline_metrics['per_class'][label]
+            adapted = adapted_metrics['per_class'][label]
+            
+            f1_diff = adapted['f1_score'] - baseline['f1_score']
+            ap_diff = adapted['ap_score'] - baseline['ap_score']
+            
+            print(f"\n{label}:")
+            print(f"F1-Score: {f1_diff:+.4f}")
+            print(f"AP Score: {f1_diff:+.4f}")
+        
+        # Compare mean metrics
+        print("\nMean Metric Improvements:")
+        print("-" * 30)
+        
+        mean_metrics = [
+            ('mean_ap', 'Mean AP'),
+            ('mean_f1', 'Mean F1'),
+            ('mean_precision', 'Mean Precision'),
+            ('mean_recall', 'Mean Recall')
+        ]
+        
+        for metric_key, metric_name in mean_metrics:
+            diff = adapted_metrics['mean_metrics'][metric_key] - baseline_metrics['mean_metrics'][metric_key]
+            print(f"{metric_name}: {diff:+.4f}")
+
+    def load_ground_truth(self, video):
+        """Load ground truth annotations for a video."""
+        labels_folder = os.path.join(self.dataset_dir, "Labels")
+        json_file = os.path.join(labels_folder, f"{video}.json")
+        
+        frame_annotations = defaultdict(lambda: {
+            'instruments': defaultdict(int)
+        })
+        
+        try:
+            with open(json_file, 'r') as f:
+                data = json.load(f)
+                frames = data.get('frames', {})
+                
+                for frame_num, frame_data in frames.items():
+                    frame_number = int(frame_num)
+                    instruments = frame_data.get('instruments', {})
+                    for instr_name, present in instruments.items():
+                        frame_annotations[frame_number]['instruments'][instr_name] = 1 if present > 0 else 0
+                
+                return frame_annotations
+                
+        except Exception as e:
+            print(f"Error loading annotations: {str(e)}")
+            raise
 
 def main():
+    """Compare baseline and domain-adapted models on HeiChole dataset"""
+    try:
+        print("\n=== Initializing Models ===")
+        # Initialize ModelLoader
+        loader = ModelLoader()
+        
+        # Load baseline YOLO model correctly
+        print("\nLoading baseline YOLO model...")
+        yolo_model = load_yolo_model(str(loader.yolo_weights))  # Using your existing load_yolo_model function
+        
+        # Create and load domain adapter
+        print("\nInitializing domain adapter...")
+        domain_adapter = DomainAdapter(str(loader.yolo_weights))
+        
+        # Load feature reducer weights
+        feature_reducer_path = Path("/home/Bartscht/YOLO/surgical-instrument-action-detection/domain_adaptation/hei_chole/experiments/class_aware_adapter_weights_class_aware_domain_adaptation/class_aware_feature_reducer.pt")
+        print(f"\nLoading feature reducer from: {feature_reducer_path}")
+        
+        if not feature_reducer_path.exists():
+            raise FileNotFoundError(f"Feature reducer weights not found at: {feature_reducer_path}")
+            
+        checkpoint = torch.load(feature_reducer_path)
+        domain_adapter.feature_reducer.load_state_dict(checkpoint['state_dict'])
+        
+        # Create domain-adapted YOLO model
+        print("\nCreating domain-adapted YOLO model...")
+        adapted_model = DomainAdaptedYOLO(
+            yolo_path=str(loader.yolo_weights),
+            feature_reducer=domain_adapter.feature_reducer
+        )
+        
+        dataset_dir = str(loader.dataset_path)
+        
+        # Specify videos to analyze
+        videos_to_analyze = ["VID08", "VID13"]
+        print(f"\nAnalyzing videos: {', '.join(videos_to_analyze)}")
+        
+        # Create comparative evaluator with different thresholds
+        print("\nInitializing comparative evaluator...")
+        evaluator = ComparativeHeiCholeEvaluator(
+            baseline_model=yolo_model,
+            domain_adapted_model=adapted_model,
+            dataset_dir=dataset_dir,
+            baseline_threshold=0.5,    # Higher threshold for baseline
+            adapted_threshold=0.1      # Lower threshold for adapted model
+        )
+        
+        # First analyze ground truth distribution
+        print("\n=== Analyzing Ground Truth Distribution ===")
+        gt_distribution = analyze_label_distribution(dataset_dir, videos_to_analyze)
+        
+        # Run evaluation
+        print("\n=== Starting Model Evaluation ===")
+        results, total_frames, ground_truth = evaluator.evaluate_dataset(videos_to_analyze)
+        
+        # Save results
+        print("\n=== Saving Results ===")
+        results_dir = Path("evaluation_results")
+        results_dir.mkdir(exist_ok=True)
+        
+        # Save metrics to JSON
+        metrics_file = results_dir / "comparative_metrics.json"
+        with open(metrics_file, 'w') as f:
+            json.dump({
+                'baseline': results['baseline']['metrics'],
+                'adapted': results['adapted']['metrics'],
+                'total_frames': total_frames,
+                'evaluation_date': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            }, f, indent=4)
+            
+        print(f"\nMetrics saved to: {metrics_file}")
+        
+        # Print comparative report
+        print("\n=== Generating Comparative Report ===")
+        evaluator.print_comparative_report(results, total_frames)
+        
+        print("\n=== Evaluation Complete ===")
+        
+    except Exception as e:
+        print(f"\n❌ Error during evaluation: {str(e)}")
+        import traceback
+        traceback.print_exc()
+
+def oldmain():
     """Test YOLO model debugging"""
     try:
         print("\n=== Initializing Models ===")
         loader = ModelLoader()
         
-        # Initialize debugger
         debugger = YOLODebugger(str(loader.yolo_weights))
         
         # Test frame analysis
@@ -1174,7 +1546,7 @@ def xmain():
         yolo_model.model.eval()
         
         # Path to feature reducer weights
-        weights_path = "/home/Bartscht/YOLO/surgical-instrument-action-detection/domain_adaptation/hei_chole/experiments/spatial_model_epoch_0.pt"
+        weights_path = "/home/Bartscht/YOLO/surgical-instrument-action-detection/domain_adaptation/hei_chole/experiments/class_aware_adapter_weights_class_aware_domain_adaptation/class_aware_feature_reducer.pt"
         
         print("\n=== Creating Domain-Adapted YOLO ===")
         # Initialize domain adapter
@@ -1257,6 +1629,7 @@ def xmain():
     except Exception as e:
         print(f"\nError during testing: {str(e)}")
         traceback.print_exc()
+
 def yolomain():
     """Test YOLO model debugging"""
     try:

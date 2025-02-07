@@ -73,6 +73,8 @@ class ClassAwareSpatialAdapter(nn.Module):
             nn.ReLU(),
             nn.Conv2d(256, 5, 1)  # 6 instruments, but hook and bipolar mapped to  "coagulation"
         )
+        self.current_step = 0
+        self.warmup_steps = 1000
 
     def set_train_mode(self, mode=True):
         self.feature_reducer.train(mode)
@@ -81,7 +83,12 @@ class ClassAwareSpatialAdapter(nn.Module):
         self.yolo_model.eval()
         return self
 
-    def forward(self, images, domains, alpha=1.0, return_features=False):
+    def forward(self, images, domains, alpha=None, return_features=False):
+        
+        if alpha is None:
+            alpha = min(1.0, self.current_step / self.warmup_steps)
+            self.current_step += 1
+
         # Feature Extraction
         with torch.no_grad():
             x = images.clone()
@@ -95,7 +102,6 @@ class ClassAwareSpatialAdapter(nn.Module):
         
         # Feature Reduction
         reduced_features = self.feature_reducer(features)
-        
         # Domain Classification mit GRL
         domain_features = GradientReversalLayer.apply(reduced_features, alpha)
         domain_pred = self.domain_classifier(domain_features)
@@ -119,23 +125,26 @@ def spatial_consistency_loss(source_features, target_features):
         target_features,
         dim=1
     ).mean()
-    return similarity
+    return 1 - similarity
 
 def class_aware_consistency_loss(source_features, target_features, source_labels):
     """Berechnet Feature-Consistency pro Klasse"""
     total_similarity = 0
     num_classes = source_labels.size(1)
-    valid_classes = 0
+    weights = []
     
     for class_idx in range(num_classes):
         class_mask = source_labels[:, class_idx] > 0.5
         if class_mask.any():
             class_source_features = source_features[class_mask]
+            # Stärkere Gewichtung für seltenere Klassen
+            weight = 1.0 / (class_mask.float().mean() + 1e-6)
+            weights.append(weight)
+            
             similarity = spatial_consistency_loss(class_source_features, target_features)
-            total_similarity += similarity
-            valid_classes += 1
-    
-    return total_similarity / valid_classes if valid_classes > 0 else torch.tensor(0.0).to(source_features.device)
+            total_similarity += weight * similarity
+            
+    return total_similarity / sum(weights) if weights else torch.tensor(0.0).to(source_features.device)
 
 def calculate_spatial_metrics(domain_preds, domains):
     """Berechnet Metriken basierend auf den Domain-Predictions"""
@@ -351,8 +360,8 @@ def main():
         "batch_size": 32,
         "patience": 10,
         "model_path": "/data/Bartscht/YOLO/best_v35.pt",
-        "feature_consistency_weight": 0.1,
-        "class_weight": 0.5,        # NEU: Gewichtung des Klassifikations-Loss
+        "feature_consistency_weight": 0.5, # # !! von 0.1 - stärkerer Fokus auf Feature-Erhaltung
+        "class_weight": 1.0,        #Erhöht!!
         "min_lr": 1e-6,
         "experiment_name": "class_aware_domain_adaptation"
     }
