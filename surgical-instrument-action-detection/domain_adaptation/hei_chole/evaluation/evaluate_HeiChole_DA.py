@@ -1468,7 +1468,7 @@ def main():
         import traceback
         traceback.print_exc()
 
-def oldmain():
+def debugmain():
     """Test YOLO model debugging"""
     try:
         print("\n=== Initializing Models ===")
@@ -1527,125 +1527,6 @@ def oldmain():
         print(f"\nError during testing: {str(e)}")
         traceback.print_exc()
 
-def xmain():
-    """Test domain-adapted YOLO model with feature reducer"""
-    try:
-        print("\n=== Initializing Models ===")
-        # Initialize ModelLoader
-        loader = ModelLoader()
-        
-        # Run debug analysis first
-        print("\n=== Running Debug Analysis ===")
-        test_frame_path = os.path.join(loader.dataset_path, "Videos", "VID08", "030300.png")
-        debug_results = debug_original_yolo(str(loader.yolo_weights), test_frame_path)
-        print("\n=== Debug Analysis Complete ===")
-        
-        # Load base YOLO model
-        print("\nLoading base YOLO model...")
-        yolo_model = load_yolo_model(str(loader.yolo_weights))
-        yolo_model.model.eval()
-        
-        # Path to feature reducer weights
-        weights_path = "/home/Bartscht/YOLO/surgical-instrument-action-detection/domain_adaptation/hei_chole/experiments/class_aware_adapter_weights_class_aware_domain_adaptation/class_aware_feature_reducer.pt"
-        
-        print("\n=== Creating Domain-Adapted YOLO ===")
-        # Initialize domain adapter
-        domain_adapter = DomainAdapter(str(loader.yolo_weights))
-        
-        # Load feature reducer weights
-        print(f"\nLoading feature reducer weights from: {weights_path}")
-        checkpoint = torch.load(weights_path)
-        domain_adapter.feature_reducer.load_state_dict(checkpoint['feature_reducer'])
-        
-        # Create adapted model
-        adapted_yolo = DomainAdaptedYOLO(
-            yolo_path=str(loader.yolo_weights),
-            feature_reducer=domain_adapter.feature_reducer
-        )
-        
-        # Move model to GPU if available
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        adapted_yolo = adapted_yolo.to(device)
-        print(f"\nModel moved to device: {device}")
-        
-        # Test frames
-        test_frames = [
-            {'frame': '030300', 'path': "VID08"},
-            {'frame': '030325', 'path': "VID08"},
-            {'frame': '030350', 'path': "VID08"},
-            {'frame': '030375', 'path': "VID08"}
-        ]
-        #comparer = YOLOOutputComparer(str(loader.yolo_weights))
-        #comparer.set_domain_adapter(domain_adapter, weights_path)
-
-        print("\n=== Testing Model on Frames ===")
-        for frame_info in test_frames:
-            frame_number = frame_info['frame']
-            video_path = frame_info['path']
-            
-            # Construct frame path
-            frame_path = os.path.join(
-                loader.dataset_path, 
-                "Videos", 
-                video_path,
-                f"{frame_number}.png"
-            )
-            
-            print(f"\nProcessing frame {frame_number} from {video_path}")
-            
-            try:
-                # Load and preprocess image
-                img = Image.open(frame_path)
-                transform = transforms.Compose([
-                    transforms.ToTensor(),
-                    transforms.Normalize(
-                        mean=[0.485, 0.456, 0.406],
-                        std=[0.229, 0.224, 0.225]
-                    )
-                ])
-                img_tensor = transform(img).unsqueeze(0).to(device)
-                
-                # Run inference
-                with torch.no_grad():
-                    print(f"\nRunning inference on frame {frame_number}")
-                    predictions = adapted_yolo(img_tensor)
-                    
-                    # Print detailed prediction information
-                    if isinstance(predictions, (tuple, list)):
-                        for i, pred in enumerate(predictions):
-                            print(f"Prediction {i} type: {type(pred)}")
-                            print(f"Prediction {i} shape: {pred.shape if hasattr(pred, 'shape') else 'N/A'}")
-                    else:
-                        print(f"Prediction type: {type(predictions)}")
-                        print(f"Prediction shape: {predictions.shape if hasattr(predictions, 'shape') else 'N/A'}")
-                    
-            except Exception as e:
-                print(f"Error processing frame {frame_number}: {str(e)}")
-                traceback.print_exc()
-                continue
-        
-        print("\n=== Testing Complete ===")
-        
-    except Exception as e:
-        print(f"\nError during testing: {str(e)}")
-        traceback.print_exc()
-
-def yolomain():
-    """Test YOLO model debugging"""
-    try:
-        print("\n=== Initializing Models ===")
-        loader = ModelLoader()
-        
-        # Initialize debugger
-        debugger = YOLODebugger(str(loader.yolo_weights))
-        
-        # Test frame analysis
-        test_frame_path = os.path.join(loader.dataset_path, "Videos", "VID08", "030300.png")
-        debugger.trace_prediction_flow(test_frame_path)
-        
-    except Exception as e:
-        print(f"\nError during testing: {str(e)}")
-        traceback.print_exc()
 
 if __name__ == '__main__':
     main()

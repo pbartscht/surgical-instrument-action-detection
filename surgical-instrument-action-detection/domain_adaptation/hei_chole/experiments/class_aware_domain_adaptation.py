@@ -6,7 +6,8 @@ import numpy as np
 from pathlib import Path
 import wandb
 from tqdm import tqdm
-from dataloader import balanced_dataloader
+#from dataloader import balanced_dataloader
+from BalancedWeightedSampler import balanced_dataloader
 
 class GradientReversalLayer(torch.autograd.Function):
     @staticmethod
@@ -74,7 +75,7 @@ class ClassAwareSpatialAdapter(nn.Module):
             nn.Conv2d(512, 256, 1),
             nn.BatchNorm2d(256),
             nn.ReLU(),
-            nn.Conv2d(256, 5, 1)  # 6 instruments, but hook and bipolar mapped to  "coagulation"
+            nn.Conv2d(256, 6, 1)  # 6 instruments
         )
         self.current_step = 0
         self.warmup_steps = 1000

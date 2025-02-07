@@ -46,7 +46,7 @@ class CombinedDataset(Dataset):
         self.source_dataset = SurgicalDataset(source_dir, 'source')
         self.target_dataset = SurgicalDataset(target_dir, 'target')
         
-        self.mapping_matrix = self.create_mapping_matrix()
+        #self.mapping_matrix = self.create_mapping_matrix()
         self.source_len = len(self.source_dataset)
         self.target_len = len(self.target_dataset)
         
@@ -54,15 +54,6 @@ class CombinedDataset(Dataset):
         print(f"CholecT50 Samples: {self.source_len}")
         print(f"HeiChole Samples: {self.target_len}")
         
-    def create_mapping_matrix(self):
-        mapping_matrix = torch.zeros(6, 5)
-        mapping_matrix[0, 0] = 1  # grasper -> grasper
-        mapping_matrix[1, 2] = 1  # bipolar -> coagulation
-        mapping_matrix[2, 2] = 1  # hook -> coagulation
-        mapping_matrix[3, 3] = 1  # scissors -> scissors
-        mapping_matrix[4, 1] = 1  # clipper -> clipper
-        mapping_matrix[5, 4] = 1  # irrigator -> suction_irrigation
-        return mapping_matrix
     
     def __len__(self):
         return self.source_len + self.target_len
@@ -78,10 +69,9 @@ class CombinedDataset(Dataset):
         
         if idx < self.source_len:
             sample = self.source_dataset[idx]
-            mapped_labels = torch.matmul(sample['labels'].float(), self.mapping_matrix)
             base_sample.update({
                 'image': sample['image'],
-                'labels': mapped_labels,
+                'labels': sample['labels'],
                 'domain': torch.tensor(0),
                 'video': sample['video'],
                 'frame': sample['frame']
@@ -90,7 +80,7 @@ class CombinedDataset(Dataset):
             sample = self.target_dataset[idx - self.source_len]
             base_sample.update({
                 'image': sample['image'],
-                'labels': sample['labels'][:5],
+                'labels': sample['labels'][:6],
                 'domain': torch.tensor(1),
                 'video': sample['video'],
                 'frame': sample['frame']
