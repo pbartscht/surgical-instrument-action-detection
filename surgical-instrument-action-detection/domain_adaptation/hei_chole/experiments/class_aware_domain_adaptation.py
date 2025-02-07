@@ -30,6 +30,7 @@ class ResidualBlock(nn.Module):
     def forward(self, x):
         residual = x
         out = F.relu(self.bn1(self.conv1(x)))
+        out = self.dropout(out)
         out = self.bn2(self.conv2(out))
         out += residual
         return F.relu(out)
@@ -119,34 +120,62 @@ class ClassAwareSpatialAdapter(nn.Module):
             }
         return domain_pred
 
-def spatial_consistency_loss(source_features, target_features):
-    """Berechnet Feature-Consistency über räumliche Dimensionen"""
-    mean_source = source_features.mean(dim=0, keepdim=True)
-    similarity = F.cosine_similarity(
-        mean_source.expand(target_features.size(0), -1, -1, -1),
-        target_features,
-        dim=1
-    ).mean()
-    return 1 - similarity
+def spatial_consistency_loss(source_features, target_features, kernel_size=3):
+    """Berechnet Feature-Consistency auf lokalen Regionen"""
+    B, C, H, W = source_features.shape
+    
+    # Extrahiere lokale Patches mit Faltung
+    unfold = nn.Unfold(kernel_size=kernel_size, padding=kernel_size//2)
+    source_patches = unfold(source_features)  # [B, C*k*k, L]
+    target_patches = unfold(target_features)  # [B, C*k*k, L]
+    
+    # Normalisiere Patches
+    source_patches = F.normalize(source_patches, dim=1)
+    target_patches = F.normalize(target_patches, dim=1)
+    
+    # Berechne Similarity-Matrix zwischen allen Patches
+    similarity_matrix = torch.bmm(source_patches.transpose(1,2), target_patches)  # [B, L, L]
+    
+    # Finde beste Matches für jeden Patch
+    max_similarity, _ = similarity_matrix.max(dim=2)  # [B, L]
+    
+    return 1 - max_similarity.mean()
 
-def class_aware_consistency_loss(source_features, target_features, source_labels):
-    """Berechnet Feature-Consistency pro Klasse"""
+def class_aware_consistency_loss(source_features, target_features, source_labels, class_predictor):
     total_similarity = 0
     num_classes = source_labels.size(1)
     weights = []
     
     for class_idx in range(num_classes):
+        # Berechne die Maske für Samples in der Source-Domain, bei denen die Klasse vorhanden ist.
         class_mask = source_labels[:, class_idx] > 0.5
         if class_mask.any():
-            class_source_features = source_features[class_mask]
-            # Stärkere Gewichtung für seltenere Klassen
+            # Berechne die Attention Map (basierend auf den Source-Features) für die aktuelle Klasse.
+            class_attention = class_predictor(source_features)[:, class_idx:class_idx+1]
+            attention = torch.sigmoid(class_attention)
+            
+            # Wende die Attention auf beide Domains an.
+            weighted_source_features = source_features * attention
+            weighted_target_features = target_features * attention
+            
+            # Gewichtung für seltenere Klassen (damit Klassen mit wenigen positiven Samples stärker gewichtet werden)
             weight = 1.0 / (class_mask.float().mean() + 1e-6)
             weights.append(weight)
             
-            similarity = spatial_consistency_loss(class_source_features, target_features)
-            total_similarity += weight * similarity
+            # Wähle die Source-Samples aus, die diese Klasse haben.
+            selected_source_features = weighted_source_features[class_mask]
+            # Anstatt alle Target-Samples zu verwenden, bilde den Mittelwert der Target-Features
+            # (als Proxy für die typische Target-Domain-Repräsentation) und repliziere ihn.
+            target_mean = weighted_target_features.mean(dim=0, keepdim=True)
+            target_mean = target_mean.expand(selected_source_features.size(0), -1, -1, -1)
             
+            # Berechne den spatial consistency loss zwischen den selektierten Source-Features
+            # und dem mittleren Target-Feature (repliziert auf die gleiche Batch-Größe).
+            similarity = spatial_consistency_loss(selected_source_features, target_mean)
+            total_similarity += weight * similarity
+    
     return total_similarity / sum(weights) if weights else torch.tensor(0.0).to(source_features.device)
+
 
 def calculate_spatial_metrics(domain_preds, domains):
     """Berechnet Metriken basierend auf den Domain-Predictions"""
@@ -227,7 +256,7 @@ def train_epoch(model, dataloader, optimizer_reducer, optimizer_classifier, devi
         
         if source_features.size(0) > 0 and target_features.size(0) > 0:
             consistency_loss = class_aware_consistency_loss(
-                source_features, target_features, source_labels
+                source_features, target_features, source_labels, model.class_predictor
             )
         else:
             consistency_loss = torch.tensor(0.0).to(device)
@@ -312,7 +341,7 @@ def validate_epoch(model, dataloader, device, epoch, config):
             
             if source_features.size(0) > 0 and target_features.size(0) > 0:
                 consistency_loss = class_aware_consistency_loss(
-                    source_features, target_features, source_labels
+                    source_features, target_features, source_labels, model.class_predictor
                 )
             else:
                 consistency_loss = torch.tensor(0.0).to(device)
