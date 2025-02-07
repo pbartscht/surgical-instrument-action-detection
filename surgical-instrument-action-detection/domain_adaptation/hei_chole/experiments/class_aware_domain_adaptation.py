@@ -22,9 +22,10 @@ class ResidualBlock(nn.Module):
     def __init__(self, in_channels, out_channels):
         super().__init__()
         self.conv1 = nn.Conv2d(in_channels, out_channels, 3, padding=1)
-        self.bn1 = nn.BatchNorm2d(out_channels)
+        self.bn1 = nn.BatchNorm2d(out_channels, momentum=0.01)
         self.conv2 = nn.Conv2d(out_channels, out_channels, 3, padding=1)
-        self.bn2 = nn.BatchNorm2d(out_channels)
+        self.bn2 = nn.BatchNorm2d(out_channels, momentum=0.01)
+        self.dropout = nn.Dropout2d(p=0.1)
         
     def forward(self, x):
         residual = x
@@ -48,11 +49,12 @@ class ClassAwareSpatialAdapter(nn.Module):
             
         # Feature Reducer
         self.feature_reducer = nn.Sequential(
-            nn.Conv2d(512, 512, kernel_size=1),
-            nn.BatchNorm2d(512),
-            nn.ReLU(),
             ResidualBlock(512, 512),
-            nn.Conv2d(512, 512, kernel_size=3, padding=1, groups=32),
+            nn.Dropout2d(p=0.1),
+            nn.Conv2d(512, 512, kernel_size=1),
+            nn.BatchNorm2d(512, momentum=0.01),
+            nn.ReLU(),
+            nn.Conv2d(512, 512, kernel_size=3, padding=1, groups=64),
             nn.BatchNorm2d(512),
             nn.ReLU()
         )
@@ -360,9 +362,10 @@ def main():
         "batch_size": 32,
         "patience": 10,
         "model_path": "/data/Bartscht/YOLO/best_v35.pt",
-        "feature_consistency_weight": 0.5, # # !! von 0.1 - stärkerer Fokus auf Feature-Erhaltung
-        "class_weight": 1.0,        #Erhöht!!
+        "feature_consistency_weight": 1.0, # # !! von 0.1 - stärkerer Fokus auf Feature-Erhaltung
+        "class_weight": 1.5,        #Erhöht!!
         "min_lr": 1e-6,
+        "warmup_steps": 1000,
         "experiment_name": "class_aware_domain_adaptation"
     }
     

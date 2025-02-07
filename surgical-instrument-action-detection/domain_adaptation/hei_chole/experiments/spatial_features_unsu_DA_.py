@@ -313,7 +313,7 @@ def main():
         "batch_size": 32,
         "patience": 10,
         "model_path": "/data/Bartscht/YOLO/best_v35.pt",
-        "feature_consistency_weight": 0.1,
+        "feature_consistency_weight": 2.0,
         "min_lr": 1e-6,
         "experiment_name": "spatial_domain_adaptation"
     }
