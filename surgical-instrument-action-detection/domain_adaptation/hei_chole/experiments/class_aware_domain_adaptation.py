@@ -71,7 +71,7 @@ class ClassAwareSpatialAdapter(nn.Module):
             nn.Conv2d(512, 256, 1),
             nn.BatchNorm2d(256),
             nn.ReLU(),
-            nn.Conv2d(256, 5, 1)  # 5 Klassen
+            nn.Conv2d(256, 5, 1)  # 6 instruments, but hook and bipolar mapped to  "coagulation"
         )
 
     def set_train_mode(self, mode=True):
@@ -196,7 +196,7 @@ def train_epoch(model, dataloader, optimizer_reducer, optimizer_classifier, devi
         reduced_features = outputs['features']
         
         # Domain Confusion Loss
-        domain_confusion_loss = -F.binary_cross_entropy(domain_pred, expanded_domains)
+        domain_confusion_loss = F.binary_cross_entropy(domain_pred, expanded_domains)
         
         # Class Loss (nur für Source Domain)
         source_mask = domains == 0
