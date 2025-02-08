@@ -136,6 +136,7 @@ class CombinedDataset(Dataset):
         return self.source_len + self.target_len
     
     def __getitem__(self, idx):
+        # Initialize base sample structure
         base_sample = {
             'image': None,
             'labels': None,
@@ -148,16 +149,18 @@ class CombinedDataset(Dataset):
             sample = self.source_dataset[idx]
             base_sample.update({
                 'image': sample['image'],
-                'labels': sample['labels'],
+                'labels': sample['labels'],  # Behalte originale 6D Labels
                 'domain': torch.tensor(0),
                 'video': sample['video'],
                 'frame': sample['frame']
             })
         else:
             sample = self.target_dataset[idx - self.source_len]
+            # Erzeuge 6D Dummy-Labels für Target
+            dummy_labels = torch.zeros(6, dtype=torch.float)
             base_sample.update({
                 'image': sample['image'],
-                'labels': sample['labels'][:5],
+                'labels': dummy_labels,  # 6D Dummy-Labels
                 'domain': torch.tensor(1),
                 'video': sample['video'],
                 'frame': sample['frame']

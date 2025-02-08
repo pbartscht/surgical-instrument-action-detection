@@ -231,13 +231,14 @@ def train_epoch(model, dataloader, optimizer_reducer, optimizer_classifier, devi
 
         # 2. Training des Feature Reducers (mit Class Predictor)
         optimizer_reducer.zero_grad()
-        outputs = model(images, domains, alpha=1.0, return_features=True)
+        outputs = model(images, domains, return_features=True)
         domain_pred = outputs['domain_pred']
         class_pred = outputs['class_pred']
         reduced_features = outputs['features']
         
         # Domain Confusion Loss
         domain_confusion_loss = F.binary_cross_entropy(domain_pred, expanded_domains)
+        domain_confusion_loss = 0.5 * domain_confusion_loss
         
         # Class Loss (nur für Source Domain)
         source_mask = domains == 0
