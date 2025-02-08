@@ -8,6 +8,7 @@ import wandb
 from tqdm import tqdm
 #from dataloader import balanced_dataloader
 from BalancedWeightedSampler import balanced_dataloader
+import copy
 
 class GradientReversalLayer(torch.autograd.Function):
     @staticmethod
@@ -23,19 +24,20 @@ class ResidualBlock(nn.Module):
     def __init__(self, in_channels, out_channels):
         super().__init__()
         self.conv1 = nn.Conv2d(in_channels, out_channels, 3, padding=1)
-        self.bn1 = nn.BatchNorm2d(out_channels, momentum=0.01)
+        # Instance Norm statt BatchNorm
+        self.in1 = nn.InstanceNorm2d(out_channels, affine=True)  
         self.conv2 = nn.Conv2d(out_channels, out_channels, 3, padding=1)
-        self.bn2 = nn.BatchNorm2d(out_channels, momentum=0.01)
+        self.in2 = nn.InstanceNorm2d(out_channels, affine=True)
         self.dropout = nn.Dropout2d(p=0.1)
         
     def forward(self, x):
         residual = x
-        out = F.relu(self.bn1(self.conv1(x)))
+        out = F.relu(self.in1(self.conv1(x)))
         out = self.dropout(out)
-        out = self.bn2(self.conv2(out))
+        out = self.in2(self.conv2(out))
         out += residual
         return F.relu(out)
-
+    
 class ClassAwareSpatialAdapter(nn.Module):
     def __init__(self, yolo_path="/data/Bartscht/YOLO/best_v35.pt"):
         super().__init__()
@@ -54,17 +56,17 @@ class ClassAwareSpatialAdapter(nn.Module):
             ResidualBlock(512, 512),
             nn.Dropout2d(p=0.1),
             nn.Conv2d(512, 512, kernel_size=1),
-            nn.BatchNorm2d(512, momentum=0.01),
+            nn.InstanceNorm2d(512, affine=True),
             nn.ReLU(),
             nn.Conv2d(512, 512, kernel_size=3, padding=1, groups=64),
-            nn.BatchNorm2d(512),
+            nn.InstanceNorm2d(512, affine=True),
             nn.ReLU()
         )
 
         # Domain Classifier
         self.domain_classifier = nn.Sequential(
             nn.Conv2d(512, 256, 1),
-            nn.BatchNorm2d(256),
+            nn.InstanceNorm2d(256, affine=True),
             nn.ReLU(),
             nn.Conv2d(256, 1, 1),
             nn.Sigmoid()
@@ -73,12 +75,24 @@ class ClassAwareSpatialAdapter(nn.Module):
         # Class Predictor
         self.class_predictor = nn.Sequential(
             nn.Conv2d(512, 256, 1),
-            nn.BatchNorm2d(256),
+            nn.InstanceNorm2d(256, affine=True),
             nn.ReLU(),
             nn.Conv2d(256, 6, 1)  # 6 instruments
         )
         self.current_step = 0
         self.warmup_steps = 1000
+
+        self.ema_model = None
+        self.ema_decay = 0.999
+
+    def update_ema_model(self):
+        # Aktualisiere EMA Model
+        if self.ema_model is None:
+            self.ema_model = copy.deepcopy(self)
+        else:
+            with torch.no_grad():
+                for param, ema_param in zip(self.parameters(), self.ema_model.parameters()):
+                    ema_param.data = self.ema_decay * ema_param.data + (1 - self.ema_decay) * param.data
 
     def set_train_mode(self, mode=True):
         self.feature_reducer.train(mode)
@@ -243,11 +257,20 @@ def train_epoch(model, dataloader, optimizer_reducer, optimizer_classifier, devi
         # Class Loss (nur für Source Domain)
         source_mask = domains == 0
         if source_mask.any():
-            class_pred_source = class_pred[source_mask].mean(dim=(2, 3))
-            class_loss = F.binary_cross_entropy_with_logits(
-                class_pred_source,
-                labels[source_mask]
-            )
+                # source_class_pred hat die Form [N, 6, H, W]
+                source_class_pred = class_pred[source_mask]
+                # Berechne die Attention-Map (Werte zwischen 0 und 1)
+                attention = torch.sigmoid(source_class_pred)
+                # Berechne den gewichteten Mittelwert über die räumlichen Dimensionen
+                weighted_sum = (source_class_pred * attention).sum(dim=(2, 3))
+                weights = attention.sum(dim=(2, 3)) + 1e-6  # Vermeide Division durch 0
+                class_pred_weighted = weighted_sum / weights
+                
+                # Berechne den Loss mit den gewichteten Vorhersagen
+                class_loss = F.binary_cross_entropy_with_logits(
+                    class_pred_weighted,
+                    labels[source_mask]
+                )
         else:
             class_loss = torch.tensor(0.0).to(device)
         
@@ -328,9 +351,18 @@ def validate_epoch(model, dataloader, device, epoch, config):
             # Class Loss (nur für Source Domain)
             source_mask = domains == 0
             if source_mask.any():
-                class_pred_source = class_pred[source_mask].mean(dim=(2, 3))
+                # source_class_pred hat die Form [N, 6, H, W]
+                source_class_pred = class_pred[source_mask]
+                # Berechne die Attention-Map (Werte zwischen 0 und 1)
+                attention = torch.sigmoid(source_class_pred)
+                # Berechne den gewichteten Mittelwert über die räumlichen Dimensionen
+                weighted_sum = (source_class_pred * attention).sum(dim=(2, 3))
+                weights = attention.sum(dim=(2, 3)) + 1e-6  # Vermeide Division durch 0
+                class_pred_weighted = weighted_sum / weights
+                
+                # Berechne den Loss mit den gewichteten Vorhersagen
                 class_loss = F.binary_cross_entropy_with_logits(
-                    class_pred_source,
+                    class_pred_weighted,
                     labels[source_mask]
                 )
             else:
