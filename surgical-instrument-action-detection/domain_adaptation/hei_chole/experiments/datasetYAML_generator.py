@@ -52,6 +52,7 @@ def calculate_class_weights(class_counts, total_objects, method='inverse'):
 
 def update_dataset_yaml(yaml_path, class_weights):
     """
+    copy old dataset.yaml into new mixed_samples_epoch_x to refresh class distribution
     Aktualisiert die dataset.yaml mit den neuen Klassengewichten
     """
     with open(yaml_path, 'r') as f:
@@ -64,7 +65,7 @@ def update_dataset_yaml(yaml_path, class_weights):
         yaml.dump(yaml_content, f, sort_keys=False)
 
 def main():
-    base_path = "/data/Bartscht/mixed_samples_epoch2"
+    base_path = "/data/Bartscht/mixed_samples_epoch3"
     labels_dir = os.path.join(base_path, "labels")
     yaml_path = os.path.join(base_path, "dataset.yaml")
     

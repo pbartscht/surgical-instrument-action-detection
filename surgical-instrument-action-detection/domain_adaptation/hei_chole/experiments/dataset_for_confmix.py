@@ -8,10 +8,10 @@ import random
 import math
 
 # Erweiterte Constants
-YOLO_MODEL_PATH = "/home/Bartscht/YOLO/surgical-instrument-action-detection/domain_adaptation/hei_chole/experiments/heichole_transfer/transfer_learning/weights/best.pt"
+YOLO_MODEL_PATH = "/home/Bartscht/YOLO/surgical-instrument-action-detection/domain_adaptation/hei_chole/experiments/heichole_transfer_2/transfer_learning/weights/epoch30.pt"
 HEICHOLE_DATASET_PATH = "/data/Bartscht/HeiChole/domain_adaptation/train"
 CHOLECT50_PATH = "/data/Bartscht/YOLO"
-MIXED_SAMPLES_PATH = "/data/Bartscht/mixed_samples_epoch2"  
+MIXED_SAMPLES_PATH = "/data/Bartscht/mixed_samples_epoch3"  
 CONFIDENCE_THRESHOLD = 0.25
 
 # Instrument mappings from your existing code
