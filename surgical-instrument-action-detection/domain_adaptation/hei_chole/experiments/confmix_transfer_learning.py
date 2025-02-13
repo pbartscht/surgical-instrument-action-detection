@@ -87,8 +87,8 @@ def setup_transfer_learning(pretrained_model_path, dataset_yaml_path, project_na
 
 def main():
     # Pfade definieren
-    PRETRAINED_MODEL = "/home/Bartscht/YOLO/surgical-instrument-action-detection/domain_adaptation/hei_chole/experiments/heichole_transfer_2/transfer_learning/weights/epoch30.pt"
-    DATASET_YAML = "/data/Bartscht/mixed_samples_epoch3/dataset.yaml"
+    PRETRAINED_MODEL = "/home/Bartscht/YOLO/surgical-instrument-action-detection/domain_adaptation/hei_chole/experiments/heichole_transfer/transfer_learning/weights/best.pt"
+    DATASET_YAML = "/data/Bartscht/mixed_samples_epoch2/dataset.yaml"
     
     print("Starting transfer learning with memory-optimized settings...")
     print(f"Using pretrained model: {PRETRAINED_MODEL}")

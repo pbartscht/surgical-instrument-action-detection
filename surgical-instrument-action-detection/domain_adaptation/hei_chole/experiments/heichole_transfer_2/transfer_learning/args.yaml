@@ -1,7 +1,7 @@
 task: detect
 mode: train
-model: /home/Bartscht/YOLO/surgical-instrument-action-detection/domain_adaptation/hei_chole/experiments/heichole_transfer_2/transfer_learning/weights/epoch30.pt
-data: /data/Bartscht/mixed_samples_epoch3/dataset.yaml
+model: /home/Bartscht/YOLO/surgical-instrument-action-detection/domain_adaptation/hei_chole/experiments/heichole_transfer/transfer_learning/weights/best.pt
+data: /data/Bartscht/mixed_samples_epoch2/dataset.yaml
 epochs: 100
 time: null
 patience: 20
