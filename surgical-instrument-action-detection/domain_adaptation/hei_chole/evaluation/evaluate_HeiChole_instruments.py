@@ -66,7 +66,7 @@ class ModelLoader:
         """Defines all important paths for the models"""
         # YOLO model path
         #self.yolo_weights = self.hierarchical_dir / "Instrument-classification-detection" / "weights" / "instrument_detector" / "best_v35.pt"
-        self.yolo_weights = Path("/home/Bartscht/YOLO/surgical-instrument-action-detection/domain_adaptation/hei_chole/experiments/heichole_transfer_2/transfer_learning/weights/epoch0.pt")
+        self.yolo_weights = Path("/home/Bartscht/YOLO/surgical-instrument-action-detection/domain_adaptation/hei_chole/experiments/heichole_transfer_2/transfer_learning/weights/epoch20.pt")
         # Dataset path for HeiChole
         self.dataset_path = Path("/data/Bartscht/HeiChole/domain_adaptation/test")
         
@@ -458,7 +458,13 @@ def main():
         dataset_dir = str(loader.dataset_path)
         
         # Specify videos to analyze
-        videos_to_analyze = ["VID08", "VID13"]
+        videos_to_analyze = [
+            "VID08", 
+            "VID13", 
+            "VID15", 
+            "VID17", 
+            "VID21"
+        ]
         print(f"\nAnalyzing videos: {', '.join(videos_to_analyze)}")
         
         print("\n==========================================")
