@@ -33,19 +33,34 @@ class YOLOLossAdapter:
 
     def _capture_loss(self, module, input, output):
         """Erweiterte Loss-Erfassung"""
-        # Fall 1: Loss im Output
+        # Fall 1: Loss im Output als direkter Wert
         if isinstance(output, dict) and 'loss' in output:
             self.current_loss = output['loss']
+            return
+        
         # Fall 2: Loss als Attribut
-        elif hasattr(output, 'loss'):
-            self.current_loss = output.loss
+        if hasattr(output, 'loss'):
+            loss_attr = getattr(output, 'loss')
+            if not callable(loss_attr):  # Wenn es ein Wert ist
+                self.current_loss = loss_attr
+                return
+        
         # Fall 3: Loss im Modul
-        elif hasattr(module, 'loss'):
-            self.current_loss = module.loss
-            
-        # Detach und zu Tensor konvertieren falls nötig
+        if hasattr(module, 'loss'):
+            loss_attr = getattr(module, 'loss')
+            if not callable(loss_attr):  # Wenn es ein Wert ist
+                self.current_loss = loss_attr
+                return
+        
+        # Wenn kein direkter Loss-Wert gefunden wurde
+        self.current_loss = torch.tensor(0.0)
+                
+        # Konvertierung zu Tensor
         if self.current_loss is not None:
-            self.current_loss = torch.tensor(self.current_loss.detach())
+            if isinstance(self.current_loss, torch.Tensor):
+                self.current_loss = self.current_loss.detach()
+            elif isinstance(self.current_loss, (int, float)):
+                self.current_loss = torch.tensor(self.current_loss)
 
     def train_step(self, batch, custom_loss_fn=None):
         """Sicherer Trainingsschritt"""

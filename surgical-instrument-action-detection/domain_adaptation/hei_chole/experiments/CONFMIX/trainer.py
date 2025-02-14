@@ -34,7 +34,7 @@ class ConfMixTrainer:
     def _train_source_batch(self, batch):
         """Trainiert auf Source-Daten mit Klassengewichtung"""
         def custom_source_loss(results, batch_data):
-            loss = 0
+            loss = torch.tensor(0.0, device=self.device)
             for idx, result in enumerate(results):
                 boxes = result.boxes
                 labels = batch_data['labels'][idx]
@@ -52,23 +52,32 @@ class ConfMixTrainer:
             return loss / len(batch_data['images'])
 
         # Prepare batch in YOLO format
-        yolo_batch = {
-            'images': batch['source_images'],
+        batch_dict = {
+            'data': batch['source_images'],  # Bilder als Tensor
+            'batch_idx': list(range(len(batch['source_images']))),
+            'im_file': [''] * len(batch['source_images']),  # Dummy filenames
             'labels': [
                 [{
-                    'class': label['class'],
-                    'box': label['box']
+                    'cls': [label['class']],
+                    'bboxes': label['box'],
+                    'segments': [],
+                    'keypoints': None,
+                    'normalized': True,
+                    'bbox_format': 'xywh'
                 } for label in img_labels]
                 for img_labels in batch['source_labels']
             ]
         }
         
         # Train mit Loss Adapter
-        loss_dict = self.dual_model_manager.train_step(yolo_batch, custom_source_loss)
-        self.dual_model_manager.update_counter += 1
+        try:
+            loss = self.dual_model_manager.train_step(batch_dict, custom_source_loss)
+            self.dual_model_manager.update_counter += 1
+            return loss if isinstance(loss, (int, float)) else loss.get('loss', 0.0)
+        except Exception as e:
+            print(f"Error in source batch training: {str(e)}")
+            return torch.tensor(0.0, device=self.device)  # Fallback
         
-        return loss_dict['total_loss']
-    
     def _train_mixed_batch(self, batch):
         """Trainiert auf gemischten Samples"""
         def custom_mixed_loss(results, batch_data):
