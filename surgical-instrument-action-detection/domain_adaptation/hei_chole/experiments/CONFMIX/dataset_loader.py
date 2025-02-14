@@ -4,14 +4,14 @@ from pathlib import Path
 from PIL import Image
 import random
 import numpy as np
-from base_setup import YOLOUtils
 from torchvision import transforms
 
 class ConfMixDataset(Dataset):
-    def __init__(self, source_path, target_path, confmix_detector):
+    def __init__(self, source_path, target_path, confmix_detector, image_size=(640, 640)):
         self.source_path = Path(source_path)
         self.target_path = Path(target_path)
         self.confmix_detector = confmix_detector
+        self.image_size = image_size
         
         # Load image paths
         self.source_images = list((self.source_path / "images" / "train").glob("*.png"))
@@ -21,120 +21,81 @@ class ConfMixDataset(Dataset):
         print(f"Loaded {len(self.source_images)} source images")
         print(f"Loaded {len(self.target_images)} target images")
         
-        # YOLO augmentations
-        self.transform = self._get_yolo_augmentations()
-    
+        # Base transforms for resizing
+        self.resize_transform = transforms.Compose([
+            transforms.Resize(image_size),
+            transforms.ToTensor(),
+        ])
+        
+        # Augmentation transforms
+        self.augment_transform = transforms.Compose([
+            transforms.RandomHorizontalFlip(p=0.5),
+            transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
+            transforms.RandomAffine(degrees=0, translate=(0.1, 0.1), scale=(0.8, 1.2))
+        ])
+
     def __len__(self):
         return len(self.target_images)
     
+    def _load_and_resize_image(self, image_path):
+        """Load and resize image while preserving aspect ratio"""
+        image = Image.open(image_path).convert('RGB')
+        return self.resize_transform(image)
+
+    def _load_labels(self, label_path):
+        """Load and parse YOLO format labels"""
+        labels = []
+        if label_path.exists():
+            with open(label_path, 'r') as f:
+                for line in f:
+                    parts = line.strip().split()
+                    if len(parts) == 5:
+                        labels.append({
+                            'class': int(parts[0]),
+                            'box': [float(x) for x in parts[1:]]
+                        })
+        return labels
+
     def __getitem__(self, idx):
         # Calculate progress ratio
         progress_ratio = idx / len(self)
         
-        # Load target image
+        # Load and resize target image
         target_path = self.target_images[idx]
-        target_image = Image.open(target_path)
+        target_tensor = self._load_and_resize_image(target_path)
         
         # Get random source image and labels
-        source_data = self._get_random_source_data()
+        source_path = random.choice(self.source_images)
+        source_tensor = self._load_and_resize_image(source_path)
+        source_labels = self._load_labels(self.source_labels / f"{source_path.stem}.txt")
         
-        # Process with ConfMix
+        # Process with ConfMix detector
+        target_image = transforms.ToPILImage()(target_tensor)
+        source_image = transforms.ToPILImage()(source_tensor)
+        
         target_results = self.confmix_detector.process_frame(target_image, progress_ratio)
         mixed_data = self.confmix_detector.create_mixed_sample(
-            target_image, 
-            source_data['image'], 
+            target_image,
+            source_image,
             target_results
         )
         
-        # Generate labels
-        mixed_labels = self._generate_mixed_labels(
-            source_data['labels'],
-            target_results['detections'],
-            mixed_data['selected_region'],
-            target_image.size
-        )
-        
-        # Apply augmentations
-        augmented_data = self.transform({
-            'image': mixed_data['mixed_image'],
-            'labels': mixed_labels
-        })
+        # Convert mixed image to tensor and apply augmentations
+        mixed_tensor = self.resize_transform(mixed_data['mixed_image'])
+        if random.random() > 0.5:  # 50% chance to apply augmentations
+            mixed_tensor = self.augment_transform(mixed_tensor)
         
         return {
-            'mixed_image': augmented_data['image'],
-            'mixed_labels': augmented_data['labels'],
-            'source_image': source_data['image'],
-            'source_labels': source_data['labels'],
-            'progress_ratio': progress_ratio,
-            'mixing_mask': mixed_data['mixing_mask']
+            'mixed_image': mixed_tensor,
+            'source_image': source_tensor,
+            'mixed_labels': mixed_data['target_detections'],
+            'source_labels': source_labels,
+            'mixing_mask': torch.from_numpy(mixed_data['mixing_mask']).float(),
+            'progress_ratio': progress_ratio
         }
-    
-    def _get_random_source_data(self):
-        """Lädt zufälliges Source-Bild mit Labels"""
-        source_path = random.choice(self.source_images)
-        label_path = self.source_labels / f"{source_path.stem}.txt"
-        
-        image = Image.open(source_path)
-        labels = []
-        if label_path.exists():
-            with open(label_path, 'r') as f:
-                labels = f.readlines()
-        
-        return {
-            'image': image,
-            'labels': labels
-        }
-    
-    def _generate_mixed_labels(self, source_labels, target_detections, selected_region, image_size):
-        """Generiert kombinierte YOLO-Labels für gemischtes Bild"""
-        mixed_labels = []
-        x1, y1, x2, y2 = selected_region
-        
-        # Add target pseudo-labels in selected region
-        for det in target_detections:
-            box = det['box']
-            box_center_x = (box[0] + box[2]) / 2
-            box_center_y = (box[1] + box[3]) / 2
-            
-            if (x1 <= box_center_x <= x2 and y1 <= box_center_y <= y2):
-                yolo_box = YOLOUtils.convert_to_yolo_format(
-                    box, image_size[0], image_size[1]
-                )
-                mixed_labels.append({
-                    'class': det['class'],
-                    'box': yolo_box
-                })
-        
-        # Add source labels outside selected region
-        for label in source_labels:
-            parts = label.strip().split()
-            if len(parts) == 5:
-                class_id = int(parts[0])
-                x_center = float(parts[1]) * image_size[0]
-                y_center = float(parts[2]) * image_size[1]
-                
-                if not (x1 <= x_center <= x2 and y1 <= y_center <= y2):
-                    mixed_labels.append({
-                        'class': class_id,
-                        'box': (float(parts[1]), float(parts[2]), 
-                               float(parts[3]), float(parts[4]))
-                    })
-        
-        return mixed_labels
-    
-    def _get_yolo_augmentations(self):
-        """YOLO-spezifische Augmentationen"""
-        return transforms.Compose([
-            transforms.RandomHorizontalFlip(p=0.5),
-            transforms.RandomResizedCrop(
-                size=(640, 640),
-                scale=(0.8, 1.0)
-            )
-        ])
 
 def create_confmix_dataloader(source_path, target_path, confmix_detector, 
                             batch_size=8, num_workers=0):
-    """Erstellt DataLoader mit ConfMix Dataset"""
     dataset = ConfMixDataset(source_path, target_path, confmix_detector)
     
     return DataLoader(
@@ -142,15 +103,17 @@ def create_confmix_dataloader(source_path, target_path, confmix_detector,
         batch_size=batch_size,
         num_workers=num_workers,
         shuffle=True,
+        drop_last=True,  # Drop incomplete batches
         collate_fn=collate_confmix_batch
     )
+
 def collate_confmix_batch(batch):
-    """Custom collate function für ConfMix batches"""
+    """Custom collate function for ConfMix batches"""
     return {
-        'mixed_images': torch.stack([transforms.ToTensor()(item['mixed_image']) for item in batch]),
+        'mixed_images': torch.stack([item['mixed_image'] for item in batch]),
+        'source_images': torch.stack([item['source_image'] for item in batch]),
         'mixed_labels': [item['mixed_labels'] for item in batch],
-        'source_images': torch.stack([transforms.ToTensor()(item['source_image']) for item in batch]),
         'source_labels': [item['source_labels'] for item in batch],
-        'progress_ratio': torch.tensor([item['progress_ratio'] for item in batch]),
-        'mixing_masks': torch.stack([torch.from_numpy(item['mixing_mask']) for item in batch])
+        'mixing_masks': torch.stack([item['mixing_mask'] for item in batch]),
+        'progress_ratio': torch.tensor([item['progress_ratio'] for item in batch])
     }

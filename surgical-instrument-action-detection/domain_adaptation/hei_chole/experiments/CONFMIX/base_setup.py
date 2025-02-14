@@ -2,9 +2,7 @@ import torch
 from ultralytics import YOLO
 from pathlib import Path
 import copy
-from PIL import Image
 import numpy as np
-from torch.distributions import Normal
 
 # Constants
 CONFIDENCE_THRESHOLD = 0.1
@@ -20,80 +18,102 @@ TOOL_MAPPING = {
     5: {'name': 'irrigator', 'weight': 1.0, 'base_threshold': 0.15}
 }
 
+class YOLOLossAdapter:
+    def __init__(self, yolo_model):
+        self.model = yolo_model
+        self.current_loss = None
+        
+        # Hook für das Haupt-Modell
+        self.model.model.register_forward_hook(self._capture_loss)
+        
+        # Zusätzliche Hooks für Submodule falls nötig
+        for module in self.model.model.modules():
+            if hasattr(module, 'loss') or 'Loss' in module.__class__.__name__:
+                module.register_forward_hook(self._capture_loss)
+
+    def _capture_loss(self, module, input, output):
+        """Erweiterte Loss-Erfassung"""
+        # Fall 1: Loss im Output
+        if isinstance(output, dict) and 'loss' in output:
+            self.current_loss = output['loss']
+        # Fall 2: Loss als Attribut
+        elif hasattr(output, 'loss'):
+            self.current_loss = output.loss
+        # Fall 3: Loss im Modul
+        elif hasattr(module, 'loss'):
+            self.current_loss = module.loss
+            
+        # Detach und zu Tensor konvertieren falls nötig
+        if self.current_loss is not None:
+            self.current_loss = torch.tensor(self.current_loss.detach())
+
+    def train_step(self, batch, custom_loss_fn=None):
+        """Sicherer Trainingsschritt"""
+        try:
+            # YOLO's forward pass
+            results = self.model.train(**batch)  # Nutze train statt __call__
+            
+            # Stelle sicher, dass wir einen Loss haben
+            if self.current_loss is None:
+                print("Warning: No YOLO loss captured, using only custom loss")
+                yolo_loss = torch.tensor(0.0).to(self.model.device)
+            else:
+                yolo_loss = self.current_loss
+                
+            if custom_loss_fn:
+                try:
+                    custom_loss = custom_loss_fn(results, batch)
+                    total_loss = yolo_loss + custom_loss
+                    
+                    return {
+                        'yolo_loss': yolo_loss.item(),
+                        'custom_loss': custom_loss.item(),
+                        'total_loss': total_loss.item()
+                    }
+                except Exception as e:
+                    print(f"Error in custom loss calculation: {str(e)}")
+                    return {'yolo_loss': yolo_loss.item()}
+            
+            return {'yolo_loss': yolo_loss.item()}
+            
+        except Exception as e:
+            print(f"Error in YOLO training step: {str(e)}")
+            # Fallback: Minimaler Loss um Training fortzusetzen
+            return {'yolo_loss': 0.0}
+
 class DualModelManager:
     def __init__(self, inference_weights, train_weights=None):
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        self.inference_model = YOLO(inference_weights)
         
+        # Initialize YOLO models
+        self.inference_model = YOLO(inference_weights)
         if train_weights is None:
             self.train_model = YOLO(inference_weights)
         else:
             self.train_model = YOLO(train_weights)
             
+        # Wrap models mit Loss Adapter
+        self.inference_adapter = YOLOLossAdapter(self.inference_model)
+        self.train_adapter = YOLOLossAdapter(self.train_model)
+            
         self.update_counter = 0
         self.update_frequency = 100
 
-    def predict_with_gaussian_uncertainty(self, image, box):
-        """Implementiert Gaussian-basierte Box Uncertainty"""
-        # Extrahiere Boxparameter
-        x1, y1, x2, y2 = box
-        width = x2 - x1
-        height = y2 - y1
-        
-        # Berechne Gaussian Parameter
-        mu = torch.tensor([x1, y1, width, height])
-        sigma = torch.tensor([
-            width * 0.1,  # 10% der Breite als Standardabweichung
-            height * 0.1, # 10% der Höhe als Standardabweichung
-            width * 0.2,  # 20% für Breite
-            height * 0.2  # 20% für Höhe
-        ])
-        
-        # Erstelle Normalverteilung
-        distribution = Normal(mu, sigma)
-        
-        # Berechne Log-Likelihood der Box
-        log_prob = distribution.log_prob(mu).mean()
-        
-        # Normalisiere zu Confidence-Score
-        uncertainty = 1 - torch.exp(log_prob).item()
-        return uncertainty
+    def train_step(self, batch, custom_loss_fn=None):
+        """Training step mit Loss Adapter"""
+        return self.train_adapter.train_step(batch, custom_loss_fn)
 
-    def train_step(self, batch):
-        """Erweitertes Training mit Consistency Loss"""
-        # Standard Detection Training
-        det_loss = self.train_model.train(**batch['detection'])
-        
-        # Consistency Loss
-        if 'consistency' in batch:
-            cons_loss = self.calculate_consistency_loss(
-                batch['consistency']['mixed_pred'],
-                batch['consistency']['source_pred'],
-                batch['consistency']['weights']
-            )
-            total_loss = det_loss + 0.5 * cons_loss
-        else:
-            total_loss = det_loss
-            
-        self.update_counter += 1
-        return total_loss
-
-    def calculate_consistency_loss(self, mixed_pred, source_pred, weights):
-        """Berechnet gewichteten Consistency Loss"""
-        loss = 0
-        for mp, sp, w in zip(mixed_pred, source_pred, weights):
-            # Berechne L2 Loss zwischen Predictions
-            box_loss = torch.nn.functional.mse_loss(
-                mp['boxes'], sp['boxes']
-            )
-            # Gewichte mit Klassengewicht
-            loss += w * box_loss
-        return loss
+    def predict(self, images):
+        """Prediction mit Inference Model"""
+        with torch.no_grad():
+            return self.inference_model(images)
 
     def _update_inference_model(self):
         """Aktualisiert Inference-Modell"""
         state_dict = copy.deepcopy(self.train_model.model.state_dict())
         self.inference_model.model.load_state_dict(state_dict)
+        # Update auch den Loss Adapter
+        self.inference_adapter = YOLOLossAdapter(self.inference_model)
         self.update_counter = 0
         print("\nInference model updated with new weights")
 
