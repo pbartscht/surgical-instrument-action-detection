@@ -105,8 +105,8 @@ class ModelLoader:
     def setup_paths(self):
         """Defines all important paths for the models"""
         # YOLO model path
-       #self.yolo_weights = self.hierarchical_dir / "Instrument-classification-detection" / "weights" / "instrument_detector" / "best_v35.pt"
-        self.yolo_weights = Path("/home/Bartscht/YOLO/surgical-instrument-action-detection/domain_adaptation/hei_chole/experiments/heichole_transfer_2/transfer_learning/weights/epoch20.pt")
+        #self.yolo_weights = self.hierarchical_dir / "Instrument-classification-detection" / "weights" / "instrument_detector" / "best_v35.pt"
+        self.yolo_weights = Path("/home/Bartscht/YOLO/surgical-instrument-action-detection/domain_adaptation/hei_chole/experiments/heichole_transfer_specific_instruments/transfer_learning/weights/epoch20.pt")
         # Verb model path
         self.verb_model_path = self.hierarchical_dir / "verb_recognition/checkpoints/jumping-tree-47/last.ckpt"
         

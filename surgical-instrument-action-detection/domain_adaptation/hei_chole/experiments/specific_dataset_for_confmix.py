@@ -8,7 +8,7 @@ import random
 import math
 
 # Erweiterte Constants
-YOLO_MODEL_PATH = "/home/Bartscht/YOLO/surgical-instrument-action-detection/domain_adaptation/hei_chole/experiments/heichole_transfer_2/transfer_learning/weights/epoch30.pt"
+YOLO_MODEL_PATH = "/home/Bartscht/YOLO/surgical-instrument-action-detection/domain_adaptation/hei_chole/experiments/heichole_transfer/transfer_learning/weights/best.pt"
 HEICHOLE_DATASET_PATH = "/data/Bartscht/HeiChole/domain_adaptation/train"
 CHOLECT50_PATH = "/data/Bartscht/YOLO"
 MIXED_SAMPLES_SPECIFIC_PATH = "/data/Bartscht/mixed_samples_specific"  
@@ -124,24 +124,6 @@ class ConfMixDetector:
             })
         return region_confidences
 
-def process_heichole_dataset():
-    """Funktion zum Testen der Detektionen im HeiChole-Datensatz."""
-    confidence_detector = ConfidenceBasedDetector(YOLO_MODEL_PATH)
-    confmix_detector = ConfMixDetector(confidence_detector)
-    
-    dataset_path = Path(HEICHOLE_DATASET_PATH)
-    for video_folder in (dataset_path / "Videos").iterdir():
-        if not video_folder.is_dir():
-            continue
-        print(f"\nProcessing video: {video_folder.name}")
-        for frame_file in video_folder.glob("*.png"):
-            image = Image.open(frame_file)
-            results = confmix_detector.process_frame(image, progress_ratio=0.5)  # Beispielhafter progress_ratio-Wert
-            print(f"\nFrame {frame_file.stem}:")
-            print(f"Found {len(results['detections'])} detections")
-            print(f"Best region: {results['best_region_idx']}")
-            print(f"Region confidences: {[conf['mean_confidence'] for conf in results['region_confidences']]}")
-
 class ConfMixTrainer:
     def __init__(self, confmix_detector, source_data_path):
         self.confmix_detector = confmix_detector
@@ -171,19 +153,37 @@ class ConfMixTrainer:
 
     def create_mixed_sample(self, target_image, target_results):
         """Erstellt ein gemischtes Bild gemäß der ConfMix-Methode."""
+        # Check if there are any allowed class detections in the best region first
+        best_region_idx = target_results['best_region_idx']
+        best_region = target_results['regions'][best_region_idx]
+        x1, y1, x2, y2 = best_region
+        
+        # Check for valid detections in the target region
+        valid_detections = []
+        for det in target_results['detections']:
+            if det['class'] not in ALLOWED_CLASSES:
+                continue
+            box = det['box']
+            box_center_x = (box[0] + box[2]) / 2
+            box_center_y = (box[1] + box[3]) / 2
+            if (x1 <= box_center_x <= x2 and y1 <= box_center_y <= y2):
+                valid_detections.append(det)
+        
+        # If no valid detections in target region, return None early
+        if not valid_detections:
+            return None
+            
+        # Continue with normal processing if we have valid detections
         source_data = self._get_random_source_image()
         source_image = source_data['image']
         
         if source_image.size != target_image.size:
             source_image = source_image.resize(target_image.size)
         
-        best_region_idx = target_results['best_region_idx']
-        best_region = target_results['regions'][best_region_idx]
         confidence = target_results['region_confidences'][best_region_idx]['mean_confidence']
         
         if confidence > CONFIDENCE_THRESHOLD:
             mask = np.zeros((target_image.size[1], target_image.size[0]))
-            x1, y1, x2, y2 = best_region
             mask[y1:y2, x1:x2] = 1
             
             target_array = np.array(target_image)
@@ -213,57 +213,23 @@ def convert_to_yolo_format(box, image_width, image_height):
     height /= image_height
     return x_center, y_center, width, height
 
-def save_combined_labels(mixed_sample, label_path, image_width, image_height):
-    """
-    Speichert kombinierte Labels aus Source und Target basierend auf der gemixten Region.
-    Für den Target-Part werden nur Pseudo-Labels der erlaubten Klassen (bipolar, scissors, clipper, irrigator)
-    übernommen.
-    """
-    target_region = mixed_sample['target_region']
-    x1, y1, x2, y2 = target_region
-    combined_labels = []
+def process_heichole_dataset():
+    """Funktion zum Testen der Detektionen im HeiChole-Datensatz."""
+    confidence_detector = ConfidenceBasedDetector(YOLO_MODEL_PATH)
+    confmix_detector = ConfMixDetector(confidence_detector)
     
-    # 1. Target-Pseudo-Labels (nur erlaubte Klassen)
-    for det in mixed_sample['target_detections']:
-        if det['class'] not in ALLOWED_CLASSES:
+    dataset_path = Path(HEICHOLE_DATASET_PATH)
+    for video_folder in (dataset_path / "Videos").iterdir():
+        if not video_folder.is_dir():
             continue
-        box = det['box']
-        box_center_x = (box[0] + box[2]) / 2
-        box_center_y = (box[1] + box[3]) / 2
-        if (x1 <= box_center_x <= x2 and y1 <= box_center_y <= y2):
-            x_center, y_center, width, height = convert_to_yolo_format(box, image_width, image_height)
-            combined_labels.append({
-                'class': det['class'],
-                'x_center': x_center,
-                'y_center': y_center,
-                'width': width,
-                'height': height
-            })
-    
-    # 2. Source-Labels (für den Rest des Bildes)
-    for label in mixed_sample['source_data']['labels']:
-        parts = label.strip().split()
-        if len(parts) == 5:
-            class_id = int(parts[0])
-            x_center = float(parts[1])
-            y_center = float(parts[2])
-            width = float(parts[3])
-            height = float(parts[4])
-            abs_x = x_center * image_width
-            abs_y = y_center * image_height
-            if not (x1 <= abs_x <= x2 and y1 <= abs_y <= y2):
-                combined_labels.append({
-                    'class': class_id,
-                    'x_center': x_center,
-                    'y_center': y_center,
-                    'width': width,
-                    'height': height
-                })
-    
-    with open(label_path, 'w') as f:
-        for label in combined_labels:
-            f.write(f"{label['class']} {label['x_center']:.6f} {label['y_center']:.6f} "
-                    f"{label['width']:.6f} {label['height']:.6f}\n")
+        print(f"\nProcessing video: {video_folder.name}")
+        for frame_file in video_folder.glob("*.png"):
+            image = Image.open(frame_file)
+            results = confmix_detector.process_frame(image, progress_ratio=0.5)
+            print(f"\nFrame {frame_file.stem}:")
+            print(f"Found {len(results['detections'])} detections")
+            print(f"Best region: {results['best_region_idx']}")
+            print(f"Region confidences: {[conf['mean_confidence'] for conf in results['region_confidences']]}")
 
 def main():
     """Hauptfunktion zur Erstellung der gemischten Trainingsdaten für die spezifischen Klassen."""
@@ -295,27 +261,83 @@ def main():
             mixed_sample = trainer.create_mixed_sample(target_image, target_results)
             
             if mixed_sample is not None:
-                base_filename = f"mixed_{successful_mixes:06d}"
-                image_path = os.path.join(MIXED_SAMPLES_SPECIFIC_PATH, "images", f"{base_filename}.png")
-                label_path = os.path.join(MIXED_SAMPLES_SPECIFIC_PATH, "labels", f"{base_filename}.txt")
-                meta_path = os.path.join(MIXED_SAMPLES_SPECIFIC_PATH, "labels", "meta", f"{base_filename}_meta.txt")
-                
-                mixed_sample['mixed_image'].save(image_path)
+                # Verify we have valid labels before saving
                 image_width, image_height = mixed_sample['mixed_image'].size
-                save_combined_labels(mixed_sample, label_path, image_width, image_height)
+                combined_labels = []
                 
-                with open(meta_path, 'w') as f:
-                    f.write(f"Progress Ratio: {progress_ratio:.3f}\n")
-                    f.write(f"Source: {mixed_sample['source_data']['path'].name}\n")
-                    f.write(f"Target region: {mixed_sample['target_region']}\n")
-                    f.write(f"Confidence: {mixed_sample['confidence']}\n")
-                    f.write("Original detections:\n")
-                    for det in mixed_sample['target_detections']:
-                        f.write(f"{det['class']} {det['combined_confidence']} {det['box']}\n")
+                # Get target labels
+                target_region = mixed_sample['target_region']
+                x1, y1, x2, y2 = target_region
+                for det in mixed_sample['target_detections']:
+                    if det['class'] not in ALLOWED_CLASSES:
+                        continue
+                    box = det['box']
+                    box_center_x = (box[0] + box[2]) / 2
+                    box_center_y = (box[1] + box[3]) / 2
+                    if (x1 <= box_center_x <= x2 and y1 <= box_center_y <= y2):
+                        x_center, y_center, width, height = convert_to_yolo_format(
+                            box, image_width, image_height)
+                        combined_labels.append({
+                            'class': det['class'],
+                            'x_center': x_center,
+                            'y_center': y_center,
+                            'width': width,
+                            'height': height
+                        })
                 
-                successful_mixes += 1
-                if successful_mixes % 100 == 0:
-                    print(f"Created {successful_mixes} mixed samples (Progress: {progress_ratio:.2%})")
+                # Get source labels
+                for label in mixed_sample['source_data']['labels']:
+                    parts = label.strip().split()
+                    if len(parts) == 5:
+                        class_id = int(parts[0])
+                        x_center = float(parts[1])
+                        y_center = float(parts[2])
+                        width = float(parts[3])
+                        height = float(parts[4])
+                        abs_x = x_center * image_width
+                        abs_y = y_center * image_height
+                        if not (x1 <= abs_x <= x2 and y1 <= abs_y <= y2):
+                            combined_labels.append({
+                                'class': class_id,
+                                'x_center': x_center,
+                                'y_center': y_center,
+                                'width': width,
+                                'height': height
+                            })
+                # Only save if we have valid labels
+                if combined_labels:
+                    base_filename = f"mixed_{successful_mixes:06d}"
+                    image_path = os.path.join(MIXED_SAMPLES_SPECIFIC_PATH, "images", 
+                                            f"{base_filename}.png")
+                    label_path = os.path.join(MIXED_SAMPLES_SPECIFIC_PATH, "labels", 
+                                            f"{base_filename}.txt")
+                    meta_path = os.path.join(MIXED_SAMPLES_SPECIFIC_PATH, "labels", "meta", 
+                                           f"{base_filename}_meta.txt")
+                    
+                    # Save image
+                    mixed_sample['mixed_image'].save(image_path)
+                    
+                    # Save labels
+                    with open(label_path, 'w') as f:
+                        for label in combined_labels:
+                            f.write(f"{label['class']} {label['x_center']:.6f} "
+                                  f"{label['y_center']:.6f} {label['width']:.6f} "
+                                  f"{label['height']:.6f}\n")
+                    
+                    # Save meta information
+                    with open(meta_path, 'w') as f:
+                        f.write(f"Progress Ratio: {progress_ratio:.3f}\n")
+                        f.write(f"Source: {mixed_sample['source_data']['path'].name}\n")
+                        f.write(f"Target region: {mixed_sample['target_region']}\n")
+                        f.write(f"Confidence: {mixed_sample['confidence']}\n")
+                        f.write("Original detections:\n")
+                        for det in mixed_sample['target_detections']:
+                            f.write(f"{det['class']} {det['combined_confidence']} {det['box']}\n")
+                    
+                    successful_mixes += 1
+                    if successful_mixes % 100 == 0:
+                        print(f"Created {successful_mixes} mixed samples "
+                              f"(Progress: {progress_ratio:.2%})")
 
 if __name__ == "__main__":
     main()

@@ -65,7 +65,7 @@ def update_dataset_yaml(yaml_path, class_weights):
         yaml.dump(yaml_content, f, sort_keys=False)
 
 def main():
-    base_path = "/data/Bartscht/mixed_samples_epoch3"
+    base_path = "/data/Bartscht/mixed_samples_specific"
     labels_dir = os.path.join(base_path, "labels")
     yaml_path = os.path.join(base_path, "dataset.yaml")
     
