@@ -4,6 +4,7 @@ from PIL import Image
 import torch
 from torch.distributions import Normal
 from base_setup import TOOL_MAPPING, IMAGE_SIZE
+from torchvision import transforms
 
 class ConfidenceBasedDetector:
     def __init__(self, model, confidence_threshold=0.25):
@@ -240,19 +241,21 @@ class ConfMixDetector:
         return region_dets
 
     def create_mixed_sample(self, target_image, source_image, target_results):
-        """Erstellt gemischtes Sample mit Multi-Region Support"""
+        """Erstellt gemischtes Sample mit Multi-Region Support und Masken"""
         if target_image.size != IMAGE_SIZE:
             target_image = target_image.resize(IMAGE_SIZE)
         if source_image.size != IMAGE_SIZE:
             source_image = source_image.resize(IMAGE_SIZE)
-            
-        # Erstelle Basis-Maske
+                
+        # Erstelle Basis-Maske für Feature Consistency
         mask = np.zeros((IMAGE_SIZE[1], IMAGE_SIZE[0]))
         
         # Fülle ausgewählte Regionen
+        selected_regions = []
         for region_idx in target_results['best_regions']:
             x1, y1, x2, y2 = target_results['regions'][region_idx]
             mask[y1:y2, x1:x2] = 1
+            selected_regions.append(target_results['regions'][region_idx])
         
         # Mix images
         target_array = np.array(target_image)
@@ -260,38 +263,67 @@ class ConfMixDetector:
         mixed_array = source_array.copy()
         
         # Ersetze ausgewählte Regionen
-        for region_idx in target_results['best_regions']:
-            x1, y1, x2, y2 = target_results['regions'][region_idx]
+        for x1, y1, x2, y2 in selected_regions:
             mixed_array[y1:y2, x1:x2] = target_array[y1:y2, x1:x2]
         
-        # Filtere Detektionen für ausgewählte Regionen
-        selected_detections = []
-        selected_regions = []
+        # Erstelle source detections mit dem inference model
+        source_tensor = transforms.ToTensor()(source_image).unsqueeze(0)
+        with torch.no_grad():
+            source_detections = self.confidence_detector.model(source_tensor)[0]
         
-        for region_idx in target_results['best_regions']:
-            region_score = target_results['region_scores'][region_idx]
-            region_dets = region_score['detections']
-            
-            # Priorisiere wichtige Klassen
-            important_dets = [det for det in region_dets 
-                            if det['class'] in self.important_classes]
-            other_dets = [det for det in region_dets 
-                         if det['class'] in self.less_important_classes]
-            
-            # Füge alle wichtigen Detektionen hinzu
-            selected_detections.extend(important_dets)
-            
-            # Füge andere Detektionen nur hinzu, wenn sie hohe Confidence haben
-            selected_detections.extend([det for det in other_dets 
-                                     if det['combined_confidence'] > 0.5])
-            
-            selected_regions.append(target_results['regions'][region_idx])
+        # Filtere und kombiniere Detektionen
+        mixed_detections = self._combine_detections(
+            target_results['detections'],
+            selected_regions,
+            source_detections.boxes.data.cpu().numpy(), 
+            self.important_classes
+        )
         
         return {
             'mixed_image': Image.fromarray(mixed_array.astype('uint8')),
             'mixing_mask': mask,
             'selected_regions': selected_regions,
-            'target_detections': selected_detections,
+            'mixed_detections': mixed_detections,
+            'source_detections': source_detections,
+            'target_detections': target_results['detections'],  
             'confidence': np.mean([det['combined_confidence'] 
-                                 for det in selected_detections]) if selected_detections else 0
+                                for det in mixed_detections]) if mixed_detections else 0
         }
+
+    def _combine_detections(self, target_dets, selected_regions, source_dets, important_classes):
+        """Kombiniert source und target detections basierend auf Regionen"""
+        combined_dets = []
+        
+        # Konvertiere Regionen in eine Maske für schnelleres Matching
+        region_mask = np.zeros(IMAGE_SIZE, dtype=bool)
+        for x1, y1, x2, y2 in selected_regions:
+            region_mask[y1:y2, x1:x2] = True
+        
+        # Verarbeite target detections
+        for det in target_dets:
+            box = det['box']
+            center_x = (box[0] + box[2]) / 2
+            center_y = (box[1] + box[3]) / 2
+            
+            # Prüfe ob detection im target bereich liegt
+            if region_mask[int(center_y), int(center_x)]:
+                combined_dets.append(det)
+        
+        # Verarbeite source detections
+        for det in source_dets:
+            box = det[:4]  # YOLO format [x1, y1, x2, y2]
+            center_x = (box[0] + box[2]) / 2
+            center_y = (box[1] + box[3]) / 2
+            
+            # Nur hinzufügen wenn außerhalb der target regionen
+            if not region_mask[int(center_y), int(center_x)]:
+                combined_dets.append({
+                    'box': box,
+                    'class': int(det[5]),  # YOLO class index
+                    'detector_confidence': det[4],  # YOLO confidence
+                    'box_confidence': 1.0,  # Default für source
+                    'combined_confidence': det[4],
+                    'instrument_name': TOOL_MAPPING[int(det[5])]['name']
+                })
+        
+        return combined_dets

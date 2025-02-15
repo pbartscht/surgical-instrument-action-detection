@@ -88,7 +88,7 @@ class ConfMixDataset(Dataset):
         return {
             'mixed_image': mixed_tensor,
             'source_image': source_tensor,
-            'mixed_labels': mixed_data['target_detections'],
+            'mixed_labels': mixed_data['mixed_detections'],
             'source_labels': source_labels,
             'mixing_mask': torch.from_numpy(mixed_data['mixing_mask']).float(),
             'progress_ratio': progress_ratio

@@ -15,86 +15,131 @@ TOOL_MAPPING = {
     2: {'name': 'hook', 'weight': 0.3, 'base_threshold': 0.25},
     3: {'name': 'scissors', 'weight': 1.0, 'base_threshold': 0.15},
     4: {'name': 'clipper', 'weight': 1.0, 'base_threshold': 0.15},
-    5: {'name': 'irrigator', 'weight': 1.0, 'base_threshold': 0.15}
+    5: {'name': 'irrigator', 'weight': 1.0, 'base_threshold': 0.15},
+    6: {'name': 'specimen_bag', 'weight': 0.1, 'base_threshold': 0.3}
 }
 
 class YOLOLossAdapter:
     def __init__(self, yolo_model):
         self.model = yolo_model
-        self.current_loss = None
+        # Überschreibe die Standard-Trainingsmethode
+        self.model.train = self.custom_train
         
-        # Hook für das Haupt-Modell
-        self.model.model.register_forward_hook(self._capture_loss)
+        # Basis-Setup
+        self.device = next(self.model.parameters()).device
+        self.detect = self.model.model.model[-1]  # Detection Layer
+        self.criterion = self.model.model.loss    # Loss Function
         
-        # Zusätzliche Hooks für Submodule falls nötig
-        for module in self.model.model.modules():
-            if hasattr(module, 'loss') or 'Loss' in module.__class__.__name__:
-                module.register_forward_hook(self._capture_loss)
+        # Custom Training Parameter
+        self.num_epochs = 50  # Unsere definierte Epochenzahl
+        self.current_epoch = 0
+        self.best_loss = float('inf')
+        
+        # Optimizer Setup mit verschiedenen Parametergruppen
+        pg0, pg1, pg2 = [], [], []  # Parameter Gruppen
+        for k, v in self.model.named_modules():
+            if hasattr(v, 'bias') and isinstance(v.bias, torch.nn.Parameter):
+                pg2.append(v.bias)    # Biases
+            if isinstance(v, torch.nn.BatchNorm2d):
+                pg0.append(v.weight)  # BatchNorm Weights
+            elif hasattr(v, 'weight') and isinstance(v.weight, torch.nn.Parameter):
+                pg1.append(v.weight)  # Rest der Weights
 
-    def _capture_loss(self, module, input, output):
-        """Erweiterte Loss-Erfassung"""
-        # Fall 1: Loss im Output als direkter Wert
-        if isinstance(output, dict) and 'loss' in output:
-            self.current_loss = output['loss']
-            return
+        self.optimizer = torch.optim.Adam(pg0, lr=0.01)
+        self.optimizer.add_param_group({'params': pg1, 'weight_decay': 0.0005})
+        self.optimizer.add_param_group({'params': pg2})
         
-        # Fall 2: Loss als Attribut
-        if hasattr(output, 'loss'):
-            loss_attr = getattr(output, 'loss')
-            if not callable(loss_attr):  # Wenn es ein Wert ist
-                self.current_loss = loss_attr
-                return
+        # Loss tracking
+        self.current_loss = None
+        self.loss_history = []
         
-        # Fall 3: Loss im Modul
-        if hasattr(module, 'loss'):
-            loss_attr = getattr(module, 'loss')
-            if not callable(loss_attr):  # Wenn es ein Wert ist
-                self.current_loss = loss_attr
-                return
-        
-        # Wenn kein direkter Loss-Wert gefunden wurde
-        self.current_loss = torch.tensor(0.0)
-                
-        # Konvertierung zu Tensor
-        if self.current_loss is not None:
-            if isinstance(self.current_loss, torch.Tensor):
-                self.current_loss = self.current_loss.detach()
-            elif isinstance(self.current_loss, (int, float)):
-                self.current_loss = torch.tensor(self.current_loss)
+    def custom_train(self, **kwargs):
+        """Überschreibt die Standard YOLO Trainingsmethode"""
+        # Verhindere Standard YOLO Training
+        self.model.model.train()
+        return self.model
 
     def train_step(self, batch, custom_loss_fn=None):
-        """Sicherer Trainingsschritt"""
+        """Erweiterter Trainingsschritt mit Custom Loss Support"""
         try:
-            # YOLO's forward pass
-            results = self.model.train(**batch)  # Nutze train statt __call__
+            self.model.model.train()  # Explizit Trainingsmodus aktivieren
+            self.optimizer.zero_grad()
             
-            # Stelle sicher, dass wir einen Loss haben
-            if self.current_loss is None:
-                print("Warning: No YOLO loss captured, using only custom loss")
-                yolo_loss = torch.tensor(0.0).to(self.model.device)
-            else:
-                yolo_loss = self.current_loss
-                
+            # Batch zu Device verschieben
+            images = batch['images'].to(self.device)
+            targets = self._convert_targets(batch['labels'])
+            
+            # Forward pass
+            pred = self.model(images)
+            loss = self.criterion(pred, targets)
+            
+            # Custom loss wenn verfügbar
             if custom_loss_fn:
                 try:
-                    custom_loss = custom_loss_fn(results, batch)
-                    total_loss = yolo_loss + custom_loss
-                    
-                    return {
-                        'yolo_loss': yolo_loss.item(),
-                        'custom_loss': custom_loss.item(),
-                        'total_loss': total_loss.item()
-                    }
+                    custom_loss = custom_loss_fn(pred, batch)
+                    loss = loss + custom_loss
                 except Exception as e:
-                    print(f"Error in custom loss calculation: {str(e)}")
-                    return {'yolo_loss': yolo_loss.item()}
+                    print(f"Warning: Custom loss calculation failed: {str(e)}")
             
-            return {'yolo_loss': yolo_loss.item()}
+            # Backward pass
+            loss.backward()
+            self.optimizer.step()
+            
+            # Loss tracking
+            self.current_loss = loss.detach()
+            self.loss_history.append(float(self.current_loss))
+            
+            return {
+                'loss': float(self.current_loss),
+                'pred': pred
+            }
             
         except Exception as e:
             print(f"Error in YOLO training step: {str(e)}")
-            # Fallback: Minimaler Loss um Training fortzusetzen
-            return {'yolo_loss': 0.0}
+            return {'loss': 0.0, 'pred': None}
+
+    def _convert_targets(self, targets):
+        """Konvertiert Targets in YOLO-Format"""
+        converted = []
+        for target in targets:
+            if isinstance(target, (list, tuple)):
+                boxes = []
+                for t in target:
+                    box = {
+                        'cls': torch.tensor([t['class']]).to(self.device),
+                        'boxes': torch.tensor(t['box']).to(self.device),
+                        'conf': torch.tensor(1.0).to(self.device)
+                    }
+                    boxes.append(box)
+                converted.append(boxes)
+            else:
+                box = {
+                    'cls': torch.tensor([target['class']]).to(self.device),
+                    'boxes': torch.tensor(target['box']).to(self.device),
+                    'conf': torch.tensor(1.0).to(self.device)
+                }
+                converted.append([box])
+        
+        return converted
+
+    def save_state(self, path):
+        """Speichert Model und Optimizer State"""
+        torch.save({
+            'model_state_dict': self.model.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'current_epoch': self.current_epoch,
+            'loss_history': self.loss_history,
+            'best_loss': self.best_loss
+        }, path)
+
+    def load_state(self, path):
+        """Lädt gespeicherten State"""
+        checkpoint = torch.load(path)
+        self.model.load_state_dict(checkpoint['model_state_dict'])
+        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        self.current_epoch = checkpoint['current_epoch']
+        self.loss_history = checkpoint['loss_history']
+        self.best_loss = checkpoint['best_loss']
 
 class DualModelManager:
     def __init__(self, inference_weights, train_weights=None):
@@ -131,13 +176,6 @@ class DualModelManager:
         self.inference_adapter = YOLOLossAdapter(self.inference_model)
         self.update_counter = 0
         print("\nInference model updated with new weights")
-
-    def save_models(self, save_dir):
-        """Speichert beide Modelle"""
-        save_dir = Path(save_dir)
-        save_dir.mkdir(exist_ok=True, parents=True)
-        self.inference_model.save(save_dir / 'inference_model.pt')
-        self.train_model.save(save_dir / 'train_model.pt')
 
 class YOLOUtils:
     @staticmethod
