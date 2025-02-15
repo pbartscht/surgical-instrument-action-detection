@@ -1,257 +1,211 @@
 import torch
 from pathlib import Path
 import numpy as np
-from base_setup import DualModelManager, TOOL_MAPPING
+from torch.utils.data import DataLoader
+from ultralytics import YOLO
+from base_setup import TOOL_MAPPING, IMAGE_SIZE
 from confmix_core import ConfidenceBasedDetector, ConfMixDetector
 from dataset_loader import create_confmix_dataloader
 
-
-
-class FeatureMemoryBank:
-    def __init__(self, size=1000):
-        self.features = []
-        self.max_size = size
-    
-    def update(self, new_features):
-        self.features.extend(new_features)
-        if len(self.features) > self.max_size:
-            self.features = self.features[-self.max_size:]
-    
-    def get_features(self):
-        return self.features
-    
-
-
 class ConfMixTrainer:
-    def __init__(self, inference_weights, train_weights=None):
+    def __init__(self, inference_weights):
+        """Initialisiert den ConfMix Trainer"""
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         
-        # Initialize components
-        self.dual_model_manager = DualModelManager(inference_weights, train_weights)
-        self.confidence_detector = ConfidenceBasedDetector(
-            self.dual_model_manager.inference_model
-        )
-        self.confmix_detector = ConfMixDetector(self.confidence_detector)
-        
-        self.feature_bank = FeatureMemoryBank()
-        self.total_steps = 0
+        # Model Setup
+        self.model = YOLO(inference_weights)
+        self.model = self.model.to(self.device)
 
-        # Training settings bleiben gleich
+        self.confidence_detector = ConfidenceBasedDetector(self.model)
+        self.confmix_detector = ConfMixDetector(self.confidence_detector)
+
+        # Optimizer Setup ähnlich wie in YOLOTrainer
+        g = [], [], []  # optimizer parameter groups
+        bn = tuple(v for k, v in torch.nn.__dict__.items() if "Norm" in k)
+        
+        # Parameter Gruppierung wie in YOLOTrainer
+        for module_name, module in self.model.named_modules():
+            for param_name, param in module.named_parameters(recurse=False):
+                fullname = f"{module_name}.{param_name}" if module_name else param_name
+                if "bias" in fullname:
+                    g[2].append(param)
+                elif isinstance(module, bn):
+                    g[1].append(param)
+                else:
+                    g[0].append(param)
+        
+        # Optimizer mit Parameter Gruppen
+        self.optimizer = torch.optim.Adam(g[2], lr=0.001)  # bias params
+        self.optimizer.add_param_group({'params': g[0], 'weight_decay': 0.0005})  # weight params with decay
+        self.optimizer.add_param_group({'params': g[1], 'weight_decay': 0.0})  # weight params without decay
+        
+        # Training Settings
         self.num_epochs = 50
         self.batch_size = 8
-        self.num_workers = 0
         self.save_frequency = 5
         
-        # Class weights für Loss
+        # ConfMix spezifische Parameter
+        self.pseudo_label_threshold = 0.25  # Start-Threshold
+        self.consistency_weight = 0.5
         self.class_weights = self._initialize_class_weights()
         
-        # Tracking der Performance
+        # Performance Tracking
         self.class_performance = {
             class_id: {'tp': 0, 'fp': 0, 'fn': 0} 
             for class_id in TOOL_MAPPING.keys()
         }
-    
-    def _train_source_batch(self, batch):
-        """Trainiert auf Source-Daten mit Klassengewichtung und erweiterten Features"""
-        def custom_source_loss(pred, batch_data):
-            loss = torch.tensor(0.0, device=self.device)
-            
-            # Extrahiere Vorhersagen und Ground Truth
-            for pred_boxes, target_boxes in zip(pred, batch_data['labels']):
-                if not target_boxes:
-                    continue
-                    
-                # Berechne IoU Matrix zwischen Vorhersagen und Ground Truth
-                ious = self._calculate_iou_matrix(pred_boxes, target_boxes)
-                
-                # Matchmaking zwischen Vorhersagen und Ground Truth
-                matches = self._match_boxes(ious, threshold=0.5)
-                
-                for pred_idx, target_idx in matches:
-                    pred_box = pred_boxes[pred_idx]
-                    target_box = target_boxes[target_idx]
-                    
-                    # Klassengewichtung
-                    class_id = target_box['class']
-                    class_weight = self.class_weights[class_id]
-                    
-                    # Regression Loss (CIoU)
-                    box_loss = self._calculate_ciou_loss(
-                        pred_box['boxes'],
-                        torch.tensor(target_box['box']).to(self.device)
-                    )
-                    
-                    # Classification Loss
-                    cls_loss = torch.nn.functional.cross_entropy(
-                        pred_box['cls'],
-                        torch.tensor([class_id]).to(self.device)
-                    )
-                    
-                    # Gewichteter Gesamtverlust
-                    loss += class_weight * (box_loss + cls_loss)
-            
-            # Normalisierung
-            num_targets = sum(len(t) for t in batch_data['labels'])
-            if num_targets > 0:
-                loss = loss / num_targets
-                
-            return loss
-
-        try:
-            # Prepare batch in YOLO format
-            batch_dict = {
-                'images': batch['source_images'],
-                'labels': batch['source_labels']
-            }
-            
-            # Training durchführen
-            results = self.dual_model_manager.train_adapter.train_step(
-                batch_dict, 
-                custom_loss_fn=custom_source_loss
-            )
-            
-            # Update Counter
-            self.dual_model_manager.update_counter += 1
-            
-            return results['loss']
-            
-        except Exception as e:
-            print(f"Error in source batch training: {str(e)}")
-            return torch.tensor(0.0, device=self.device)
         
-    def _train_mixed_batch(self, batch):
-        """Trainiert auf gemischten Samples mit Feature Memory und Domain Alignment"""
-        def custom_mixed_loss(results, batch_data):
-            loss = torch.tensor(0.0, device=self.device)
-            for idx, result in enumerate(results):
-                boxes = result.boxes
-                labels = batch_data['labels'][idx]
-                
-                for box, label in zip(boxes, labels):
-                    class_id = int(label['class'])
-                    # Erhöhte Gewichtung für wichtige Klassen
-                    class_weight = self.class_weights[class_id]
-                    if class_id in self.confmix_detector.important_classes:
-                        class_weight *= 1.5
-                    
-                    # Box loss mit Koordinaten
-                    box_loss = torch.nn.functional.mse_loss(
-                        box.xyxy,
-                        torch.tensor(label['box']).to(box.xyxy.device)
-                    )
-                    loss += class_weight * box_loss
+        # Loss History
+        self.loss_history = []
+        
+    def train(self, source_path, target_path, save_dir):
+        """Haupttraining Loop"""
+        save_dir = Path(save_dir)
+        save_dir.mkdir(parents=True, exist_ok=True)
+        
+        print(f"Starting training with source: {source_path}, target: {target_path}")
+        
+        # DataLoader Setup
+        dataloader = create_confmix_dataloader(
+            source_path=source_path,
+            target_path=target_path,
+            confmix_detector=self.confmix_detector,
+            batch_size=self.batch_size
+        )
+        
+        # Training Loop
+        for epoch in range(self.num_epochs):
+            print(f"\nEpoch {epoch+1}/{self.num_epochs}")
             
-            return loss / len(batch_data['data'])
-
-        # Prepare mixed batch in YOLO format
-        batch_dict = {
-            'data': batch['mixed_images'],
-            'batch_idx': list(range(len(batch['mixed_images']))),
-            'im_file': [''] * len(batch['mixed_images']),
-            'labels': [
-                [{
-                    'cls': [label['class']],
-                    'bboxes': label['box'],
-                    'segments': [],
-                    'keypoints': None,
-                    'normalized': True,
-                    'bbox_format': 'xywh'
-                } for label in img_labels]
-                for img_labels in batch['mixed_labels']
-            ]
-        }
-
-        try:
-            # Feature Extraction für Domain Alignment
-            with torch.no_grad():
-                mixed_features = self.dual_model_manager.inference_model.model.backbone(
-                    batch['mixed_images']
+            # Update pseudo-label threshold progressively
+            self.pseudo_label_threshold = self._get_progressive_threshold(epoch)
+            
+            # Train one epoch
+            epoch_loss = self._train_epoch(dataloader)
+            
+            # Update class weights based on performance
+            self._update_class_weights()
+            
+            print(f"Epoch {epoch+1} - Average Loss: {epoch_loss:.4f}")
+            self._print_class_performance()
+            
+            # Save checkpoints
+            if (epoch + 1) % self.save_frequency == 0:
+                self._save_checkpoint(save_dir / f"epoch_{epoch+1}")
+                
+            self.loss_history.append(epoch_loss)
+    
+    def _train_epoch(self, dataloader):
+        """Trainiert eine einzelne Epoche"""
+        epoch_losses = []
+        self._reset_class_performance()
+        
+        for batch_idx, batch in enumerate(dataloader):
+            try:
+                # Move batch to device
+                batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v 
+                        for k, v in batch.items()}
+                
+                # Forward pass durch YOLO
+                predictions = self.model(batch['mixed_images'])
+                
+                # Berechne Loss
+                loss = self.compute_confmix_loss(
+                    predictions=predictions,
+                    source_labels=batch['source_labels'],
+                    mixed_labels=batch['mixed_labels'],
+                    masks=batch['mixing_mask']
                 )
-                self.feature_bank.update(mixed_features.detach())
-
-            # Target Domain Alignment Loss
-            target_features = self.feature_bank.get_features()
-            if target_features:
-                target_features = torch.stack(target_features[:len(mixed_features)])
-                alignment_loss = torch.nn.functional.mse_loss(
-                    mixed_features,
-                    target_features
+                
+                # Backward pass
+                loss.backward()
+                self.optimizer.step()
+                self.optimizer.zero_grad()
+                
+                epoch_losses.append(loss.item())
+                
+                # Update Performance Tracking
+                if (batch_idx + 1) % 10 == 0:
+                    self._update_class_performance(predictions, batch)
+                    print(f"Batch {batch_idx+1}/{len(dataloader)} - "
+                          f"Loss: {loss.item():.4f}")
+                    
+            except Exception as e:
+                print(f"Error in batch {batch_idx}: {str(e)}")
+                continue
+        
+        return np.mean(epoch_losses) if epoch_losses else 0
+    
+    def compute_confmix_loss(self, predictions, source_labels, mixed_labels, masks):
+        """Berechnet den ConfMix-spezifischen Loss"""
+        batch_size = len(predictions)
+        total_loss = 0
+        
+        for idx in range(batch_size):
+            pred = predictions[idx]
+            mask = masks[idx]
+            
+            # Source Region Loss (mask == 0)
+            source_region = ~mask.bool()
+            if source_region.any():
+                source_loss = self.model.criterion(
+                    pred[source_region],
+                    self._format_yolo_labels(source_labels[idx])
                 )
-            else:
-                alignment_loss = torch.tensor(0.0, device=self.device)
-
-            # Training Step mit kombiniertem Loss
-            mixed_loss = self.dual_model_manager.train_step(batch_dict, custom_mixed_loss)
-            if isinstance(mixed_loss, dict):
-                mixed_loss = mixed_loss.get('loss', 0.0)
+                total_loss += source_loss
             
-            # Kombiniere Mixed Loss und Alignment Loss
-            total_loss = mixed_loss + 0.1 * alignment_loss
-            
-            self.dual_model_manager.update_counter += 1
-            return total_loss
-
-        except Exception as e:
-            print(f"Error in mixed batch training: {str(e)}")
-            return torch.tensor(0.0, device=self.device)
+            # Target Region Loss (mask == 1)
+            target_region = mask.bool()
+            if target_region.any():
+                confident_labels = self._filter_confident_labels(
+                    mixed_labels[idx], 
+                    self.pseudo_label_threshold
+                )
+                if confident_labels:
+                    # Gewichte Loss basierend auf Klassengewichten
+                    pseudo_loss = 0
+                    for label in confident_labels:
+                        class_weight = self.class_weights[label['class']]
+                        class_loss = self.model.criterion(
+                            pred[target_region],
+                            self._format_yolo_labels([label])
+                        )
+                        pseudo_loss += class_weight * class_loss
+                    
+                    total_loss += self.consistency_weight * pseudo_loss
+        
+        return total_loss / batch_size
     
-    def _calculate_consistency_loss(self, mixed_images, source_images, mixing_masks, mixed_results, source_results):
-        """Berechnet Consistency Loss zwischen Mixed und Source Predictions"""
-        consistency_loss = 0
+    def _format_yolo_labels(self, labels):
+        """Konvertiert Labels in YOLO-kompatibles Format"""
+        if not labels:
+            return torch.zeros((0, 6), device=self.device)
         
-        for mixed_pred, source_pred, mask in zip(mixed_results, source_results, mixing_masks):
-            # Nur für Source Regionen (mask == 0)
-            source_regions = ~mask.bool()
-            
-            # Finde überlappende Detektionen
-            for mixed_box in mixed_pred.boxes:
-                box_center = self._get_box_center(mixed_box)
-                if not mask[int(box_center[1]), int(box_center[0])]:  # In Source Region
-                    # Finde matching box in source predictions
-                    best_match = self._find_best_matching_box(mixed_box, source_pred.boxes)
-                    if best_match is not None:
-                        # Berechne Consistency Loss
-                        box_loss = self._compute_box_consistency(mixed_box, best_match)
-                        class_id = int(mixed_box.cls.item())
-                        # Gewichte Loss basierend auf Klassengewichten
-                        consistency_loss += self.class_weights[class_id] * box_loss
-        
-        return consistency_loss / len(mixed_images)
+        formatted = []
+        for label in labels:
+            formatted.append([
+                0,  # batch_idx
+                label['class'],
+                *label['box']  # x, y, w, h
+            ])
+        return torch.tensor(formatted, device=self.device)
     
-    def _compute_pred_consistency(self, mixed_result, source_result, mask):
-        """Berechnet Consistency zwischen Predictions basierend auf Mixing Mask"""
-        mask = mask.bool()
-        loss = 0
-        
-        # Extrahiere Predictions in nicht-gemischten Regionen
-        mixed_boxes = mixed_result.boxes
-        source_boxes = source_result.boxes
-        
-        for box in mixed_boxes:
-            box_center = ((box.xyxy[0][0] + box.xyxy[0][2])/2, 
-                         (box.xyxy[0][1] + box.xyxy[0][3])/2)
-            
-            # Nur für Regionen außerhalb der Mixing-Maske
-            if not mask[int(box_center[1]), int(box_center[0])]:
-                closest_source_box = self._find_closest_box(box, source_boxes)
-                if closest_source_box is not None:
-                    # Gewichte Loss mit Klassengewicht
-                    class_id = int(box.cls.item())
-                    class_weight = self.class_weights[class_id]
-                    loss += class_weight * torch.nn.functional.mse_loss(
-                        box.xyxy, closest_source_box.xyxy
-                    )
-        
-        return loss
+    def _filter_confident_labels(self, labels, threshold):
+        """Filtert Labels basierend auf Confidence"""
+        return [label for label in labels 
+                if label.get('confidence', 0) > threshold]
     
-    def _get_consistency_weight(self, progress_ratio):
-        """Berechnet Gewicht für Consistency Loss"""
-        # Starte mit niedrigem Gewicht, erhöhe während Training
-        return min(1.0, 0.2 + 0.8 * progress_ratio)
+    def _get_progressive_threshold(self, epoch):
+        """Berechnet progressiven Threshold basierend auf Trainingfortschritt"""
+        progress = epoch / self.num_epochs
+        base_threshold = 0.25
+        max_threshold = 0.5
+        return base_threshold + (max_threshold - base_threshold) * progress
     
     def _initialize_class_weights(self):
         """Initialisiert Klassengewichte basierend auf TOOL_MAPPING"""
-        return {class_id: info['weight'] for class_id, info in TOOL_MAPPING.items()}
+        return {class_id: info['weight'] 
+                for class_id, info in TOOL_MAPPING.items()}
     
     def _update_class_weights(self):
         """Aktualisiert Klassengewichte basierend auf Performance"""
@@ -266,80 +220,64 @@ class ConfMixTrainer:
         for class_id in self.class_performance:
             self.class_performance[class_id] = {'tp': 0, 'fp': 0, 'fn': 0}
     
-    def _update_class_performance(self, batch):
+    def _update_class_performance(self, predictions, batch):
         """Aktualisiert Performance-Metriken pro Klasse"""
-        results = self.dual_model_manager.inference_model(batch['mixed_images'])
-        
-        for result, labels in zip(results, batch['mixed_labels']):
-            boxes = result.boxes
-            for box in boxes:
+        for pred, labels in zip(predictions, batch['mixed_labels']):
+            pred_boxes = pred.boxes
+            
+            # True Positives und False Positives
+            for box in pred_boxes:
                 class_id = int(box.cls.item())
-                # Prüfe ob true positive oder false positive
                 matched = False
+                
                 for label in labels:
                     if label['class'] == class_id:
-                        if self._calculate_iou(box.xyxy[0], label['box']) > 0.5:
+                        iou = self._calculate_iou(
+                            box.xyxy[0].cpu(), 
+                            torch.tensor(label['box'])
+                        )
+                        if iou > 0.5:
                             self.class_performance[class_id]['tp'] += 1
                             matched = True
                             break
+                
                 if not matched:
                     self.class_performance[class_id]['fp'] += 1
             
-            # Zähle false negatives
+            # False Negatives
             for label in labels:
                 class_id = label['class']
                 matched = False
-                for box in boxes:
+                
+                for box in pred_boxes:
                     if int(box.cls.item()) == class_id:
-                        if self._calculate_iou(box.xyxy[0], label['box']) > 0.5:
+                        iou = self._calculate_iou(
+                            box.xyxy[0].cpu(), 
+                            torch.tensor(label['box'])
+                        )
+                        if iou > 0.5:
                             matched = True
                             break
+                
                 if not matched:
                     self.class_performance[class_id]['fn'] += 1
     
     def _calculate_iou(self, box1, box2):
         """Berechnet IoU zwischen zwei Boxen"""
-        # Konvertiere zu Tensoren wenn nötig
-        if not isinstance(box1, torch.Tensor):
-            box1 = torch.tensor(box1)
-        if not isinstance(box2, torch.Tensor):
-            box2 = torch.tensor(box2)
-            
+        # Intersection
         x1 = torch.max(box1[0], box2[0])
         y1 = torch.max(box1[1], box2[1])
         x2 = torch.min(box1[2], box2[2])
         y2 = torch.min(box1[3], box2[3])
         
         intersection = torch.clamp(x2 - x1, min=0) * torch.clamp(y2 - y1, min=0)
+        
+        # Union
         box1_area = (box1[2] - box1[0]) * (box1[3] - box1[1])
         box2_area = (box2[2] - box2[0]) * (box2[3] - box2[1])
-        
         union = box1_area + box2_area - intersection
         
-        return intersection / (union + 1e-6)  # Kleine Konstante zur numerischen Stabilität
-    
-    def _find_closest_box(self, ref_box, boxes):
-        """Findet die nächstgelegene Box aus einer Liste von Boxes"""
-        if len(boxes) == 0:
-            return None
-            
-        ref_center = ((ref_box.xyxy[0][0] + ref_box.xyxy[0][2])/2, 
-                     (ref_box.xyxy[0][1] + ref_box.xyxy[0][3])/2)
-        
-        min_dist = float('inf')
-        closest_box = None
-        
-        for box in boxes:
-            center = ((box.xyxy[0][0] + box.xyxy[0][2])/2, 
-                     (box.xyxy[0][1] + box.xyxy[0][3])/2)
-            dist = ((ref_center[0] - center[0])**2 + 
-                   (ref_center[1] - center[1])**2).sqrt()
-            
-            if dist < min_dist:
-                min_dist = dist
-                closest_box = box
-        
-        return closest_box
+        return intersection / (union + 1e-6)
     
     def _print_class_performance(self):
         """Gibt Performance-Metriken pro Klasse aus"""
@@ -349,177 +287,48 @@ class ConfMixTrainer:
                 precision = perf['tp'] / (perf['tp'] + perf['fp']) if perf['tp'] + perf['fp'] > 0 else 0
                 recall = perf['tp'] / (perf['tp'] + perf['fn']) if perf['tp'] + perf['fn'] > 0 else 0
                 f1 = 2 * precision * recall / (precision + recall) if precision + recall > 0 else 0
-                print(f"{TOOL_MAPPING[class_id]['name']}: F1={f1:.3f} (P={precision:.3f}, R={recall:.3f})")
-
-    def _save_class_performance(self, save_dir):
-        """Speichert Performance-Metriken mit detaillierter Analyse"""
-        save_dir = Path(save_dir)
-        save_dir.mkdir(parents=True, exist_ok=True)
-        with open(save_dir / 'performance.txt', 'w') as f:
-            # Gesamtperformance
-            total_tp = sum(perf['tp'] for perf in self.class_performance.values())
-            total_fp = sum(perf['fp'] for perf in self.class_performance.values())
-            total_fn = sum(perf['fn'] for perf in self.class_performance.values())
+                print(f"{TOOL_MAPPING[class_id]['name']}: "
+                      f"F1={f1:.3f} (P={precision:.3f}, R={recall:.3f})")
+    
+    def _save_checkpoint(self, path):
+        """Speichert Checkpoint mit allen relevanten Informationen"""
+        path = Path(path)
+        path.mkdir(parents=True, exist_ok=True)
+        
+        # Speichere Modell
+        self.model.save(path / "model.pt")
+        
+        # Speichere Trainer-State
+        torch.save({
+            'class_weights': self.class_weights,
+            'pseudo_label_threshold': self.pseudo_label_threshold,
+            'loss_history': self.loss_history,
+            'class_performance': self.class_performance
+        }, path / "trainer_state.pt")
+        
+        # Speichere Performance-Metriken
+        self._save_performance_metrics(path)
+    
+    def _save_performance_metrics(self, path):
+        """Speichert detaillierte Performance-Metriken"""
+        with open(path / "metrics.txt", "w") as f:
+            f.write("Class Performance Details:\n\n")
             
-            overall_precision = total_tp / (total_tp + total_fp) if total_tp + total_fp > 0 else 0
-            overall_recall = total_tp / (total_tp + total_fn) if total_tp + total_fn > 0 else 0
-            overall_f1 = 2 * overall_precision * overall_recall / (overall_precision + overall_recall) if overall_precision + overall_recall > 0 else 0
-            
-            f.write(f"Overall Performance:\n")
-            f.write(f"F1={overall_f1:.3f} (P={overall_precision:.3f}, R={overall_recall:.3f})\n\n")
-            
-            # Performance pro Klasse
-            f.write("Per-Class Performance:\n")
             for class_id, perf in self.class_performance.items():
                 if perf['tp'] + perf['fp'] + perf['fn'] > 0:
                     precision = perf['tp'] / (perf['tp'] + perf['fp']) if perf['tp'] + perf['fp'] > 0 else 0
                     recall = perf['tp'] / (perf['tp'] + perf['fn']) if perf['tp'] + perf['fn'] > 0 else 0
                     f1 = 2 * precision * recall / (precision + recall) if precision + recall > 0 else 0
                     
-                    # Erweiterte Metriken für wichtige Klassen
-                    class_weight = TOOL_MAPPING[class_id]['weight']
-                    is_important = class_weight > 0.5
-                    
                     f.write(f"\n{TOOL_MAPPING[class_id]['name']}:\n")
-                    f.write(f"- F1={f1:.3f} (P={precision:.3f}, R={recall:.3f})\n")
-                    f.write(f"- Class Weight: {class_weight}\n")
-                    f.write(f"- Total Detections: {perf['tp'] + perf['fp']}\n")
-                    f.write(f"- True Positives: {perf['tp']}\n")
-                    f.write(f"- False Positives: {perf['fp']}\n")
-                    f.write(f"- False Negatives: {perf['fn']}\n")
-                    
-                    if is_important:
-                        # Zusätzliche Analyse für wichtige Klassen
-                        miss_rate = perf['fn'] / (perf['tp'] + perf['fn']) if perf['tp'] + perf['fn'] > 0 else 1
-                        false_discovery_rate = perf['fp'] / (perf['tp'] + perf['fp']) if perf['tp'] + perf['fp'] > 0 else 1
-                        
-                        f.write(f"- Miss Rate: {miss_rate:.3f}\n")
-                        f.write(f"- False Discovery Rate: {false_discovery_rate:.3f}\n")
-                        
-                        # Performanzwarnung wenn nötig
-                        if f1 < 0.3:
-                            f.write("WARNING: Low performance on important class!\n")
+                    f.write(f"F1-Score: {f1:.3f}\n")
+                    f.write(f"Precision: {precision:.3f}\n")
+                    f.write(f"Recall: {recall:.3f}\n")
+                    f.write(f"True Positives: {perf['tp']}\n")
+                    f.write(f"False Positives: {perf['fp']}\n")
+                    f.write(f"False Negatives: {perf['fn']}\n")
+                    f.write(f"Current Weight: {self.class_weights[class_id]:.3f}\n")
 
-    def train(self, source_path, target_path, save_dir):
-        """Haupttrainingsschleife"""
-        save_dir = Path(save_dir)
-        save_dir.mkdir(parents=True, exist_ok=True)
-        print(f"Starting training with source: {source_path}, target: {target_path}")
-        
-        # Setup DataLoader
-        dataloader = create_confmix_dataloader(
-            source_path, target_path, self.confmix_detector,
-            self.batch_size, self.num_workers
-        )
-        
-        # Training Loop
-        for epoch in range(self.num_epochs):
-            print(f"\nEpoch {epoch+1}/{self.num_epochs}")
-            epoch_loss = self._train_epoch(dataloader)
-            
-            # Update class weights basierend auf Performance
-            self._update_class_weights()
-            
-            print(f"Epoch {epoch+1} - Average Loss: {epoch_loss:.4f}")
-            self._print_class_performance()
-            
-            # Periodisches Speichern
-            if (epoch + 1) % self.save_frequency == 0:
-                checkpoint_dir = save_dir / f"epoch_{epoch+1}"
-                self.dual_model_manager.save_models(checkpoint_dir)
-                self._save_class_performance(checkpoint_dir)
-                print(f"Saved checkpoint to {checkpoint_dir}")
-
-    def _train_epoch(self, dataloader):
-        """Trainiert eine Epoche mit erweitertem Loss"""
-        epoch_losses = []
-        self._reset_class_performance()
-        
-        for batch_idx, batch in enumerate(dataloader):
-            # Progress ratio für adaptive Gewichtung
-            progress_ratio = batch['progress_ratio'].mean()
-            
-            # Move batch to device
-            batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v 
-                    for k, v in batch.items()}
-            
-            # Generate predictions for mixed and source images
-            with torch.no_grad():
-                mixed_results = self.dual_model_manager.inference_model(
-                    batch['mixed_images']
-                )
-                source_results = self.dual_model_manager.inference_model(
-                    batch['source_images']
-                )
-            
-            # Erweiterte Loss-Berechnung
-            # 1. Source Training
-            source_loss = self._train_source_batch(batch) * max(0.1, 1.0 - progress_ratio)
-            
-            # 2. Mixed Training
-            mixed_loss = self._train_mixed_batch(batch)
-            
-            # 3. Consistency Loss
-            consistency_loss = self._calculate_consistency_loss(
-                batch['mixed_images'],
-                batch['source_images'],
-                batch['mixing_masks'],
-                mixed_results,
-                source_results
-            ) * min(1.0, progress_ratio * 2)
-            
-            # Gesamtverlust
-            total_loss = source_loss + mixed_loss + consistency_loss
-            
-            epoch_losses.append(float(total_loss))
-            
-            # Update Modell mit kontrolliertem Target-Fokus
-            if self.dual_model_manager.update_counter >= self.dual_model_manager.update_frequency:
-                self._update_model_weights()  # Neue Methode
-                self.confidence_detector.model = self.dual_model_manager.inference_model
-            
-            # Progress & Performance Tracking
-            if (batch_idx + 1) % 10 == 0:
-                self._update_class_performance(batch)
-                print(f"Batch {batch_idx+1}/{len(dataloader)} - "
-                    f"Loss: {total_loss:.4f}")
-        
-        return np.mean(epoch_losses)
-
-    def _update_model_weights(self):
-        """Kontrollierter Update der Modell-Gewichte"""
-        progress = self.dual_model_manager.update_counter / self.total_steps
-        
-        if progress < 0.2:
-            # Frühe Phase: Voller Update
-            self.dual_model_manager._update_inference_model()
-        elif progress < 0.5:
-            # Mittlere Phase: Selektiver Update
-            self._update_shared_layers()
-        else:
-            # Späte Phase: Target-fokussiert
-            self._update_target_layers()
-            
-    def _update_shared_layers(self):
-        """Update nur für shared layers"""
-        source_state = self.dual_model_manager.train_model.model.state_dict()
-        target_state = self.dual_model_manager.inference_model.model.state_dict()
-        
-        # Update nur backbone/shared layers
-        for name, param in source_state.items():
-            if 'backbone' in name or 'shared' in name:
-                target_state[name].copy_(param)
-                
-    def _update_target_layers(self):
-        """Update nur für target-spezifische Layer"""
-        source_state = self.dual_model_manager.train_model.model.state_dict()
-        target_state = self.dual_model_manager.inference_model.model.state_dict()
-        
-        # Update nur detection/classifier layers
-        for name, param in source_state.items():
-            if 'detect' in name or 'classifier' in name:
-                target_state[name].copy_(param)
-                
 def main():
     try:
         # Setup paths
@@ -534,10 +343,8 @@ def main():
         print(f"Target data: {target_path}")
         print(f"Save directory: {save_dir}")
         
-        # Initialize trainer
+        # Initialize and start training
         trainer = ConfMixTrainer(inference_weights)
-        
-        # Start training
         trainer.train(source_path, target_path, save_dir)
         
         print("Training completed successfully!")
