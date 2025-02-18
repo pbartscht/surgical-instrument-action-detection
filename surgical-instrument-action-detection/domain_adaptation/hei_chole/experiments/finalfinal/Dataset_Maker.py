@@ -10,12 +10,11 @@ import yaml
 from collections import Counter
 
 # Konstanten und Pfade
-YOLO_MODEL_PATH = "/data/Bartscht/YOLO/best_v35.pt"
+YOLO_MODEL_PATH = "/home/Bartscht/YOLO/surgical-instrument-action-detection/domain_adaptation/hei_chole/experiments/finalfinal/heichole_transfer_balanced_instruments/transfer_learning/weights/epoch20.pt"
 HEICHOLE_DATASET_PATH = "/data/Bartscht/HeiChole/domain_adaptation/train"
 CHOLECT50_PATH = "/data/Bartscht/YOLO"
 # Ursprünglicher Ordner (wird nicht mehr genutzt) und neuer, balancierter Ordner
-MIXED_SAMPLES_PATH = "/data/Bartscht/mixed_samples_epoch0"
-BALANCED_MIXED_SAMPLES_PATH = "/data/Bartscht/balanced_mixed_samples_epoch0"
+BALANCED_MIXED_SAMPLES_PATH = "/data/Bartscht/balanced_mixed_samples_epoch1"
 
 CONFIDENCE_THRESHOLD = 0.05
 IOU_THRESHOLD = 0.5  # Schwellwert für Duplikat-Filterung
