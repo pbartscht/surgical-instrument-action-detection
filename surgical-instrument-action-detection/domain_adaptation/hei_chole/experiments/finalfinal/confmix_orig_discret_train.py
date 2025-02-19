@@ -54,7 +54,7 @@ def load_dataset_config(yaml_path):
     print(f"Loaded dataset config from {yaml_path}")
     return config
 
-def setup_training(pretrained_model_path, dataset_yaml_path, project_name="confmix_training_strategy"):
+def setup_training(pretrained_model_path, dataset_yaml_path, project_name="lasttry"):
     # Load dataset configuration
     dataset_config = load_dataset_config(dataset_yaml_path)
     
@@ -68,12 +68,12 @@ def setup_training(pretrained_model_path, dataset_yaml_path, project_name="confm
     training_args = {
         'data': dataset_yaml_path,
         'imgsz': 640,
-        'epochs': 35,
-        'batch': 16,
+        'epochs': 25,
+        'batch': 8,
         'patience': 10,
         
         # Learning rate settings
-        'lr0': 0.001,
+        'lr0': 0.0001,
         'lrf': 0.01,
         'warmup_epochs': 3.0,
         'warmup_momentum': 0.8,
@@ -112,8 +112,8 @@ def setup_training(pretrained_model_path, dataset_yaml_path, project_name="confm
         raise
 
 def main():
-    PRETRAINED_MODEL = "/home/Bartscht/YOLO/surgical-instrument-action-detection/domain_adaptation/hei_chole/experiments/finalfinal/heichole_transfer_balanced_instruments/transfer_learning/weights/last.pt"
-    DATASET_YAML = "/data/Bartscht/balanced_mixed_samples_epoch1/dataset.yaml"
+    PRETRAINED_MODEL = "/data/Bartscht/YOLO/best_v35.pt"
+    DATASET_YAML = "/data/Bartscht/balanced_mixed_samples_combined/dataset.yaml"
     
     print("Starting ConfMix training...")
     print(f"Using pretrained model: {PRETRAINED_MODEL}")
@@ -123,7 +123,7 @@ def main():
         results = setup_training(
             PRETRAINED_MODEL,
             DATASET_YAML,
-            project_name="transfer_epoch1"
+            project_name="transfer_big_dataset_v35"
         )
         
         print("\nTraining completed successfully!")

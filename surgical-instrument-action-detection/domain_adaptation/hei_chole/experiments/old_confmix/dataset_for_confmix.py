@@ -12,7 +12,7 @@ YOLO_MODEL_PATH = "/data/Bartscht/YOLO/best_v35.pt"
 HEICHOLE_DATASET_PATH = "/data/Bartscht/HeiChole/domain_adaptation/train"
 CHOLECT50_PATH = "/data/Bartscht/YOLO"
 MIXED_SAMPLES_PATH = "/data/Bartscht/mixed_samples_epoch0"  
-CONFIDENCE_THRESHOLD = 0.05
+CONFIDENCE_THRESHOLD = 0.1
 
 # Instrument mappings from your existing code
 TOOL_MAPPING = {

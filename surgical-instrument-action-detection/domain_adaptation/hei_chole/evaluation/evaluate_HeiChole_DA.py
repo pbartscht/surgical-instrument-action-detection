@@ -199,14 +199,16 @@ class ResidualBlock(nn.Module):
     def __init__(self, in_channels, out_channels):
         super().__init__()
         self.conv1 = nn.Conv2d(in_channels, out_channels, 3, padding=1)
-        self.bn1 = nn.BatchNorm2d(out_channels)
+        self.in1 = nn.InstanceNorm2d(out_channels, affine=True)  
         self.conv2 = nn.Conv2d(out_channels, out_channels, 3, padding=1)
-        self.bn2 = nn.BatchNorm2d(out_channels)
+        self.in2 = nn.InstanceNorm2d(out_channels, affine=True)
+        self.dropout = nn.Dropout2d(p=0.1)
         
     def forward(self, x):
         residual = x
-        out = F.relu(self.bn1(self.conv1(x)))
-        out = self.bn2(self.conv2(out))
+        out = F.relu(self.in1(self.conv1(x)))
+        out = self.dropout(out)
+        out = self.in2(self.conv2(out))
         out += residual
         return F.relu(out)
 
@@ -224,12 +226,13 @@ class DomainAdapter(nn.Module):
             
         
         self.feature_reducer = nn.Sequential(
-            nn.Conv2d(512, 512, kernel_size=1),
-            nn.BatchNorm2d(512),
-            nn.ReLU(),
             ResidualBlock(512, 512),
-            nn.Conv2d(512, 512, kernel_size=3, padding=1, groups=32),
-            nn.BatchNorm2d(512),
+            nn.Dropout2d(p=0.1),
+            nn.Conv2d(512, 512, kernel_size=1),
+            nn.InstanceNorm2d(512, affine=True),
+            nn.ReLU(),
+            nn.Conv2d(512, 512, kernel_size=3, padding=1, groups=64),
+            nn.InstanceNorm2d(512, affine=True),
             nn.ReLU()
         )
         
@@ -1398,7 +1401,7 @@ def main():
         # Create and load domain adapter
         print("\nInitializing domain adapter...")
         domain_adapter = DomainAdapter(str(loader.yolo_weights))
-        
+        print ("testtest")
         # Load feature reducer weights
         feature_reducer_path = Path("/home/Bartscht/YOLO/surgical-instrument-action-detection/domain_adaptation/hei_chole/experiments/class_aware_adapter_weights_class_aware_domain_adaptation/class_aware_feature_reducer.pt")
         print(f"\nLoading feature reducer from: {feature_reducer_path}")
@@ -1419,7 +1422,7 @@ def main():
         dataset_dir = str(loader.dataset_path)
         
         # Specify videos to analyze
-        videos_to_analyze = ["VID08", "VID13"]
+        videos_to_analyze = ["VID02", "VID08", "VID13","VID14","VID15","VID21"]
         print(f"\nAnalyzing videos: {', '.join(videos_to_analyze)}")
         
         # Create comparative evaluator with different thresholds
