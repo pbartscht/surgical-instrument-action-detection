@@ -39,11 +39,11 @@ IOU_THRESHOLD = 0.3
 # Global mappings
 TOOL_MAPPING = {
     0: 'grasper', 1: 'bipolar', 2: 'hook', 
-    3: 'scissors', 4: 'clipper', 5: 'irrigator'
+    3: 'scissors', 4: 'clipper', 5: 'irrigator', 6: 'specimen_bag'
 }
 
 IGNORED_INSTRUMENTS = {
-    6: 'specimen_bag'  # Index: Name der zu ignorierenden Instrumente
+    7: 'dummy'  # Index: Name der zu ignorierenden Instrumente
 }
 
 VERB_MAPPING = {
@@ -73,7 +73,8 @@ CHOLECT50_TO_HEICHOLE_INSTRUMENT_MAPPING = {
     'clipper': 'clipper',
     'hook': 'coagulation',  # revised: hook is also a coagulation instrument
     'scissors': 'scissors',
-    'irrigator': 'suction_irrigation'
+    'irrigator': 'suction_irrigation',
+    'specimen_bag': 'specimen_bag'
 }
 
 CHOLECT50_TO_HEICHOLE_VERB_MAPPING = {
@@ -90,10 +91,31 @@ CHOLECT50_TO_HEICHOLE_VERB_MAPPING = {
 }
 
 HEICHOLE_SPECIFIC_INSTRUMENTS = {
-    'specimen_bag',
+    #'specimen_bag',
     'stapler'
 }
 
+CHOLECT50_TO_HEICHOLE_INSTRUMENT_MAPPING_NAIVE = {
+    'grasper': 'grasper',      # Direct match
+    'bipolar': 'bipolar',      # Keep original
+    'clipper': 'clipper',      # Direct match
+    'hook': 'hook',            # Keep original
+    'scissors': 'scissors',     # Direct match
+    'irrigator': 'irrigator'   # Keep original
+}
+
+CHOLECT50_TO_HEICHOLE_VERB_MAPPING_NAIVE = {
+    'grasp': 'grasp',           # Direct match
+    'retract': 'retract',       # Keep original
+    'dissect': 'dissect',       # Keep original
+    'coagulate': 'coagulate',   # Keep original
+    'clip': 'clip',             # Direct match
+    'cut': 'cut',               # Direct match
+    'irrigate': 'irrigate',     # Keep original
+    'aspirate': 'aspirate',     # Keep original
+    'pack': 'pack',             # Keep original
+    'null_verb': 'null_verb'    # Keep original
+}
 
 
 class ModelLoader:
@@ -106,7 +128,8 @@ class ModelLoader:
         """Defines all important paths for the models"""
         # YOLO model path
         #self.yolo_weights = self.hierarchical_dir / "Instrument-classification-detection" / "weights" / "instrument_detector" / "best_v35.pt"
-        self.yolo_weights = Path("/home/Bartscht/YOLO/surgical-instrument-action-detection/domain_adaptation/hei_chole/experiments/finalfinal/heichole_transfer_balanced_instruments/transfer_learning/weights/epoch30.pt")
+        #self.yolo_weights = Path("/home/Bartscht/YOLO/surgical-instrument-action-detection/domain_adaptation/hei_chole/experiments/finalfinal/heichole_transfer_balanced_instruments/transfer_learning/weights/epoch30.pt")
+        self.yolo_weights = Path("/home/Bartscht/YOLO/surgical-instrument-action-detection/domain_adaptation/hei_chole/experiments/finalfinal/correct_transfer/confmix_improved_training/weights/epoch10.pt")
         # Verb model path
         self.verb_model_path = self.hierarchical_dir / "verb_recognition/checkpoints/jumping-tree-47/last.ckpt"
         
@@ -214,7 +237,7 @@ class HeiCholeEvaluator:
             print(f"Error loading annotations: {str(e)}")
             raise
 
-    def evaluate_frame(self, img_path, ground_truth, save_visualization=True):
+    def evaluate_frame_old(self, img_path, ground_truth, save_visualization=True):
         """
         Evaluates a single frame and maps predictions to HeiChole format.
         """
@@ -330,7 +353,148 @@ class HeiCholeEvaluator:
         except Exception as e:
             print(f"Error processing frame {frame_number}: {str(e)}")
             return []
+
+    def evaluate_frame(self, img_path, ground_truth, save_visualization=False):
+        """
+        Evaluates a single frame and maps predictions to HeiChole format.
+        Special handling for specimen_bag: Skip verb prediction
+        """
+        frame_predictions = []
+        frame_number = int(os.path.basename(img_path).split('.')[0])
+        video_name = os.path.basename(os.path.dirname(img_path))
         
+        img = Image.open(img_path)
+        original_img = img.copy()
+        draw = ImageDraw.Draw(original_img)
+        
+        try:
+            # YOLO predictions
+            yolo_results = self.yolo_model(img)
+            valid_detections = []
+            
+            # Process YOLO detections
+            for detection in yolo_results[0].boxes:
+                instrument_class = int(detection.cls)
+                confidence = float(detection.conf)
+                
+                if confidence >= CONFIDENCE_THRESHOLD:
+                    if instrument_class in IGNORED_INSTRUMENTS:
+                        print(f"\n{'='*50}")
+                        print(f"Frame {frame_number}: Skipping ignored instrument {IGNORED_INSTRUMENTS[instrument_class]}")
+                        continue
+                    
+                    try:
+                        cholect50_instrument = TOOL_MAPPING[instrument_class]
+                    except KeyError:
+                        print(f"\nWarning: Unknown instrument class {instrument_class}, skipping...")
+                        continue
+                    
+                    mapped_instrument = CHOLECT50_TO_HEICHOLE_INSTRUMENT_MAPPING.get(cholect50_instrument)
+                    
+                    if mapped_instrument:
+                        valid_detections.append({
+                            'class': instrument_class,
+                            'confidence': confidence,
+                            'box': detection.xyxy[0],
+                            'name': mapped_instrument,
+                            'original_name': cholect50_instrument
+                        })
+            
+            # Sort by confidence
+            valid_detections.sort(key=lambda x: x['confidence'], reverse=True)
+            
+            # Process each detection
+            for detection in valid_detections:
+                mapped_instrument = detection['name']
+                original_instrument = detection['original_name']
+                box = detection['box']
+                confidence = detection['confidence']
+                
+                # Special handling for specimen_bag: Skip verb prediction
+                if original_instrument == 'specimen_bag':
+                    prediction = {
+                        'frame_id': f"{video_name}_frame{frame_number}",
+                        'instrument': {
+                            'name': 'specimen_bag',
+                            'confidence': confidence,
+                            'binary_pred': 1 if confidence >= CONFIDENCE_THRESHOLD else 0
+                        },
+                        'action': {
+                            'name': None,  # No verb for specimen_bag
+                            'confidence': None,
+                            'binary_pred': 0
+                        }
+                    }
+                    frame_predictions.append(prediction)
+                    
+                    # Visualization
+                    if save_visualization:
+                        x1, y1, x2, y2 = map(int, box)
+                        draw.rectangle([x1, y1, x2, y2], outline='red', width=3)
+                        text = f"specimen_bag\nConf: {confidence:.2f}"
+                        draw.text((x1, y1-40), text, fill='blue')
+                    
+                    continue  # Skip rest of loop for specimen_bag
+                
+                # Normal verb prediction for other instruments
+                x1, y1, x2, y2 = map(int, box)
+                instrument_crop = img.crop((x1, y1, x2, y2))
+                crop_tensor = self.transform(instrument_crop).unsqueeze(0).to(self.device)
+                
+                verb_outputs = self.verb_model(crop_tensor, [original_instrument])
+                verb_probs = verb_outputs['probabilities']
+                
+                top_verbs = []
+                for verb_idx in torch.topk(verb_probs[0], k=3).indices.cpu().numpy():
+                    cholect50_verb = VERB_MAPPING[VERB_MODEL_TO_EVAL_MAPPING[verb_idx]]
+                    mapped_verb = CHOLECT50_TO_HEICHOLE_VERB_MAPPING.get(cholect50_verb)
+                    verb_confidence = float(verb_probs[0][verb_idx])
+                    
+                    if mapped_verb is not None:
+                        top_verbs.append({
+                            'name': mapped_verb,
+                            'probability': verb_confidence
+                        })
+                
+                if top_verbs:
+                    best_verb = max(top_verbs, key=lambda x: x['probability'])
+                    verb_name = best_verb['name']
+                    verb_conf = best_verb['probability']
+                    
+                    prediction = {
+                        'frame_id': f"{video_name}_frame{frame_number}",
+                        'instrument': {
+                            'name': mapped_instrument,
+                            'confidence': confidence,
+                            'binary_pred': 1 if confidence >= CONFIDENCE_THRESHOLD else 0
+                        },
+                        'action': {
+                            'name': verb_name,
+                            'confidence': verb_conf,
+                            'binary_pred': 1 if verb_conf >= CONFIDENCE_THRESHOLD else 0
+                        }
+                    }
+                    frame_predictions.append(prediction)
+                    
+                    # Visualization
+                    if save_visualization:
+                        draw.rectangle([x1, y1, x2, y2], outline='red', width=3)
+                        text = f"{mapped_instrument}\n{verb_name}\nConf: {confidence:.2f}"
+                        draw.text((x1, y1-40), text, fill='blue')
+            
+            # Save visualization
+            if save_visualization:
+                viz_dir = os.path.join(self.dataset_dir, "visualizations")
+                os.makedirs(viz_dir, exist_ok=True)
+                save_path = os.path.join(viz_dir, f"{video_name}_frame{frame_number}.png")
+                original_img.save(save_path)
+            
+            return frame_predictions
+            
+        except Exception as e:
+            print(f"Error processing frame {frame_number}: {str(e)}")
+            return []
+         
 class BinaryMetricsCalculator:
     def __init__(self, confidence_threshold=0.0001):
         self.confidence_threshold = confidence_threshold

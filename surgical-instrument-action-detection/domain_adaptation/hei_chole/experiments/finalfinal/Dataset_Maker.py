@@ -10,12 +10,12 @@ import yaml
 from collections import Counter
 
 # Konstanten und Pfade
-YOLO_MODEL_PATH = "/home/Bartscht/YOLO/surgical-instrument-action-detection/domain_adaptation/hei_chole/experiments/finalfinal/heichole_transfer_balanced_instruments/transfer_learning/weights/epoch30.pt"
+YOLO_MODEL_PATH = "/data/Bartscht/YOLO/best_v35.pt"
 HEICHOLE_DATASET_PATH = "/data/Bartscht/HeiChole/domain_adaptation/train"
 CHOLECT50_PATH = "/data/Bartscht/YOLO"
-BALANCED_MIXED_SAMPLES_PATH = "/data/Bartscht/balanced_mixed_samples_epoch3"
+BALANCED_MIXED_SAMPLES_PATH = "/data/Bartscht/balanced_mixed_samples_epoch_last"
 
-CONFIDENCE_THRESHOLD = 0.09
+CONFIDENCE_THRESHOLD = 0.001
 IOU_THRESHOLD = 0.5  # Schwellwert für Duplikat-Filterung
 
 # Mapping der Instrumentklassen
@@ -384,7 +384,7 @@ def main():
     
     # Balancing-Parameter
     class_counts_tracker = {cls: 0 for cls in TOOL_MAPPING.keys()}
-    MAX_SAMPLES_PER_CLASS = 3000  # Maximale Samples pro Klasse
+    MAX_SAMPLES_PER_CLASS = 4000  # Maximale Samples pro Klasse
     
     # Initialisiere Detector und Trainer (wie im alten Code)
     confidence_detector = ConfidenceBasedDetector(YOLO_MODEL_PATH)

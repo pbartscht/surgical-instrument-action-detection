@@ -1,190 +1,119 @@
 import os
+import yaml
+from pathlib import Path
+from tqdm import tqdm
+import json
+from collections import Counter, defaultdict
+import statistics
 import torch
 from ultralytics import YOLO
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageEnhance, ImageDraw, ImageFont, ImageFilter 
 from pathlib import Path
 import random
 import math
+from core_components import EnhancedConfidenceDetector, RegionAnalyzer, TOOL_MAPPING
 
-# Erweiterte Constants
+
+# Pfade und Konstanten
 YOLO_MODEL_PATH = "/data/Bartscht/YOLO/best_v35.pt"
 HEICHOLE_DATASET_PATH = "/data/Bartscht/HeiChole/domain_adaptation/train"
 CHOLECT50_PATH = "/data/Bartscht/YOLO"
-MIXED_SAMPLES_PATH = "/data/Bartscht/mixed_samples_epoch0"  
-CONFIDENCE_THRESHOLD = 0.1
+BALANCED_MIXED_SAMPLES_PATH = "/data/Bartscht/balanced_mixed_samples_epoch_last"
 
-# Instrument mappings from your existing code
-TOOL_MAPPING = {
-    0: 'grasper', 1: 'bipolar', 2: 'hook', 
-    3: 'scissors', 4: 'clipper', 5: 'irrigator'
-}
-
-class ConfidenceBasedDetector:
-    def __init__(self, model_path, confidence_threshold=0.25):
-        self.model = YOLO(model_path)
-        self.confidence_threshold = confidence_threshold
+class DatasetCreator:
+    def __init__(self, model_path, source_path, target_path, output_path):
+        self.detector = EnhancedConfidenceDetector(
+            model_path,
+            use_tta=True,
+            multi_scale=True
+        )
+        self.source_path = Path(source_path)
+        self.target_path = Path(target_path)
+        self.output_path = Path(output_path)
         
-    def predict_with_progressive_confidence(self, image, progress_ratio):
-        """
-        Macht Vorhersagen mit progressiver Confidence
-        progress_ratio: Float zwischen 0-1, der den Fortschritt angibt
-        """
-        results = self.model(image)
-        enhanced_detections = []
+        # Initialisiere Tracking-Statistiken
+        self.class_stats = defaultdict(lambda: {
+            'count': 0,
+            'confidence_sum': 0,
+            'uncertainty_sum': 0,
+            'false_negatives': 0,
+            'quality_scores': []
+        })
         
-        # Berechne delta für progressive confidence
-        delta = 2 / (1 + math.exp(-5 * progress_ratio)) - 1
-        
-        for detection in results[0].boxes:
-            if detection.cls.item() == 6:  # Skip specimen_bag
-                continue
-                
-            # Detector confidence (Cdet)
-            detector_confidence = detection.conf.item()
-            box = detection.xyxy[0].cpu().numpy()
-            
-            # Box confidence (Ccomb)
-            box_variance = self._calculate_box_variance(box)
-            box_confidence = 1 - np.mean(box_variance)
-            
-            # Progressive combination
-            combined_confidence = (1 - delta) * detector_confidence + delta * (detector_confidence * box_confidence)
-            
-            if combined_confidence >= self.confidence_threshold:
-                enhanced_detections.append({
-                    'box': box,
-                    'class': int(detection.cls.item()),
-                    'detector_confidence': detector_confidence,
-                    'box_confidence': box_confidence,
-                    'combined_confidence': combined_confidence,
-                    'instrument_name': TOOL_MAPPING[int(detection.cls.item())]
-                })
-        
-        return enhanced_detections
+        self._setup_directories()
+        self._load_source_images()
     
-    def _calculate_box_variance(self, box):
-        # Diese Methode bleibt unverändert
-        width = box[2] - box[0]
-        height = box[3] - box[1]
+    def _setup_directories(self):
+        """Erstellt notwendige Verzeichnisstruktur"""
+        for split in ['train', 'val', 'test']:
+            for subdir in ['images', 'labels', 'labels/meta']:
+                path = self.output_path / subdir / split
+                path.mkdir(parents=True, exist_ok=True)
+    
+    def _load_source_images(self):
+        """Lädt verfügbare Source-Bilder"""
+        self.source_images = list((self.source_path / "images" / "train").glob("*.png"))
+        print(f"Loaded {len(self.source_images)} source images")
+    
+    def create_dataset(self, max_samples_per_class=3000):
+        """Erstellt verbessertes Mixed-Sample Dataset"""
+        target_videos = list((self.target_path / "Videos").glob("*"))
+        total_frames = sum(len(list(video.glob("*.png"))) for video in target_videos)
+        processed_count = 0
         
-        size_variance = np.array([
-            1 / (1 + width * height),
-            1 / (1 + min(width, height))
-        ])
+        for video_path in target_videos:
+            if not video_path.is_dir():
+                continue
+            
+            print(f"\nProcessing video: {video_path.name}")
+            for frame_path in tqdm(list(video_path.glob("*.png"))):
+                progress_ratio = processed_count / total_frames
+                
+                mixed_sample = self._process_frame(frame_path, progress_ratio)
+                if mixed_sample and self._validate_sample(mixed_sample):
+                    self._save_mixed_sample(mixed_sample, processed_count)
+                    processed_count += 1
+                    
+                    if processed_count % 100 == 0:
+                        self._log_statistics()
         
-        return size_variance
-
-class ConfMixDetector:
-    def __init__(self, confidence_detector):
-        self.confidence_detector = confidence_detector
+        self._create_final_dataset_config()
+    
+    def _process_frame(self, frame_path, progress_ratio):
+        """Verarbeitet einzelnes Frame mit verbesserter Analyse"""
+        target_image = Image.open(frame_path)
         
-    def process_frame(self, target_image, progress_ratio):
-        # 1. Get regions
-        regions = self._split_image_into_regions(target_image)
+        # Get detections with uncertainty estimation
+        detections = self.detector.predict_with_uncertainty(target_image, progress_ratio)
+        if not detections:
+            return None
+            
+        # Analyze regions
+        region_analyzer = RegionAnalyzer(target_image.size)
+        region_analyses = region_analyzer.analyze_regions(detections)
+        best_region = region_analyzer.get_best_region(region_analyses)
         
-        # 2. Get detections with progressive confidence
-        detections = self.confidence_detector.predict_with_progressive_confidence(
+        if best_region['quality_score'] < 0.3:  # Minimum quality threshold
+            return None
+        
+        # Get source image and create mix
+        source_data = self._get_random_source_image()
+        mixed_sample = self._create_mixed_sample(
             target_image, 
-            progress_ratio
+            source_data, 
+            best_region,
+            detections
         )
         
-        # Rest bleibt gleich
-        region_confidences = self._calculate_region_confidences(detections, regions)
-        best_region_idx = np.argmax([conf['mean_confidence'] for conf in region_confidences])
-        
-        return {
-            'regions': regions,
-            'detections': detections,
-            'region_confidences': region_confidences,
-            'best_region_idx': best_region_idx
-        }
-    
-    
-    def _split_image_into_regions(self, image):
-        width, height = image.size
-        regions = [
-            (0, 0, width//2, height//2),
-            (width//2, 0, width, height//2),
-            (0, height//2, width//2, height),
-            (width//2, height//2, width, height)
-        ]
-        return regions
-    
-    def _calculate_region_confidences(self, detections, regions):
-        region_confidences = []
-        
-        for region in regions:
-            region_dets = []
-            region_conf = 0.0
-            
-            for det in detections:
-                box = det['box']
-                center_x = (box[0] + box[2]) / 2
-                center_y = (box[1] + box[3]) / 2
-                
-                if (region[0] <= center_x <= region[2] and 
-                    region[1] <= center_y <= region[3]):
-                    region_dets.append(det)
-                    region_conf += det['combined_confidence']
-            
-            mean_conf = region_conf / len(region_dets) if region_dets else 0
-            region_confidences.append({
-                'detections': region_dets,
-                'mean_confidence': mean_conf
-            })
-            
-        return region_confidences
-
-def process_heichole_dataset():
-    """Main function to process HeiChole dataset"""
-    # Initialize detectors
-    confidence_detector = ConfidenceBasedDetector(YOLO_MODEL_PATH)
-    confmix_detector = ConfMixDetector(confidence_detector)
-    
-    # Process each video in the dataset
-    dataset_path = Path(HEICHOLE_DATASET_PATH)
-    for video_folder in (dataset_path / "Videos").iterdir():
-        if not video_folder.is_dir():
-            continue
-            
-        print(f"\nProcessing video: {video_folder.name}")
-        
-        # Process each frame in the video
-        for frame_file in video_folder.glob("*.png"):
-            # Load image
-            image = Image.open(frame_file)
-            
-            # Process frame with ConfMix
-            results = confmix_detector.process_frame(image)
-            
-            # Print detections for testing
-            print(f"\nFrame {frame_file.stem}:")
-            print(f"Found {len(results['detections'])} detections")
-            print(f"Best region: {results['best_region_idx']}")
-            print(f"Region confidences: {[conf['mean_confidence'] for conf in results['region_confidences']]}")
-
-class ConfMixTrainer:
-    def __init__(self, confmix_detector, source_data_path):
-        self.confmix_detector = confmix_detector
-        self.source_images_path = Path(source_data_path) / "images" / "train"
-        self.source_labels_path = Path(source_data_path) / "labels" / "train"
-        
-        # Validiere Pfade
-        if not self.source_images_path.exists():
-            raise FileNotFoundError(f"Source images path not found: {self.source_images_path}")
-            
-        # Liste alle verfügbaren CholecT50-Bilder
-        self.source_images = list(self.source_images_path.glob("*.png"))
-        print(f"Found {len(self.source_images)} CholecT50 source images")
+        return mixed_sample
     
     def _get_random_source_image(self):
-        """Lädt zufälliges CholecT50-Bild mit Labels"""
+        """Holt zufälliges Source-Bild mit Labels"""
         source_image_path = random.choice(self.source_images)
         source_image = Image.open(source_image_path)
         
-        # Lade zugehöriges YOLO-Label
-        label_path = self.source_labels_path / (source_image_path.stem + ".txt")
+        label_path = self.source_path / "labels" / "train" / f"{source_image_path.stem}.txt"
         source_labels = []
         if label_path.exists():
             with open(label_path, 'r') as f:
@@ -195,181 +124,233 @@ class ConfMixTrainer:
             'path': source_image_path,
             'labels': source_labels
         }
-
-    def create_mixed_sample(self, target_image, target_results):
-        """Erstellt gemischtes Bild nach ConfMix-Methode"""
-        source_data = self._get_random_source_image()
+    
+    def _create_mixed_sample(self, target_image, source_data, region_info, detections):
+        """Erstellt gemischtes Sample mit verbessertem Blending"""
         source_image = source_data['image']
-        
-        # Resize falls nötig
         if source_image.size != target_image.size:
             source_image = source_image.resize(target_image.size)
         
-        # Beste Region aus HeiChole
-        best_region_idx = target_results['best_region_idx']
-        best_region = target_results['regions'][best_region_idx]
-        confidence = target_results['region_confidences'][best_region_idx]['mean_confidence']
+        # Create soft mask for better blending
+        mask = Image.new('L', target_image.size, 0)
+        draw = ImageDraw.Draw(mask)
+        x1, y1, x2, y2 = region_info['region']
+        draw.rectangle([x1, y1, x2, y2], fill=255)
+        mask = mask.filter(ImageFilter.GaussianBlur(radius=10))
         
-        # Nur mixen wenn Konfidenz gut genug
-        if confidence > CONFIDENCE_THRESHOLD:
-            # Mixing-Maske erstellen
-            mask = np.zeros((target_image.size[1], target_image.size[0]))
-            x1, y1, x2, y2 = best_region
-            mask[y1:y2, x1:x2] = 1
-            
-            # Bilder mixen
-            target_array = np.array(target_image)
-            source_array = np.array(source_image)
-            mixed_array = (1 - mask[..., None]) * source_array + mask[..., None] * target_array
-            mixed_image = Image.fromarray(mixed_array.astype('uint8'))
-            
-            return {
-                'mixed_image': mixed_image,
-                'source_data': source_data,
-                'target_region': best_region,
-                'confidence': confidence,
-                'target_detections': target_results['detections']
-            }
-        return None
-
-def convert_to_yolo_format(box, image_width, image_height):
-    """Konvertiert Box-Koordinaten ins YOLO-Format"""
-    x1, y1, x2, y2 = box
-    
-    # Berechne zentrale Koordinaten und Dimensionen
-    x_center = (x1 + x2) / 2
-    y_center = (y1 + y2) / 2
-    width = x2 - x1
-    height = y2 - y1
-    
-    # Normalisiere auf Bildgröße
-    x_center /= image_width
-    y_center /= image_height
-    width /= image_width
-    height /= image_height
-    
-    return x_center, y_center, width, height
-def save_combined_labels(mixed_sample, label_path, image_width, image_height):
-    """
-    Speichert kombinierte Labels aus Source und Target
-    basierend auf der gemixten Region
-    """
-    target_region = mixed_sample['target_region']
-    x1, y1, x2, y2 = target_region
-    
-    combined_labels = []
-    
-    # 1. Target-Pseudo-Labels (nur für die ausgewählte Region)
-    for det in mixed_sample['target_detections']:
-        box = det['box']
-        box_center_x = (box[0] + box[2]) / 2
-        box_center_y = (box[1] + box[3]) / 2
+        # Mix images
+        mask_array = np.array(mask) / 255.0
+        target_array = np.array(target_image)
+        source_array = np.array(source_image)
+        mixed_array = (mask_array[..., None] * target_array + 
+                      (1 - mask_array[..., None]) * source_array)
         
-        # Prüfe ob die Detection in der Target-Region liegt
-        if (x1 <= box_center_x <= x2 and y1 <= box_center_y <= y2):
-            x_center, y_center, width, height = convert_to_yolo_format(
-                box, image_width, image_height
-            )
-            combined_labels.append({
+        return {
+            'mixed_image': Image.fromarray(mixed_array.astype('uint8')),
+            'source_data': source_data,
+            'region_info': region_info,
+            'detections': detections
+        }
+    
+    def _validate_sample(self, mixed_sample):
+        """Validiert Mixed Sample anhand mehrerer Kriterien"""
+        region_info = mixed_sample['region_info']
+        detections = mixed_sample['detections']
+        
+        # Check class distribution
+        class_counts = defaultdict(int)
+        for det in detections:
+            if self._is_detection_in_region(det, region_info['region']):
+                class_counts[det['class']] += 1
+                
+                # Check class limits
+                if self.class_stats[det['class']]['count'] >= 3000:
+                    return False
+        
+        # Validate detection quality
+        if not self._validate_detections(detections, region_info['region']):
+            return False
+        
+        return True
+    
+    def _validate_detections(self, detections, region):
+        """Prüft Qualität der Detektionen"""
+        region_dets = [d for d in detections 
+                      if self._is_detection_in_region(d, region)]
+        
+        if not region_dets:
+            return False
+        
+        # Check confidence and uncertainty
+        mean_conf = np.mean([d['adjusted_confidence'] for d in region_dets])
+        mean_uncertainty = np.mean([d['uncertainty'] for d in region_dets])
+        
+        return mean_conf > 0.3 and mean_uncertainty < 0.4
+    
+    def _is_detection_in_region(self, detection, region):
+        """Prüft ob Detection in Region liegt"""
+        box = detection['box']
+        center_x = (box[0] + box[2]) / 2
+        center_y = (box[1] + box[3]) / 2
+        x1, y1, x2, y2 = region
+        return (x1 <= center_x <= x2 and y1 <= center_y <= y2)
+    
+    def _save_mixed_sample(self, mixed_sample, index):
+        """Speichert Mixed Sample mit erweiterten Metadaten"""
+        # Bestimme Split (80/10/10)
+        r = random.random()
+        split = "train" if r < 0.8 else "val" if r < 0.9 else "test"
+        
+        base_filename = f"mixed_{index:06d}"
+        
+        # Speichere Bild
+        image_path = self.output_path / "images" / split / f"{base_filename}.png"
+        mixed_sample['mixed_image'].save(image_path)
+        
+        # Speichere Labels
+        self._save_labels(mixed_sample, split, base_filename)
+        
+        # Speichere erweiterte Metadaten
+        self._save_metadata(mixed_sample, split, base_filename)
+        
+        # Update Statistiken
+        self._update_statistics(mixed_sample)
+    
+    def _save_labels(self, mixed_sample, split, base_filename):
+        """Speichert YOLO-Format Labels mit Qualitätskontrolle"""
+        label_path = self.output_path / "labels" / split / f"{base_filename}.txt"
+        region = mixed_sample['region_info']['region']
+        image_size = mixed_sample['mixed_image'].size
+        
+        valid_labels = []
+        
+        # Process target region detections
+        for det in mixed_sample['detections']:
+            if self._is_detection_in_region(det, region):
+                label = self._convert_to_yolo_format(det, image_size)
+                if label:
+                    valid_labels.append(label)
+        
+        # Process source labels outside target region
+        for label_line in mixed_sample['source_data']['labels']:
+            label = self._parse_source_label(label_line, region, image_size)
+            if label:
+                valid_labels.append(label)
+        
+        # Filter overlapping labels
+        final_labels = self._filter_overlapping_labels(valid_labels)
+        
+        # Save labels
+        with open(label_path, 'w') as f:
+            for label in final_labels:
+                f.write(f"{label['class']} {label['x']} {label['y']} "
+                       f"{label['w']} {label['h']}\n")
+    
+    def _save_metadata(self, mixed_sample, split, base_filename):
+        """Speichert erweiterte Metadaten für Analyse"""
+        meta_path = self.output_path / "labels" / split / "meta" / f"{base_filename}.json"
+        
+        metadata = {
+            'source_image': str(mixed_sample['source_data']['path'].name),
+            'region': mixed_sample['region_info']['region'],
+            'quality_score': mixed_sample['region_info']['quality_score'],
+            'detections': []
+        }
+        
+        for det in mixed_sample['detections']:
+            metadata['detections'].append({
                 'class': det['class'],
-                'x_center': x_center,
-                'y_center': y_center,
-                'width': width,
-                'height': height
+                'confidence': float(det['confidence']),
+                'uncertainty': float(det['uncertainty']),
+                'adjusted_confidence': float(det['adjusted_confidence']),
+                'box': det['box'].tolist()
             })
+        
+        with open(meta_path, 'w') as f:
+            json.dump(metadata, f, indent=2)
     
-    # 2. Source-Labels (für den Rest des Bildes)
-    for label in mixed_sample['source_data']['labels']:
-        # Parse YOLO-Format Label
-        parts = label.strip().split()
-        if len(parts) == 5:
-            class_id = int(parts[0])
-            x_center = float(parts[1])
-            y_center = float(parts[2])
-            width = float(parts[3])
-            height = float(parts[4])
-            
-            # Konvertiere zu absoluten Koordinaten
-            abs_x = x_center * image_width
-            abs_y = y_center * image_height
-            
-            # Prüfe ob das Label außerhalb der Target-Region liegt
-            if not (x1 <= abs_x <= x2 and y1 <= abs_y <= y2):
-                combined_labels.append({
-                    'class': class_id,
-                    'x_center': x_center,
-                    'y_center': y_center,
-                    'width': width,
-                    'height': height
-                })
+    def _update_statistics(self, mixed_sample):
+        """Aktualisiert Tracking-Statistiken"""
+        region = mixed_sample['region_info']['region']
+        
+        for det in mixed_sample['detections']:
+            if self._is_detection_in_region(det, region):
+                class_id = det['class']
+                stats = self.class_stats[class_id]
+                
+                stats['count'] += 1
+                stats['confidence_sum'] += det['confidence']
+                stats['uncertainty_sum'] += det['uncertainty']
+                stats['quality_scores'].append(det['adjusted_confidence'])
     
-    # Speichere alle Labels
-    with open(label_path, 'w') as f:
-        for label in combined_labels:
-            f.write(f"{label['class']} {label['x_center']:.6f} "
-                   f"{label['y_center']:.6f} {label['width']:.6f} "
-                   f"{label['height']:.6f}\n")
+    def _log_statistics(self):
+        """Loggt aktuelle Statistiken"""
+        print("\nCurrent Dataset Statistics:")
+        print("-" * 50)
+        
+        for class_id, stats in sorted(self.class_stats.items()):
+            if stats['count'] > 0:
+                mean_conf = stats['confidence_sum'] / stats['count']
+                mean_uncertainty = stats['uncertainty_sum'] / stats['count']
+                
+                print(f"\nClass {TOOL_MAPPING[class_id]}:")
+                print(f"  Count: {stats['count']}")
+                print(f"  Mean Confidence: {mean_conf:.3f}")
+                print(f"  Mean Uncertainty: {mean_uncertainty:.3f}")
+    
+    def _create_final_dataset_config(self):
+        """Erstellt finale Dataset Konfiguration"""
+        config = {
+            'path': str(self.output_path),
+            'train': str(self.output_path / 'images' / 'train'),
+            'val': str(self.output_path / 'images' / 'val'),
+            'test': str(self.output_path / 'images' / 'test'),
+            'names': TOOL_MAPPING,
+            'class_weights': self._calculate_class_weights()
+        }
+        
+        yaml_path = self.output_path / 'dataset.yaml'
+        with open(yaml_path, 'w') as f:
+            yaml.dump(config, f, sort_keys=False)
+    
+    def _calculate_class_weights(self):
+        """Berechnet optimierte Klassengewichte"""
+        weights = {}
+        total_samples = sum(stats['count'] for stats in self.class_stats.values())
+        
+        for class_id, stats in self.class_stats.items():
+            if stats['count'] == 0:
+                weights[class_id] = 1.0
+                continue
+            
+            # Berücksichtige Klassenhäufigkeit und Detektionsqualität
+            mean_quality = np.mean(stats['quality_scores'])
+            count_factor = math.log(total_samples / stats['count'] + 1)
+            
+            weights[class_id] = count_factor * (1 + (1 - mean_quality))
+        
+        # Normalisiere Gewichte
+        max_weight = max(weights.values())
+        return {k: float(v/max_weight) for k, v in weights.items()}
 
 def main():
-    """Hauptfunktion zur Erstellung der gemischten Trainingsdaten"""
-    confidence_detector = ConfidenceBasedDetector(YOLO_MODEL_PATH)
-    confmix_detector = ConfMixDetector(confidence_detector)
-    trainer = ConfMixTrainer(confmix_detector, CHOLECT50_PATH)
-    
-    # Erweiterte Verzeichnisstruktur
-    os.makedirs(MIXED_SAMPLES_PATH, exist_ok=True)
-    os.makedirs(os.path.join(MIXED_SAMPLES_PATH, "images"), exist_ok=True)
-    os.makedirs(os.path.join(MIXED_SAMPLES_PATH, "labels"), exist_ok=True)
-    os.makedirs(os.path.join(MIXED_SAMPLES_PATH, "labels", "meta"), exist_ok=True)
-    
-    successful_mixes = 0
-    total_frames = sum(1 for _ in Path(HEICHOLE_DATASET_PATH).rglob("*.png"))
-    current_frame = 0
-    
-    dataset_path = Path(HEICHOLE_DATASET_PATH)
-    for video_folder in (dataset_path / "Videos").iterdir():
-        if not video_folder.is_dir():
-            continue
-            
-        print(f"\nProcessing HeiChole video: {video_folder.name}")
+    """Hauptfunktion zur Dataset-Erstellung"""
+    try:
+        creator = DatasetCreator(
+            model_path=YOLO_MODEL_PATH,
+            source_path=CHOLECT50_PATH,
+            target_path=HEICHOLE_DATASET_PATH,
+            output_path=BALANCED_MIXED_SAMPLES_PATH
+        )
         
-        for frame_file in video_folder.glob("*.png"):
-            progress_ratio = current_frame / total_frames
-            current_frame += 1
-            
-            target_image = Image.open(frame_file)
-            target_results = confmix_detector.process_frame(target_image, progress_ratio)
-            mixed_sample = trainer.create_mixed_sample(target_image, target_results)
-            
-            if mixed_sample is not None:
-                # Basis-Dateinamen generieren
-                base_filename = f"mixed_{successful_mixes:06d}"
-                
-                # Pfade für Bild, Label und Meta
-                image_path = os.path.join(MIXED_SAMPLES_PATH, "images", f"{base_filename}.png")
-                label_path = os.path.join(MIXED_SAMPLES_PATH, "labels", f"{base_filename}.txt")
-                meta_path = os.path.join(MIXED_SAMPLES_PATH, "labels", "meta", f"{base_filename}_meta.txt")
-                
-                # Speichere Bild
-                mixed_sample['mixed_image'].save(image_path)
-                
-                # Speichere kombinierte Labels
-                image_width, image_height = mixed_sample['mixed_image'].size
-                save_combined_labels(mixed_sample, label_path, image_width, image_height)
-                
-                # Speichere Meta-Informationen
-                with open(meta_path, 'w') as f:
-                    f.write(f"Progress Ratio: {progress_ratio:.3f}\n")
-                    f.write(f"Source: {mixed_sample['source_data']['path'].name}\n")
-                    f.write(f"Target region: {mixed_sample['target_region']}\n")
-                    f.write(f"Confidence: {mixed_sample['confidence']}\n")
-                    f.write("Original detections:\n")
-                    for det in mixed_sample['target_detections']:
-                        f.write(f"{det['class']} {det['combined_confidence']} {det['box']}\n")
-                
-                successful_mixes += 1
-                if successful_mixes % 100 == 0:
-                    print(f"Created {successful_mixes} mixed samples (Progress: {progress_ratio:.2%})")
+        print("Starting dataset creation...")
+        creator.create_dataset(max_samples_per_class=3000)
+        print("\nDataset creation completed successfully!")
+        
+    except Exception as e:
+        print(f"Error during dataset creation: {str(e)}")
+        import traceback
+        traceback.print_exc()
 
 if __name__ == "__main__":
     main()

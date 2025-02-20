@@ -1,8 +1,8 @@
 task: detect
 mode: train
-model: /home/Bartscht/YOLO/surgical-instrument-action-detection/domain_adaptation/hei_chole/experiments/finalfinal/heichole_transfer_balanced_instruments/transfer_learning/weights/epoch30.pt
-data: /data/Bartscht/balanced_mixed_samples_epoch3/dataset.yaml
-epochs: 50
+model: /data/Bartscht/YOLO/best_v35.pt
+data: /data/Bartscht/balanced_mixed_samples_epoch_last/dataset.yaml
+epochs: 30
 time: null
 patience: 50
 batch: 8

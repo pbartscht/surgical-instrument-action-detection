@@ -76,7 +76,7 @@ HEICHOLE_SPECIFIC_INSTRUMENTS = {
 }
 
 class HeiCholeEvaluator:
-    def __init__(self, model_path, dataset_path, confidence_threshold=0.1):
+    def __init__(self, model_path, dataset_path, confidence_threshold=0.5):
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.model = CholecT50Model.load_from_checkpoint(model_path)
         self.model.to(self.device)

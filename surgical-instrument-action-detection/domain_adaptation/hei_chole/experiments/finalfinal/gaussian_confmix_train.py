@@ -127,7 +127,7 @@ class ImprovedConfMixLoss(nn.Module):
         
         return gamma.clamp(0.1, 0.9)
 
-def setup_training(pretrained_model_path, dataset_yaml_path, project_name="confmix_1"):
+def setup_training(pretrained_model_path, dataset_yaml_path, project_name="confmix_last"):
     # Lade Dataset Konfiguration
     with open(dataset_yaml_path, 'r') as f:
         dataset_config = yaml.safe_load(f)
@@ -136,7 +136,7 @@ def setup_training(pretrained_model_path, dataset_yaml_path, project_name="confm
     model = YOLO(pretrained_model_path)
     
     # Training Parameter
-    epochs = 50  # Anzahl der Epochs
+    epochs = 30  # Anzahl der Epochs
     
     # Initialisiere verbesserten Loss
     model.loss_fn = ImprovedConfMixLoss(num_epochs=epochs)
@@ -198,8 +198,8 @@ def setup_training(pretrained_model_path, dataset_yaml_path, project_name="confm
         raise
 
 def main():
-    PRETRAINED_MODEL = "/home/Bartscht/YOLO/surgical-instrument-action-detection/domain_adaptation/hei_chole/experiments/finalfinal/heichole_transfer_balanced_instruments/transfer_learning/weights/epoch30.pt"
-    DATASET_YAML = "/data/Bartscht/balanced_mixed_samples_epoch3/dataset.yaml"
+    PRETRAINED_MODEL = "/data/Bartscht/YOLO/best_v35.pt"
+    DATASET_YAML = "/data/Bartscht/balanced_mixed_samples_epoch_last/dataset.yaml"
     
     print("Starting improved ConfMix training...")
     print(f"Using pretrained model: {PRETRAINED_MODEL}")
