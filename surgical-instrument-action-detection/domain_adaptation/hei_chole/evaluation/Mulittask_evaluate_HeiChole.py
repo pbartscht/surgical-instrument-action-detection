@@ -33,19 +33,6 @@ VERB_MAPPING = {
     8: 'pack', 9: 'null_verb'
 }
 
-# Mapping between verb model indices and evaluation indices
-VERB_MODEL_TO_EVAL_MAPPING = {
-    0: 2,   # Model: 'dissect' -> Eval: 'dissect'
-    1: 1,   # Model: 'retract' -> Eval: 'retract'
-    2: 9,   # Model: 'null_verb' -> Eval: 'null_verb'
-    3: 3,   # Model: 'coagulate' -> Eval: 'coagulate'
-    4: 0,   # Model: 'grasp' -> Eval: 'grasp'
-    5: 4,   # Model: 'clip' -> Eval: 'clip'
-    6: 6,   # Model: 'aspirate' -> Eval: 'aspirate'
-    7: 5,   # Model: 'cut' -> Eval: 'cut'
-    8: 7,   # Model: 'irrigate' -> Eval: 'irrigate'
-    9: 9    # Model: 'null_verb' -> Eval: 'null_verb'
-}
 
 # Constants for Dataset Mappings
 CHOLECT50_TO_HEICHOLE_INSTRUMENT_MAPPING = {

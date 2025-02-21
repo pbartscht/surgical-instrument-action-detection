@@ -7,15 +7,15 @@ import yaml
 def analyze_class_distribution(labels_dir):
     """
     Analysiert die Klassenverteilung in den YOLO-Label-Dateien.
-    Überspringt Dateien, die im 'meta'-Ordner liegen oder ungültige Zeilen enthalten.
+    Überspringt Dateien, die ungültige Zeilen enthalten.
     """
     class_counts = Counter()
     total_objects = 0
+    num_files = 0
     
-    # Durchsuche alle .txt-Dateien im labels_dir, aber überspringe die im "meta"-Unterordner
-    for label_file in Path(labels_dir).rglob("*.txt"):
-        if label_file.parent.name == "meta":
-            continue  # Meta-Dateien überspringen
+    # Durchsuche alle .txt-Dateien im labels_dir
+    for label_file in Path(labels_dir).glob("*.txt"):
+        num_files += 1
         with open(label_file, 'r') as f:
             for line in f:
                 parts = line.strip().split()
@@ -30,8 +30,7 @@ def analyze_class_distribution(labels_dir):
                     # Zeile enthält keine gültigen Label-Daten, überspringen
                     continue
                     
-    return class_counts, total_objects
-
+    return class_counts, total_objects, num_files
 
 def calculate_class_weights(class_counts, total_objects, method='inverse'):
     """
@@ -64,7 +63,6 @@ def calculate_class_weights(class_counts, total_objects, method='inverse'):
 
 def update_dataset_yaml(yaml_path, class_weights):
     """
-    copy old dataset.yaml into new mixed_samples_epoch_x to refresh class distribution
     Aktualisiert die dataset.yaml mit den neuen Klassengewichten
     """
     with open(yaml_path, 'r') as f:
@@ -76,26 +74,40 @@ def update_dataset_yaml(yaml_path, class_weights):
     with open(yaml_path, 'w') as f:
         yaml.dump(yaml_content, f, sort_keys=False)
 
-def main():
-    base_path = "/data/Bartscht/YOLO"
-    labels_dir = os.path.join(base_path, "labels")
-    yaml_path = os.path.join(base_path, "data.yaml")
-    
-    print("Analyzing class distribution...")
-    class_counts, total_objects = analyze_class_distribution(labels_dir)
-    
-    print("\nClass distribution:")
+def print_distribution(split_name, class_counts, total_objects, num_files):
+    print(f"\n=== {split_name} Set Distribution ===")
+    print(f"Total files: {num_files}")
+    print(f"Total objects: {total_objects}")
+    print("\nPer-class distribution:")
     for class_id, count in sorted(class_counts.items()):
         percentage = (count / total_objects) * 100
         print(f"Class {class_id}: {count} objects ({percentage:.2f}%)")
+
+def main():
+    base_path = "/data/Bartscht/YOLO"
+    train_dir = os.path.join(base_path, "labels", "train")
+    val_dir = os.path.join(base_path, "labels", "val")
+    yaml_path = os.path.join(base_path, "data.yaml")
     
-    print("\nCalculating new class weights...")
-    class_weights = calculate_class_weights(class_counts, total_objects, method='inverse')
+    # Analyze training set
+    print("Analyzing training set distribution...")
+    train_counts, train_total, train_files = analyze_class_distribution(train_dir)
+    print_distribution("Training", train_counts, train_total, train_files)
+    
+    # Analyze validation set
+    print("\nAnalyzing validation set distribution...")
+    val_counts, val_total, val_files = analyze_class_distribution(val_dir)
+    print_distribution("Validation", val_counts, val_total, val_files)
+    
+    # Calculate weights based on training set
+    print("\nCalculating new class weights (based on training set)...")
+    class_weights = calculate_class_weights(train_counts, train_total, method='inverse')
     
     print("\nNew class weights:")
     for class_id, weight in sorted(class_weights.items()):
         print(f"Class {class_id}: {weight:.3f}")
     
+    # Update yaml
     print("\nUpdating dataset.yaml...")
     update_dataset_yaml(yaml_path, class_weights)
     
