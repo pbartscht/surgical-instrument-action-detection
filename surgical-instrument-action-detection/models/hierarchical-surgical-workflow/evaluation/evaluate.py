@@ -23,6 +23,7 @@ from verb_recognition.models.SurgicalActionNet import SurgicalVerbRecognition
 
 # Constants
 CONFIDENCE_THRESHOLD = 0.6
+#CONFIDENCE_THRESHOLD = 0.4
 IOU_THRESHOLD = 0.3
 VIDEOS_TO_ANALYZE = ["VID92", "VID96", "VID103", "VID110", "VID111"]
 
@@ -61,7 +62,7 @@ class ModelLoader:
     def setup_paths(self):
         """Defines all important paths for the models"""
         # YOLO model path
-        self.yolo_weights = self.hierarchical_dir / "Instrument-classification-detection/weights/instrument_detector/best_v35.pt"
+        self.yolo_weights = self.hierarchical_dir / "Instrument-classification-detection/weights/instrument_detector/epoch70.pt"
         # Verb model path
         self.verb_model_path = self.hierarchical_dir / "verb_recognition/checkpoints/jumping-tree-47/last.ckpt"
         
@@ -225,7 +226,7 @@ class HierarchicalEvaluator:
             valid_detections = []
             
             # Print detected instruments (for debugging)
-            print("\nDetected instruments in frame:")
+            #print("\nDetected instruments in frame:")
             
             # Process each YOLO detection
             for detection in yolo_results[0].boxes:
@@ -235,7 +236,7 @@ class HierarchicalEvaluator:
                 # Only consider predictions above confidence threshold
                 if instrument_class < 6 and confidence >= CONFIDENCE_THRESHOLD:
                     instrument_name = TOOL_MAPPING[instrument_class]
-                    print(f"- Found {instrument_name} with confidence {confidence:.2f}")
+                    #print(f"- Found {instrument_name} with confidence {confidence:.2f}")
                     
                     # Store valid detection
                     valid_detections.append({
@@ -250,12 +251,12 @@ class HierarchicalEvaluator:
             
             # Step 2: Process each detected instrument
             for idx, detection in enumerate(valid_detections):
-                print(f"\nProcessing instrument {idx + 1}:")
+                #print(f"\nProcessing instrument {idx + 1}:")
                 instrument_name = detection['name']
                 box = detection['box']
                 confidence = detection['confidence']
                 
-                print(f"- Working on {instrument_name} (confidence: {confidence:.2f})")
+                #print(f"- Working on {instrument_name} (confidence: {confidence:.2f})")
                 
                 # Crop image region with the detected instrument
                 x1, y1, x2, y2 = map(int, box)
@@ -269,7 +270,7 @@ class HierarchicalEvaluator:
                 verb_probs = verb_outputs['probabilities']
                 
                 # Get top 3 verb predictions for this instrument
-                print(f"Top 3 verb predictions for {instrument_name}:")
+                #print(f"Top 3 verb predictions for {instrument_name}:")
                 top_verbs = []
                 
                 # Process top 3 verb predictions
@@ -280,7 +281,7 @@ class HierarchicalEvaluator:
                         verb_name = VERB_MAPPING[eval_verb_idx]
                         verb_prob = float(verb_probs[0][verb_model_idx])
                         
-                        print(f"  - {verb_name}: {verb_prob:.3f}")
+                        #print(f"  - {verb_name}: {verb_prob:.3f}")
                         
                         # Only consider valid instrument-verb combinations
                         if (verb_name in self.VALID_PAIRS[instrument_name]):
@@ -392,11 +393,11 @@ class HierarchicalEvaluator:
             'pairs': defaultdict(int)
         }
         
-        print("\nStarting evaluation process...")
+        #print("\nStarting evaluation process...")
         
         # Process each video in the evaluation set
         for video in VIDEOS_TO_ANALYZE:
-            print(f"\nProcessing {video}...")
+            #print(f"\nProcessing {video}...")
             
             # Load ground truth annotations
             ground_truth = self.load_ground_truth(video)
