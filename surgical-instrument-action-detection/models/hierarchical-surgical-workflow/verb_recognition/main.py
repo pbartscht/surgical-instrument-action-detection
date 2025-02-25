@@ -1,7 +1,8 @@
 import pytorch_lightning as pl
 from pytorch_lightning.loggers import WandbLogger
 from pytorch_lightning.callbacks import ModelCheckpoint
-from models.SurgicalActionNet import SurgicalVerbRecognition
+from models.Backbone_SurgicalActionNet import SurgicalVerbRecognition
+#from models.ablation_SurgicalActionNet import UnconstrainedSurgicalVerbRecognition
 from utils.verbdataloader import VerbDataModule
 import os
 
