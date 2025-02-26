@@ -1,0 +1,21 @@
+path: /data/Bartscht//data/Bartscht/m2cai16-tool-locations
+train: images/train
+val: images/val
+test: images/test
+nc: 7
+names:
+- Grasper
+- Bipolar
+- Hook
+- Scissors
+- Clipper
+- Irrigator
+- SpecimenBag
+class_weights:
+  '5': 0.67
+  '6': 0.71
+  '0': 0.24
+  '3': 0.84
+  '4': 0.78
+  '1': 0.75
+  '2': 1.0

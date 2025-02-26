@@ -103,7 +103,13 @@ class SurgicalVerbRecognition(pl.LightningModule):
             num_classes=0,
             global_pool='avg'
         )
-        backbone_dim = 576  # Angepasste Ausgabedimension für MobileNetV3-Small
+        #self.backbone = timm.create_model(
+        #    'vit_small_patch16_224', 
+        #    pretrained=True,
+        #    num_classes=0,
+        #    global_pool='avg'
+        #)
+        backbone_dim = 1024  
 
         # Classifier entsprechend anpassen
         self.classifier = nn.Sequential(
@@ -153,7 +159,8 @@ class SurgicalVerbRecognition(pl.LightningModule):
         """
         # Extract visual features
         visual_features = self.backbone(x)
-        
+        #print(f"Visual features shape: {visual_features.shape}")
+
         # Get verb logits
         logits = self.classifier(visual_features)
 

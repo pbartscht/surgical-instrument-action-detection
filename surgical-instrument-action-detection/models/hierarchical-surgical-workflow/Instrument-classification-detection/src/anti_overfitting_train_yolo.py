@@ -47,7 +47,7 @@ def test_dataset(model, data_yaml_path):
 
 def main():
     # Define paths
-    pretrained_weights_path = project_root / 'weights' / 'pretrained' / 'yolo11l.pt'
+    pretrained_weights_path = project_root / 'weights' / 'pretrained' / 'yolov8l.pt'
     output_weights_dir = project_root / 'weights' / 'instrument_detector'
     data_yaml_path = project_root / 'config' / 'model_config' / 'data.yaml'
     

@@ -20,10 +20,12 @@ sys.path.append(str(hierarchical_dir))
 
 # Custom imports
 from verb_recognition.models.SurgicalActionNet import SurgicalVerbRecognition
+#from verb_recognition.models.Backbone_SurgicalActionNet import SurgicalVerbRecognition
+
 
 # Constants
-CONFIDENCE_THRESHOLD = 0.6
-#CONFIDENCE_THRESHOLD = 0.4
+#CONFIDENCE_THRESHOLD = 0.6
+CONFIDENCE_THRESHOLD = 0.1
 IOU_THRESHOLD = 0.3
 VIDEOS_TO_ANALYZE = ["VID92", "VID96", "VID103", "VID110", "VID111"]
 
@@ -65,7 +67,7 @@ class ModelLoader:
         self.yolo_weights = self.hierarchical_dir / "Instrument-classification-detection/weights/instrument_detector/epoch70.pt"
         # Verb model path
         self.verb_model_path = self.hierarchical_dir / "verb_recognition/checkpoints/jumping-tree-47/last.ckpt"
-        
+        #self.verb_model_path = self.hierarchical_dir / "verb_recognition/checkpoints/genial-eon-54/last.ckpt"
         # Dataset path
         self.dataset_path = Path("/data/Bartscht/CholecT50")
         

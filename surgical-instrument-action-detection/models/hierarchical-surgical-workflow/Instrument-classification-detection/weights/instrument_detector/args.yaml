@@ -1,8 +1,8 @@
 task: detect
 mode: train
-model: /home/Bartscht/YOLO/surgical-instrument-action-detection/models/hierarchical-surgical-workflow/Instrument-classification-detection/weights/pretrained/yolo11l.pt
+model: /home/Bartscht/YOLO/surgical-instrument-action-detection/models/hierarchical-surgical-workflow/Instrument-classification-detection/weights/pretrained/yolov8l.pt
 data: /home/Bartscht/YOLO/surgical-instrument-action-detection/models/hierarchical-surgical-workflow/Instrument-classification-detection/config/model_config/data.yaml
-epochs: 120
+epochs: 100
 time: null
 patience: 30
 batch: 8
