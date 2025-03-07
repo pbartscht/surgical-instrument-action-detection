@@ -1,0 +1,26 @@
+# Klassengewichtungen (Methode: inverse)
+Scissors-Coagulate 566.92
+Grasper-Pack 425.19
+Grasper-Dissect 103.08
+Bipolar-Grasp 41.48
+Scissors-Dissect 40.49
+Scissors_null-Verb 37.79
+Irrigator-Dissect 28.35
+Bipolar-Retract 23.14
+Clipper_null-Verb 14.85
+Irrigator-Retract 13.55
+Irrigator-Irrigate 13.55
+Bipolar_null-Verb 13.08
+Irrigator_null-Verb 12.46
+Hook-Retract 7.70
+Hook-Coagulate 6.41
+Bipolar-Dissect 4.63
+Grasper_null-Verb 3.55
+Scissors-Cut 2.75
+Irrigator-Aspirate 2.38
+Hook_null-Verb 1.39
+Clipper-Clip 1.38
+Grasper-Grasp 1.25
+Bipolar-Coagulate 1.04
+Grasper-Retract 0.13
+Hook-Dissect 0.09

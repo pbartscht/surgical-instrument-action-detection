@@ -1,7 +1,7 @@
 import pytorch_lightning as pl
 from pytorch_lightning.loggers import WandbLogger
 from pytorch_lightning.callbacks import ModelCheckpoint
-from models.Backbone_SurgicalActionNet import SurgicalVerbRecognition
+from models.pointer_IV_predictor import SurgicalActionRecognition
 #from models.ablation_SurgicalActionNet import UnconstrainedSurgicalVerbRecognition
 from utils.verbdataloader import VerbDataModule
 import os
@@ -9,7 +9,7 @@ import os
 def main():
     # Basic setup
     base_dir = "/data/Bartscht/Verbs"
-    batch_size = 16
+    batch_size = 32
     num_workers = 8
     
     # Initialize data and model
@@ -17,15 +17,15 @@ def main():
     datamodule = VerbDataModule(base_dir, batch_size, num_workers)
     
     print("Initializing Model...")
-    model = SurgicalVerbRecognition(
-        num_classes=10,
+    model = SurgicalActionRecognition(
+        num_classes=25,
         learning_rate=1e-5,
         backbone_learning_rate=1e-6,
         dropout=0.5
     )
     
     # Initialize WandB logger first to get the run ID
-    wandb_logger = WandbLogger(project='verb-recognition')
+    wandb_logger = WandbLogger(project='verb-recognition_pointer')
     run_name = wandb_logger.experiment.name
     
     # Create a unique directory for this run's checkpoints
@@ -44,7 +44,7 @@ def main():
     
     # Simple trainer setup
     trainer = pl.Trainer(
-        max_epochs=50,
+        max_epochs=100,
         accelerator='gpu',
         devices=1,
         precision='16-mixed',
