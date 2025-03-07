@@ -52,7 +52,7 @@ CHOLECT50_TO_HEICHOLE_VERB_MAPPING = {
     'clip': 'clip',
     'cut': 'cut',
     'irrigate': 'suction_irrigation',
-    'aspirate': 'hold',
+    'aspirate': 'suction_irrigation',
     'pack': 'hold',
     'null_verb': 'hold'
 }

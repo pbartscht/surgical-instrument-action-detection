@@ -97,19 +97,19 @@ class SurgicalVerbRecognition(pl.LightningModule):
         # Base classification loss
         self.criterion = nn.CrossEntropyLoss()
         
-        self.backbone = timm.create_model(
-            'mobilenetv3_small_100',
-            pretrained=True,
-            num_classes=0,
-            global_pool='avg'
-        )
         #self.backbone = timm.create_model(
-        #    'vit_small_patch16_224', 
+        #    'mobilenetv3_small_100',
         #    pretrained=True,
         #    num_classes=0,
         #    global_pool='avg'
         #)
-        backbone_dim = 1024  
+        self.backbone = timm.create_model(
+            'vit_small_patch16_224', 
+            pretrained=True,
+            num_classes=0,
+            global_pool='avg'
+        )
+        backbone_dim = 384  
 
         # Classifier entsprechend anpassen
         self.classifier = nn.Sequential(

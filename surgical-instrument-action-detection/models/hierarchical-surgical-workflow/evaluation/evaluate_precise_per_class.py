@@ -28,6 +28,7 @@ from verb_recognition.models.SurgicalActionNet import SurgicalVerbRecognition
 CONFIDENCE_THRESHOLD = 0.1
 IOU_THRESHOLD = 0.3
 VIDEOS_TO_ANALYZE = ["VID92", "VID96", "VID103", "VID110", "VID111"]
+#VIDEOS_TO_ANALYZE = ["VID92"]
 
 # Global mappings
 TOOL_MAPPING = {
@@ -64,7 +65,9 @@ class ModelLoader:
     def setup_paths(self):
         """Defines all important paths for the models"""
         # YOLO model path
-        self.yolo_weights = self.hierarchical_dir / "Instrument-classification-detection/weights/instrument_detector/epoch70.pt"
+        #self.yolo_weights = self.hierarchical_dir / "Instrument-classification-detection/weights/instrument_detector/best_v35.pt"
+        self.yolo_weights = self.hierarchical_dir / "Instrument-classification-detection/weights/instrument_detector/weights/epoch0.pt"
+
         # Verb model path
         self.verb_model_path = self.hierarchical_dir / "verb_recognition/checkpoints/jumping-tree-47/last.ckpt"
         #self.verb_model_path = self.hierarchical_dir / "verb_recognition/checkpoints/genial-eon-54/last.ckpt"
@@ -189,7 +192,7 @@ class HierarchicalEvaluator:
         
         return frame_annotations
 
-    def evaluate_frame(self, img_path, ground_truth, save_visualization=True):
+    def evaluate_frame(self, img_path, ground_truth, save_visualization=False):
         """
         Evaluates a single frame using hierarchical recognition:
         1. YOLO detects instruments
@@ -224,11 +227,8 @@ class HierarchicalEvaluator:
         
         try:
             # Step 1: Instrument Detection using YOLO
-            yolo_results = self.yolo_model(img)
+            yolo_results = self.yolo_model(img, verbose=False)
             valid_detections = []
-            
-            # Print detected instruments (for debugging)
-            #print("\nDetected instruments in frame:")
             
             # Process each YOLO detection
             for detection in yolo_results[0].boxes:
@@ -238,7 +238,6 @@ class HierarchicalEvaluator:
                 # Only consider predictions above confidence threshold
                 if instrument_class < 6 and confidence >= CONFIDENCE_THRESHOLD:
                     instrument_name = TOOL_MAPPING[instrument_class]
-                    #print(f"- Found {instrument_name} with confidence {confidence:.2f}")
                     
                     # Store valid detection
                     valid_detections.append({
@@ -253,12 +252,9 @@ class HierarchicalEvaluator:
             
             # Step 2: Process each detected instrument
             for idx, detection in enumerate(valid_detections):
-                #print(f"\nProcessing instrument {idx + 1}:")
                 instrument_name = detection['name']
                 box = detection['box']
                 confidence = detection['confidence']
-                
-                #print(f"- Working on {instrument_name} (confidence: {confidence:.2f})")
                 
                 # Crop image region with the detected instrument
                 x1, y1, x2, y2 = map(int, box)
@@ -272,7 +268,6 @@ class HierarchicalEvaluator:
                 verb_probs = verb_outputs['probabilities']
                 
                 # Get top 3 verb predictions for this instrument
-                #print(f"Top 3 verb predictions for {instrument_name}:")
                 top_verbs = []
                 
                 # Process top 3 verb predictions
@@ -282,8 +277,6 @@ class HierarchicalEvaluator:
                         eval_verb_idx = VERB_MODEL_TO_EVAL_MAPPING[verb_model_idx]
                         verb_name = VERB_MAPPING[eval_verb_idx]
                         verb_prob = float(verb_probs[0][verb_model_idx])
-                        
-                        #print(f"  - {verb_name}: {verb_prob:.3f}")
                         
                         # Only consider valid instrument-verb combinations
                         if (verb_name in self.VALID_PAIRS[instrument_name]):
@@ -395,12 +388,8 @@ class HierarchicalEvaluator:
             'pairs': defaultdict(int)
         }
         
-        #print("\nStarting evaluation process...")
-        
         # Process each video in the evaluation set
         for video in VIDEOS_TO_ANALYZE:
-            #print(f"\nProcessing {video}...")
-            
             # Load ground truth annotations
             ground_truth = self.load_ground_truth(video)
             
@@ -480,7 +469,7 @@ class HierarchicalEvaluator:
         )
         
         # Print detailed evaluation results
-        self._print_evaluation_results(final_metrics, ground_truth_occurrences)
+        self._print_evaluation_results(final_metrics)
         
         return final_metrics
 
@@ -545,53 +534,123 @@ class HierarchicalEvaluator:
             if count > 0 and pair not in matched['pairs']
         )
 
-    def _calculate_final_metrics(self, results, all_predictions, gt_occurrences):
+    def _calculate_per_class_metrics(self, all_predictions, gt_occurrences):
         """
-        Calculates final metrics including AP for all possible classes.
+        Calculate detailed per-class metrics similar to the multitask model.
         
         Args:
-            results: Dictionary containing traditional metrics
-            all_predictions: Predictions for each class
+            all_predictions: Dictionary with predictions for each class
             gt_occurrences: Count of ground truth occurrences per class
         
         Returns:
-            Dictionary containing all final metrics
+            Dictionary with detailed metrics for each class
+        """
+        per_class_metrics = {
+            'instruments': {},
+            'verbs': {},
+            'pairs': {}
+        }
+        
+        # Calculate total support for distribution calculation
+        total_supports = {
+            'instruments': sum(gt_occurrences['instruments'].values()),
+            'verbs': sum(gt_occurrences['verbs'].values()),
+            'pairs': sum(gt_occurrences['pairs'].values())
+        }
+        
+        # Calculate metrics for each class
+        for category in ['instruments', 'verbs', 'pairs']:
+            for class_name, predictions in all_predictions[category].items():
+                support = gt_occurrences[category].get(class_name, 0)
+                
+                # If there are no predictions, set default values
+                if not predictions:
+                    per_class_metrics[category][class_name] = {
+                        'AP': 0.0,
+                        'support': support,
+                        'dist': (support / total_supports[category] * 100) if total_supports[category] > 0 else 0,
+                        'pred': 0,
+                        'precision': 0.0,
+                        'recall': 0.0,
+                        'f1': 0.0
+                    }
+                    continue
+                
+                # Extract ground truth and prediction scores
+                y_true = np.array([p['ground_truth'] for p in predictions])
+                y_scores = np.array([p['confidence'] for p in predictions])
+                
+                # Apply 0.5 threshold for traditional metrics
+                y_pred = (y_scores >= 0.5).astype(int)
+                n_pred = np.sum(y_pred)
+                
+                # Calculate traditional metrics
+                tp = np.sum((y_pred == 1) & (y_true == 1))
+                fp = np.sum((y_pred == 1) & (y_true == 0))
+                fn = np.sum((y_pred == 0) & (y_true == 1))
+                
+                precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+                recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+                f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0.0
+                
+                # Calculate AP
+                try:
+                    ap = average_precision_score(y_true, y_scores) if support > 0 else 0.0
+                except:
+                    ap = 0.0
+                
+                # Store metrics
+                per_class_metrics[category][class_name] = {
+                    'AP': ap,
+                    'support': support,
+                    'dist': (support / total_supports[category] * 100) if total_supports[category] > 0 else 0,
+                    'pred': n_pred,
+                    'precision': precision,
+                    'recall': recall,
+                    'f1': f1
+                }
+        
+        return per_class_metrics
+
+    def _calculate_final_metrics(self, results, all_predictions, gt_occurrences):
+        """
+        Calculate final metrics for the evaluation.
+        
+        Args:
+            results: Dictionary with traditional metrics (TP, FP, FN)
+            all_predictions: Dictionary with all class predictions
+            gt_occurrences: Count of ground truth occurrences per class
+        
+        Returns:
+            Dictionary with all calculated metrics
         """
         final_metrics = {}
         
+        # Calculate per-class metrics
+        per_class_metrics = self._calculate_per_class_metrics(all_predictions, gt_occurrences)
+        
         for category in ['instruments', 'verbs', 'pairs']:
+            # Calculate traditional overall metrics
             TP = results[category]['TP']
             FP = results[category]['FP']
             FN = results[category]['FN']
             
-            # Calculate traditional metrics
             precision = TP / (TP + FP) if (TP + FP) > 0 else 0
             recall = TP / (TP + FN) if (TP + FN) > 0 else 0
             f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0
             
-            # Calculate AP for each possible class
-            category_aps = {}
+            # Calculate mean metrics from per-class metrics
+            valid_classes = [m for c, m in per_class_metrics[category].items() if m['support'] > 0]
             
-            for item_name in all_predictions[category].keys():
-                predictions = all_predictions[category][item_name]
-                gt_count = gt_occurrences[category][item_name]
-                
-                if gt_count > 0:  # Only calculate AP if class appears in ground truth
-                    if predictions:
-                        y_true = np.array([p['ground_truth'] for p in predictions])
-                        y_scores = np.array([p['confidence'] for p in predictions])
-                        ap = average_precision_score(y_true, y_scores)
-                    else:
-                        ap = 0.0  # Class exists in ground truth but was never predicted
-                else:
-                    ap = None  # Class never appears in ground truth
-                
-                category_aps[item_name] = ap
+            mean_ap = np.mean([m['AP'] for m in valid_classes]) if valid_classes else 0.0
+            mean_f1 = np.mean([m['f1'] for m in valid_classes]) if valid_classes else 0.0
             
-            # Calculate mAP (excluding None values)
-            valid_aps = [ap for ap in category_aps.values() if ap is not None]
-            map_score = np.mean(valid_aps) if valid_aps else 0.0
+            # Calculate weighted means
+            weights = [m['support'] for m in valid_classes]
+            weighted_ap = np.average([m['AP'] for m in valid_classes], weights=weights) if valid_classes else 0.0
+            weighted_f1 = np.average([m['f1'] for m in valid_classes], weights=weights) if valid_classes else 0.0
             
+            # Store all metrics
             final_metrics[category] = {
                 'traditional': {
                     'TP': TP, 'FP': FP, 'FN': FN,
@@ -599,50 +658,46 @@ class HierarchicalEvaluator:
                     'recall': recall,
                     'f1': f1
                 },
-                'per_class_ap': category_aps,
-                'mAP': map_score
+                'per_class': per_class_metrics[category],
+                'mean': {
+                    'AP': mean_ap,
+                    'f1': mean_f1
+                },
+                'weighted_mean': {
+                    'AP': weighted_ap,
+                    'f1': weighted_f1
+                }
             }
         
         return final_metrics
 
-    def _print_evaluation_results(self, final_metrics, gt_occurrences):
+    def _print_evaluation_results(self, final_metrics):
         """
-        Prints detailed evaluation results including class coverage analysis.
+        Print detailed evaluation results in a format similar to the multitask model.
         
         Args:
-            final_metrics: Dictionary containing all calculated metrics
-            gt_occurrences: Count of ground truth occurrences per class
+            final_metrics: Dictionary with all calculated metrics
         """
-        print("\nFinal Evaluation Results:")
-        print("========================")
+        print("\nEvaluation Results:")
+        print("="*80)
         
         for category in ['instruments', 'verbs', 'pairs']:
-            print(f"\n{category.upper()} METRICS:")
-            print("-" * 20)
+            print(f"\n{category.upper()}:")
+            print("-"*80)
+            print(f"{'Item':<20} {'Support':>8} {'Dist%':>8} {'Pred':>8} {'AP':>8} {'F1':>8} {'Prec':>8} {'Recall':>8}")
+            print("-"*80)
             
-            # Print traditional metrics
-            trad = final_metrics[category]['traditional']
-            print(f"True Positives: {trad['TP']}")
-            print(f"False Positives: {trad['FP']}")
-            print(f"False Negatives: {trad['FN']}")
-            print(f"Precision: {trad['precision']:.4f}")
-            print(f"Recall: {trad['recall']:.4f}")
-            print(f"F1-Score: {trad['f1']:.4f}")
+            # Print metrics for each class
+            for class_name, metrics in sorted(final_metrics[category]['per_class'].items()):
+                print(f"{class_name:<20} {metrics['support']:>8d} {metrics['dist']:>8.2f} {metrics['pred']:>8d} "
+                     f"{metrics['AP']:>8.4f} {metrics['f1']:>8.4f} {metrics['precision']:>8.4f} {metrics['recall']:>8.4f}")
             
-            # Print per-class metrics
-            print("\nPer-class Average Precision:")
-            aps = final_metrics[category]['per_class_ap']
-            
-            for class_name, ap in aps.items():
-                gt_count = gt_occurrences[category][class_name]
-                if ap is None:
-                    print(f"{class_name}: No ground truth instances")
-                else:
-                    ap_str = f"{ap:.4f}" if ap > 0 else "0.0000 (never predicted)"
-                    print(f"{class_name}: AP = {ap_str} (GT count: {gt_count})")
-            
-            print(f"\nmAP: {final_metrics[category]['mAP']:.4f}")
-        
+            # Print mean metrics
+            print("-"*80)
+            print(f"Mean         {'-':>8} {'-':>8} {'-':>8} "
+                 f"{final_metrics[category]['mean']['AP']:>8.4f} {final_metrics[category]['mean']['f1']:>8.4f}")
+            print(f"Weighted Mean{'-':>8} {'-':>8} {'-':>8} "
+                 f"{final_metrics[category]['weighted_mean']['AP']:>8.4f} {final_metrics[category]['weighted_mean']['f1']:>8.4f}")
 def main():
     # Initialize ModelLoader
     try:
@@ -673,7 +728,8 @@ def main():
         available_videos = os.listdir(videos_dir)
         print("\nAvailable Videos:")
         for video in available_videos:
-            print(f"- {video}")
+            if os.path.isdir(os.path.join(videos_dir, video)):
+                print(f"- {video}")
         
         # Create Evaluator
         evaluator = HierarchicalEvaluator(
@@ -687,8 +743,44 @@ def main():
         
         print("\nEvaluation Completed Successfully!")
         
+        # Optional: Save results to file
+        try:
+            output_dir = os.path.join(current_dir, "evaluation_results")
+            os.makedirs(output_dir, exist_ok=True)
+            
+            import pickle
+            with open(os.path.join(output_dir, "hierarchical_eval_results.pkl"), "wb") as f:
+                pickle.dump(results, f)
+            print(f"Results saved to {output_dir}/hierarchical_eval_results.pkl")
+            
+            # Save metrics summary as CSV
+            csv_summary = []
+            csv_summary.append("Category,Class,Support,DistPct,Pred,AP,F1,Precision,Recall")
+            
+            for category in ['instruments', 'verbs', 'pairs']:
+                for class_name, metrics in sorted(results[category]['per_class'].items()):
+                    csv_summary.append(f"{category},{class_name},{metrics['support']},{metrics['dist']:.2f},"
+                                     f"{metrics['pred']},{metrics['AP']:.4f},{metrics['f1']:.4f},"
+                                     f"{metrics['precision']:.4f},{metrics['recall']:.4f}")
+                
+                # Add mean and weighted mean
+                csv_summary.append(f"{category},Mean,,,,"
+                               f"{results[category]['mean']['AP']:.4f},{results[category]['mean']['f1']:.4f},,")
+                csv_summary.append(f"{category},WeightedMean,,,,"
+                               f"{results[category]['weighted_mean']['AP']:.4f},{results[category]['weighted_mean']['f1']:.4f},,")
+                csv_summary.append("")  # Empty line between categories
+            
+            with open(os.path.join(output_dir, "hierarchical_eval_metrics.csv"), "w") as f:
+                f.write("\n".join(csv_summary))
+            print(f"Metrics saved to {output_dir}/hierarchical_eval_metrics.csv")
+            
+        except Exception as e:
+            print(f"Warning: Could not save results to file: {str(e)}")
+        
     except Exception as e:
         print(f"❌ Error during initialization or evaluation: {str(e)}")
+        import traceback
+        traceback.print_exc()
 
 if __name__ == '__main__':
     main()

@@ -76,7 +76,7 @@ def main():
     
     training_config = {
         # Basis-Parameter
-        'data': str(project_root / 'config' / 'model_config' / 'data.yaml'),
+        'data': str(project_root / 'config' / 'model_config' / 'dataset.yaml'),
         'epochs': 100,
         'imgsz': 512,
         'batch': 8,

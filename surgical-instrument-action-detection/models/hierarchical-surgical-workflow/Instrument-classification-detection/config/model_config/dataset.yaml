@@ -1,4 +1,4 @@
-path: /data/Bartscht//data/Bartscht/m2cai16-tool-locations
+path: /data/Bartscht/m2cai16-tool-locations
 train: images/train
 val: images/val
 test: images/test

@@ -85,7 +85,7 @@ CHOLECT50_TO_HEICHOLE_VERB_MAPPING = {
     'clip': 'clip',
     'cut': 'cut',
     'irrigate': 'suction_irrigation',
-    'aspirate': 'hold',
+    'aspirate': 'suction_irrigation',
     'pack': 'hold',
     'null_verb': 'hold'
 }
@@ -251,7 +251,7 @@ class HeiCholeEvaluator:
         
         try:
             # YOLO predictions
-            yolo_results = self.yolo_model(img)
+            yolo_results = self.yolo_model(img, verbose=False)
             valid_detections = []
             
             # Process YOLO detections
