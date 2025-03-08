@@ -48,7 +48,7 @@ def main():
     def test_augmentations():
         print("\n=== Testing Augmentations ===")
         try:
-            data_yaml_path = str(project_root / 'config' / 'model_config' / 'dataset.yaml')
+            data_yaml_path = str(project_root / 'config' / 'model_config' / 'dataset1.yaml')
             print(f"Loading dataset from: {data_yaml_path}")
             
             # Prüfen, ob die Datei existiert
@@ -76,7 +76,7 @@ def main():
     
     training_config = {
         # Basis-Parameter
-        'data': str(project_root / 'config' / 'model_config' / 'dataset.yaml'),
+        'data': str(project_root / 'config' / 'model_config' / 'dataset1.yaml'),
         'epochs': 100,
         'imgsz': 512,
         'batch': 8,

@@ -40,31 +40,31 @@ class SurgicalActionRecognition(pl.LightningModule):
         
         # Mapping of instrument-verb pairs to class indices (sorted by frequency)
         self.action_classes = {
-            'Scissors-Coagulate': 0,
-            'Grasper-Pack': 1,
-            'Grasper-Dissect': 2,
-            'Bipolar-Grasp': 3,
-            'Scissors-Dissect': 4,
-            'Scissors_null-Verb': 5,
-            'Irrigator-Dissect': 6,
-            'Bipolar-Retract': 7,
-            'Clipper_null-Verb': 8,
-            'Irrigator-Retract': 9,
-            'Irrigator-Irrigate': 10,
-            'Bipolar_null-Verb': 11,
+            'Hook-Dissect': 0,
+            'Grasper-Retract': 1,
+            'Bipolar-Coagulate': 2,
+            'Grasper-Grasp': 3,
+            'Clipper-Clip': 4,
+            'Hook_null-Verb': 5,
+            'Irrigator-Aspirate': 6,
+            'Scissors-Cut': 7,
+            'Grasper_null-Verb': 8,
+            'Bipolar-Dissect': 9,
+            'Hook-Coagulate': 10,
+            'Hook-Retract': 11,
             'Irrigator_null-Verb': 12,
-            'Hook-Retract': 13,
-            'Hook-Coagulate': 14,
-            'Bipolar-Dissect': 15,
-            'Grasper_null-Verb': 16,
-            'Scissors-Cut': 17,
-            'Irrigator-Aspirate': 18,
-            'Hook_null-Verb': 19,
-            'Clipper-Clip': 20,
-            'Grasper-Grasp': 21,
-            'Bipolar-Coagulate': 22,
-            'Grasper-Retract': 23,
-            'Hook-Dissect': 24
+            'Bipolar_null-Verb': 13,
+            'Irrigator-Retract': 14,
+            'Irrigator-Irrigate': 15,
+            'Clipper_null-Verb': 16,
+            'Bipolar-Retract': 17,
+            'Irrigator-Dissect': 18,
+            'Scissors_null-Verb': 19,
+            'Scissors-Dissect': 20,
+            'Bipolar-Grasp': 21,
+            'Grasper-Dissect': 22,
+            'Grasper-Pack': 23,
+            'Scissors-Coagulate': 24
         }
         
         # Reverse mapping for evaluation
@@ -74,9 +74,31 @@ class SurgicalActionRecognition(pl.LightningModule):
         if class_weights is None:
             # Default weights based on provided frequencies
             default_weights = torch.tensor([
-                566.92, 425.19, 103.08, 41.48, 40.49, 37.79, 28.35, 23.14, 14.85, 13.55,
-                13.55, 13.08, 12.46, 7.70, 6.41, 4.63, 3.55, 2.75, 2.38, 1.39,
-                1.38, 1.25, 1.04, 0.13, 0.09
+                0.025,    # Hook-Dissect (39875)
+                0.037,    # Grasper-Retract (27112)
+                0.306,    # Bipolar-Coagulate (3267)
+                0.368,    # Grasper-Grasp (2714)
+                0.405,    # Clipper-Clip (2467)
+                0.410,    # Hook_null-Verb (2441)
+                0.701,    # Irrigator-Aspirate (1427)
+                0.810,    # Scissors-Cut (1235)
+                1.042,    # Grasper_null-Verb (959)
+                1.362,    # Bipolar-Dissect (734)
+                1.883,    # Hook-Coagulate (531)
+                2.262,    # Hook-Retract (442)
+                3.663,    # Irrigator_null-Verb (273)
+                3.846,    # Bipolar_null-Verb (260)
+                3.984,    # Irrigator-Retract (251)
+                3.984,    # Irrigator-Irrigate (251)
+                4.367,    # Clipper_null-Verb (229)
+                6.803,    # Bipolar-Retract (147)
+                8.333,    # Irrigator-Dissect (120)
+                11.111,   # Scissors_null-Verb (90)
+                11.905,   # Scissors-Dissect (84)
+                12.195,   # Bipolar-Grasp (82)
+                30.303,   # Grasper-Dissect (33)
+                125.000,  # Grasper-Pack (8)
+                166.667   # Scissors-Coagulate (6)
             ], dtype=torch.float32)
             
             # Convert frequencies to weights (inverse frequency)
